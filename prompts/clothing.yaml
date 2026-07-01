@@ -1,0 +1,9 @@
+clothing_description:
+  context: "Office surveillance camera. Single person visible."
+  instruction: "Describe the clothing worn by this person."
+  constraints: "Describe ONLY clothing items worn on the body (shirt, pants, shoes, jacket, etc). Do NOT mention held objects, bags, accessories, body movements, or actions."
+  detail: "Be specific about garment type, sleeve length (long-sleeve / short-sleeve / sleeveless), and color. For bottoms, state whether they are shorts or full-length pants. Write 'not visible' if a region cannot be seen."
+  output_format: 'Return ONLY valid JSON: {"top": "<color + sleeve-length + garment>", "bottom": "<color + shorts-or-full-length + garment>", "shoes": "<color + type>", "full": "<one concise sentence>"}'
+
+clothing_validation:
+  question: "<image>\nBriefly describe in 10 words or fewer the top and bottom clothing of this person."
