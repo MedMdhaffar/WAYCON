@@ -41,3 +41,14 @@ def build_graph():
     builder.add_edge("finalize",            END)
 
     return builder.compile(checkpointer=MemorySaver())
+
+
+"""
+the checkpointer do the following:
+preserve :
+current state
+previous state
+execution progress
+conversation history
+resume point
+"""
