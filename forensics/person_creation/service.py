@@ -1,7 +1,9 @@
 import json
 import re
+import sys
 import threading
 import traceback
+import types
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -12,7 +14,33 @@ from langgraph.types import Command
 
 import cv2 as _cv2
 
-from forensics.person_identifier.config import Config as _PIConfig
+#in the future try to fix this 
+#mohamed:
+#I think that removing forensics.person_creation will make the code work
+try:
+    from forensics.person_identifier.config import Config as _PIConfig
+except ModuleNotFoundError as exc:
+    if exc.name not in {
+        "forensics.person_identifier",
+        "forensics.person_identifier.config",
+    }:
+        raise
+
+    class _PIConfig:
+        PROJECT_ROOT = Path(__file__).resolve().parents[2]
+        PROFILE_ROOT = PROJECT_ROOT / "forensics" / "person_db"
+
+        @classmethod
+        def load(cls):
+            return cls()
+
+    _pi_pkg = types.ModuleType("forensics.person_identifier")
+    _pi_pkg.__path__ = []
+    _pi_config_mod = types.ModuleType("forensics.person_identifier.config")
+    _pi_config_mod.Config = _PIConfig
+    sys.modules.setdefault("forensics.person_identifier", _pi_pkg)
+    sys.modules.setdefault("forensics.person_identifier.config", _pi_config_mod)
+
 from forensics.person_creation.path_utils import to_wsl_path as _to_wsl_path
 from forensics.person_creation.tools.cleanup_orphan_crops import (
     cleanup as _cleanup_orphan_crops,

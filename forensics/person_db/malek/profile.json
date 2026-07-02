@@ -1,0 +1,20 @@
+{
+  "id": "3",
+  "name": "3",
+  "created_at": "2026-07-02",
+  "face_embedding": [],
+  "face_crop_count": 0,
+  "face_crops": [],
+  "appearance": {
+    "date": "2026-07-02",
+    "top": "unknown",
+    "bottom": "unknown",
+    "shoes": "unknown",
+    "full": "unknown"
+  },
+  "body_crops": [],
+  "best_body_crops": [],
+  "video_sources": [
+    "/mnt/c/Users/aziza/Downloads/3.mp4"
+  ]
+}
