@@ -1,0 +1,15 @@
+torch
+torchvision
+langgraph
+opencv-python
+ultralytics
+huggingface_hub
+facenet-pytorch
+transformers==4.55.4
+accelerate
+pyyaml
+flask
+flask-cors
+sentencepiece
+einops
+timm

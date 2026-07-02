@@ -10,7 +10,7 @@ import ProfileManager from './components/ProfileManager.jsx'
 
 const TABS = ['Setup', 'Progress & Crops', 'Pair Faces & Bodies', 'Review & Approve']
 const RUNNING_STATUSES = new Set([
-  'loading_models', 'processing_video', 'filtering', 'embedding',
+  'loading_models', 'processing_video', 'filtering', 'auto_pairing', 'embedding',
   'selecting', 'describing',
 ])
 

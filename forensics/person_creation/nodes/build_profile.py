@@ -1,8 +1,15 @@
 from datetime import date
 from langgraph.types import interrupt
 
+from forensics.person_creation.nodes.profile_signals import (
+    build_reid_signal,
+    color_signals_from_crops,
+)
+
 
 def build_profile(state: dict) -> dict:
+    color_signals = color_signals_from_crops(state.get("best_body_crops", []))
+    reid_signal = build_reid_signal(state, color_signals)
     profile = {
         "id": state["person_name"].lower(),
         "name": state["person_name"],
@@ -17,6 +24,10 @@ def build_profile(state: dict) -> dict:
         "body_crops": [a["body_path"] for a in state["associations"]],
         "best_body_crops": state["best_body_crops"],
         "video_sources": state["video_paths"],
+        "appearance_signals": {
+            "color": color_signals,
+        },
+        "reid": reid_signal,
     }
 
     feedback = interrupt({
@@ -26,6 +37,8 @@ def build_profile(state: dict) -> dict:
             "face_crop_count": profile["face_crop_count"],
             "associations_count": len(state["associations"]),
             "appearance": profile["appearance"],
+            "color_signals": color_signals,
+            "reid": reid_signal,
             "best_body_crops": profile["best_body_crops"],
         },
     })

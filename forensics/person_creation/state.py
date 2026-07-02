@@ -20,7 +20,7 @@ class PersonCreationState(TypedDict):
     mean_face_embedding: list[float]
 
     frame_groups: list[dict]     # [{frame_idx, video, video_name, faces:[...], bodies:[...]}]
-    associations: list[dict]     # confirmed pairs from human_in_the_loop
+    associations: list[dict]     # confirmed face/body pairs from auto_pair
     human_feedback_path: str     # absolute path to pairing_feedback.json
     best_body_crops: list[str]   # top-5 body crop paths, temporally spread
 

@@ -1,6 +1,8 @@
 import threading
 import numpy as np
 
+from forensics.person_creation.models.device import resolve_device
+
 
 def _patch_fuse():
     try:
@@ -30,10 +32,11 @@ class FaceDetector:
         self._lock = threading.Lock()
         self._conf = 0.5
 
-    def load(self, device: str = "cuda") -> None:
+    def load(self, device: str = "auto") -> None:
         from huggingface_hub import hf_hub_download
         from ultralytics import YOLO
 
+        device = resolve_device(device)
         _patch_fuse()
         model_path = hf_hub_download(
             repo_id="arnabdhar/YOLOv8-Face-Detection",

@@ -49,8 +49,8 @@ CORS(app)
 class JobState:
     job_id: str
     status: str = "idle"
-    # idle | loading_models | processing_video | filtering | embedding
-    # | awaiting_pairing | selecting | describing | awaiting_review
+    # idle | loading_models | processing_video | filtering | auto_pairing | embedding
+    # | selecting | describing | awaiting_review
     # | finalizing | done | error
     node: str = ""
     error: str | None = None
@@ -78,7 +78,7 @@ _NODE_TO_STATUS = {
     "process_video":     "processing_video",
     "filter_quality":    "filtering",
     "embed_faces":       "embedding",
-    "human_in_the_loop": "awaiting_pairing",
+    "auto_pair":         "auto_pairing",
     "select_best":       "selecting",
     "describe_clothing": "describing",
     "build_profile":     "awaiting_review",
@@ -103,9 +103,11 @@ def _run_pipeline(job_id: str, initial_state: dict, config: dict) -> None:
         return None
 
     try:
-        # --- Run to first interrupt (human_in_the_loop pairing) ---
+        # --- Run to first interrupt (profile review; pairing is automatic) ---
         interrupt_val = _stream_until_interrupt(initial_state)
 
+        # Backward compatibility for older graphs that still interrupt for
+        # manual pairing. The Goal 2 graph should skip this branch.
         if interrupt_val and "frame_groups" in interrupt_val:
             job.status = "awaiting_pairing"
             job.node = "human_in_the_loop"
