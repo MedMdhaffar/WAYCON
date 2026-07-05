@@ -1,57 +1,6 @@
-# =========================
-# Data
-# =========================
-videos/
-person_db/
-_staging/
-debug/
-outputs/
-logs/
-*.log
-
-# Images generated during processing
-*.jpg
-*.jpeg
-*.png
-
-# Keep example assets if desired
-!videos/mohammed.mp4
-
-# =========================
-# Node / React / Vite
-# =========================
-node_modules/
-dist/
-.vite/
-
-# =========================
-# Python
-# =========================
-__pycache__/
-
-# Virtual environments
-venv/
-.venv/
-env/
-ENV/
-
-# =========================
-# Models
-# =========================
-*.pt
-*.pth
-*.onnx
-*.ckpt
-*.safetensors
-
-# Hugging Face cache (if created inside repo)
-offload/
-.cache/
-
-# =========================
-# VS Code / IDE
-# =========================
-.vscode/
-.idea/
-*.swp
-*.swo
+Flask
+langgraph
+torch
+opencv-python
+transformers
+ultralytics
