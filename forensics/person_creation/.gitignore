@@ -2,20 +2,14 @@
 # Data
 # =========================
 videos/
-person_db/
+forensics/person_db/
 _staging/
-debug/
 outputs/
 logs/
 *.log
 
-# Images generated during processing
-*.jpg
-*.jpeg
-*.png
-
 # Keep example assets if desired
-!videos/mohamed.mp4
+!videos/test_video.mp4
 
 # =========================
 # Node / React / Vite
@@ -40,8 +34,6 @@ ENV/
 # =========================
 *.pt
 *.pth
-*.onnx
-*.ckpt
 *.safetensors
 
 # Hugging Face cache (if created inside repo)
@@ -55,3 +47,4 @@ offload/
 .idea/
 *.swp
 *.swo
+.claude/

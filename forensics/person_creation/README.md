@@ -1,7 +1,7 @@
 ## to install the dependencies :
 ```
 pip install uv
-uv pip install requirements.txt
+uv pip install -r requirements.txt
 ```
 
 
@@ -15,7 +15,16 @@ python -m forensics.person_creation.run \
   --every 5
 ```
 
-
+## to open the web interface
+```
+cd /frontend
+npm install
+npm run dev
+```
+```
+cd /WAYCON
+python -m forensics.person_creation.service
+```
 
 
 
