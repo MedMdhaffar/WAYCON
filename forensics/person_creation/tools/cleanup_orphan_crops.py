@@ -18,10 +18,12 @@ import json
 import sys
 from pathlib import Path
 
+# from service import PROFILE_ROOT
+
 _HERE = Path(__file__).parent
 sys.path.insert(0, str(_HERE.parents[2]))
 
-from forensics.person_identifier.config import Config
+# from forensics.person_identifier.config import Config
 
 
 class CleanupError(Exception):
@@ -49,8 +51,10 @@ def _list_jpgs(directory: Path) -> list[Path]:
 
 def cleanup(profile_name: str, dry_run: bool = False) -> dict:
     """Return a structured result dict. Raises CleanupError if profile missing."""
-    cfg = Config.load()
-    profile_dir = cfg.PROFILE_ROOT / profile_name
+    # cfg = Config.load()
+    # profile_dir = cfg.PROFILE_ROOT / profile_name
+    PROFILE_ROOT = Path("forensics/person_creation/person_db").resolve()
+    profile_dir = PROFILE_ROOT / profile_name
     profile_json_path = profile_dir / "profile.json"
 
     if not profile_json_path.exists():

@@ -12,7 +12,8 @@ from langgraph.types import Command
 
 import cv2 as _cv2
 
-from forensics.person_identifier.config import Config as _PIConfig
+
+# from forensics.person_identifier.config import Config as _PIConfig
 from forensics.person_creation.path_utils import to_wsl_path as _to_wsl_path
 from forensics.person_creation.tools.cleanup_orphan_crops import (
     cleanup as _cleanup_orphan_crops,
@@ -295,8 +296,14 @@ def serve_image():
 
 # ─── Profile management endpoints ─────────────────────────────────────────────
 
+PROFILE_ROOT = Path("forensics/person_creation/person_db")
+
 def _profile_dir(name: str) -> Path:
-    return _PIConfig.load().PROFILE_ROOT / name
+    return PROFILE_ROOT / name
+
+
+# def _profile_dir(name: str) -> Path:
+#     return _PIConfig.load().PROFILE_ROOT / name
 
 
 def _load_profile_json(name: str) -> dict | None:
@@ -320,7 +327,7 @@ def list_profiles():
     profile.json's own "id" field is only displayed as a label, never used
     for routing.
     """
-    root = _PIConfig.load().PROFILE_ROOT
+    root = PROFILE_ROOT
     profiles = []
     if root.is_dir():
         for d in sorted(p for p in root.iterdir() if p.is_dir()):

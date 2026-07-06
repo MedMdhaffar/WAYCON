@@ -25,11 +25,12 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+# from service import PROFILE_ROOT
 
 _HERE = Path(__file__).parent
 sys.path.insert(0, str(_HERE.parents[2]))
 
-from forensics.person_identifier.config import Config
+# from forensics.person_identifier.config import Config
 
 _IMG_EXTS = {".jpg", ".jpeg", ".png"}
 
@@ -73,8 +74,10 @@ def add_face_photos(
     """Run the enrichment. Returns a structured result dict; raises
     AddFacePhotosError on hard failures (missing profile, bad images_dir).
     """
-    cfg = Config.load()
-    profile_dir = cfg.PROFILE_ROOT / profile_name
+    # cfg = Config.load()
+    # profile_dir = cfg.PROFILE_ROOT / profile_name
+    PROFILE_ROOT = Path("forensics/person_creation/person_db").resolve()
+    profile_dir = PROFILE_ROOT / profile_name
     profile_json_path = profile_dir / "profile.json"
     images_dir = Path(images_dir)
 
