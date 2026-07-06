@@ -2,8 +2,9 @@ const NODES = [
   { id: 'load_models',       label: 'Load Models' },
   { id: 'process_video',     label: 'Extract Crops' },
   { id: 'filter_quality',    label: 'Filter Quality' },
-  { id: 'auto_pair',         label: 'Auto Pair' },
-  { id: 'embed_faces',       label: 'Embed Faces' },
+  { id: 'embed_all_faces',   label: 'Embed Faces' },
+  { id: 'cluster_identities', label: 'Cluster Identities' },
+  { id: 'assign_bodies_to_clusters', label: 'Assign Bodies' },
   { id: 'select_best',       label: 'Select Best' },
   { id: 'describe_clothing', label: 'Describe Clothing' },
   { id: 'build_profile',     label: 'Build Profile' },
@@ -13,7 +14,6 @@ const NODES = [
 const STATUS_COLORS = {
   done:             '#22c55e',
   awaiting_review:  '#f59e0b',
-  awaiting_pairing: '#a78bfa',
   error:            '#ef4444',
   default:          '#7c9ef8',
 }
@@ -22,8 +22,7 @@ export default function ProgressTracker({ status, node, error }) {
   const currentIdx = NODES.findIndex(n => n.id === node)
 
   const statusColor = STATUS_COLORS[status] ?? STATUS_COLORS.default
-  const statusLabel = status === 'awaiting_pairing'  ? '⏸ Awaiting Pairing'
-    : status === 'awaiting_review' ? '⏸ Awaiting Review'
+  const statusLabel = status === 'awaiting_review' ? '⏸ Awaiting Review'
     : status === 'done'            ? '✓ Done'
     : status === 'error'           ? '✕ Error'
     : status ? `⟳ ${status.replace(/_/g, ' ')}` : '—'

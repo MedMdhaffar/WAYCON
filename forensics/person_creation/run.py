@@ -40,23 +40,9 @@ def main():
                 print(f"  [{node}] done")
         return None
 
-    # --- Run until first interrupt (human pairing) ---
+    # --- Run until the profile-review interrupt (pairing is fully automatic) ---
     interrupt_data = _stream(initial_state)
 
-    if interrupt_data and "frame_groups" in interrupt_data:
-        print("\n" + "=" * 60)
-        print("PAIRING REQUIRED")
-        print(f"{interrupt_data['total_frames']} frame groups with face+body detections.")
-        print("Use the UI at http://localhost:5175 to pair faces to bodies.")
-        print("After confirming pairs in the UI, press Enter here to continue.")
-        input("Press Enter once you have confirmed pairs in the UI...")
-        # In CLI mode, pairs were submitted via UI — resume with empty payload
-        # (the UI already POSTed to /api/person/confirm-pairs which set resume_value)
-        # For pure CLI usage, we skip pairing and resume with empty pairs
-        resume_pairing = {"human_pairs": [], "deleted_paths": []}
-        interrupt_data = _stream(Command(resume=resume_pairing))
-
-    # --- Second interrupt (profile review) ---
     if interrupt_data and "profile_preview" in interrupt_data:
         print("\n" + "=" * 60)
         print("REVIEW REQUIRED")
@@ -67,7 +53,13 @@ def main():
         _stream(Command(resume=resume_value))
 
     snapshot = graph.get_state(config)
+    profiles = snapshot.values.get("per_cluster_profiles", {})
     profile = snapshot.values.get("profile", {})
+    if profiles:
+        print(f"\nProfiles saved under: {args.output}")
+        for cid, item in profiles.items():
+            print(f"  cluster_{cid}: {item.get('face_crop_count', 0)} face crops, appearance={item.get('appearance', {})}")
+        return
     if profile:
         print(f"\nProfile saved: {args.output}/profile.json")
         print(f"  Face crops : {profile.get('face_crop_count', 0)}")

@@ -105,7 +105,7 @@ def build_reid_signal(state: dict, color_signals: dict) -> dict:
         "primary_key": "face_embedding",
         "embedding_model": "facenet_pytorch.InceptionResnetV1.vggface2",
         "face_embedding_dim": len(state.get("mean_face_embedding") or []),
-        "association_source": "automatic_geometry_v1",
+        "association_source": "automatic_multi_cue_v2",
         "association_count": len(associations),
         "auto_pair_score_mean": round(
             sum(float(a.get("auto_score", 0.0)) for a in associations) / max(len(associations), 1),

@@ -24,6 +24,9 @@ class FaceEmbedder:
         ])
         print(f"[FaceEmbedder] loaded InceptionResnetV1 vggface2 on {self._device}")
 
+    def is_loaded(self) -> bool:
+        return self._model is not None
+
     def embed(self, crop_bgr: np.ndarray) -> list[float]:
         import torch
         import torch.nn.functional as F

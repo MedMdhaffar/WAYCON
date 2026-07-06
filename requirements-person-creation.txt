@@ -13,3 +13,10 @@ flask-cors
 sentencepiece
 einops
 timm
+scipy
+
+# Optional — auto_pair association cues. Each is probed at load_models time;
+# if missing, that cue is disabled and its weight is redistributed across the
+# remaining cues. Install to enable body-ReID / pose cues:
+#   torchreid   (OSNet-x0.25 body ReID embedder)
+#   rtmlib      (RTMPose keypoints, onnxruntime-only, no mmcv/mmdet needed)
