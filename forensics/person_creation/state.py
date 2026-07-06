@@ -31,6 +31,14 @@ class PersonCreationState(TypedDict):
     clothing_raw_by_person: dict[str, str]
     clothing_by_person: dict[str, dict]
 
+    reid: dict
+    reid_by_person: dict[str, dict]
+
+    color_signals: dict
+    color_signals_debug: dict
+    color_signals_by_person: dict[str, dict]
+    color_signals_debug_by_person: dict[str, dict]
+
     review_feedback: dict
     approved: bool
 

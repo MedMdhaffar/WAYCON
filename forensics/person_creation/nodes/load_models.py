@@ -9,11 +9,16 @@ def load_models(state: dict) -> dict:
     from forensics.person_creation.models.face_detector import get_face_detector
     from forensics.person_creation.models.face_embedder import get_face_embedder
     from forensics.person_creation.models.clothing_describer import get_clothing_describer
+    from forensics.person_creation.models.reid_embedder import get_reid_embedder
 
     get_person_detector().load(model_path=_YOLO_MODEL_PATH)
     get_face_detector().load()
     get_face_embedder().load()
     get_clothing_describer().load(model_id=_INTERNVL_MODEL_ID)
+    try:
+        get_reid_embedder().load()
+    except Exception as exc:
+        print(f"[load_models][warn] ReID unavailable: {exc}")
 
     print("[load_models] all models ready")
     return {}

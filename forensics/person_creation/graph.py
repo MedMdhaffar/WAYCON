@@ -11,6 +11,8 @@ from forensics.person_creation.nodes.track_persons import track_persons
 from forensics.person_creation.nodes.promote_crops import promote_crops
 from forensics.person_creation.nodes.select_best_per_person import select_best_per_person
 from forensics.person_creation.nodes.describe_clothing_per_person import describe_clothing_per_person
+from forensics.person_creation.nodes.extract_reid import extract_reid
+from forensics.person_creation.nodes.extract_colors import extract_colors
 from forensics.person_creation.nodes.build_multi_profile import build_multi_profile
 from forensics.person_creation.nodes.finalize import finalize
 from forensics.person_creation.nodes.human_in_the_loop import human_in_the_loop
@@ -29,6 +31,8 @@ def build_graph():
     builder.add_node("embed_faces",         embed_faces)
     builder.add_node("select_best_per_person", select_best_per_person)
     builder.add_node("describe_clothing_per_person", describe_clothing_per_person)
+    builder.add_node("extract_reid",       extract_reid)
+    builder.add_node("extract_colors",     extract_colors)
     builder.add_node("build_multi_profile", build_multi_profile)
     builder.add_node("finalize",            finalize)
 
@@ -42,7 +46,9 @@ def build_graph():
     builder.add_edge("promote_crops",       "embed_faces")
     builder.add_edge("embed_faces",         "select_best_per_person")
     builder.add_edge("select_best_per_person", "describe_clothing_per_person")
-    builder.add_edge("describe_clothing_per_person", "build_multi_profile")
+    builder.add_edge("describe_clothing_per_person", "extract_reid")
+    builder.add_edge("extract_reid",        "extract_colors")
+    builder.add_edge("extract_colors",      "build_multi_profile")
     builder.add_edge("build_multi_profile", "finalize")
     builder.add_edge("finalize",            END)
 
