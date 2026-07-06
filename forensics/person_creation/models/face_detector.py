@@ -27,10 +27,16 @@ def _patch_fuse():
 class FaceDetector:
     def __init__(self) -> None:
         self._model = None
+        self._device = None
         self._lock = threading.Lock()
         self._conf = 0.5
 
+    def is_loaded(self) -> bool:
+        return self._model is not None
+
     def load(self, device: str = "cuda") -> None:
+        if self._model is not None:
+            return
         from huggingface_hub import hf_hub_download
         from ultralytics import YOLO
 
@@ -43,6 +49,13 @@ class FaceDetector:
         self._model.to(device)
         self._device = device
         print(f"[FaceDetector] loaded YOLOv8-Face on {device}")
+
+    def unload(self) -> None:
+        if self._model is not None:
+            from forensics.person_creation.utils.model_lifecycle import move_to_cpu
+            move_to_cpu(self._model)
+            self._model = None
+        self._device = None
 
     def detect(self, frame_bgr: np.ndarray) -> list[dict]:
         if self._model is None:
@@ -68,3 +81,9 @@ _instance = FaceDetector()
 
 def get_face_detector() -> FaceDetector:
     return _instance
+
+
+def release_face_detector() -> None:
+    from forensics.person_creation.utils.memory import cleanup_memory
+    _instance.unload()
+    cleanup_memory("release_face_detector")

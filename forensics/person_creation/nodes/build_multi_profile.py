@@ -3,13 +3,42 @@ from datetime import date
 from langgraph.types import interrupt
 
 
-_UNKNOWN = {"top": "unknown", "bottom": "unknown", "shoes": "unknown", "full": "unknown"}
+_FACE_MODEL_NAME = "FaceNet_InceptionResnetV1_VGGFace2"
+_CLOTHING_MODEL_NAME = "InternVL3.5-2B"
+_UNKNOWN_CLOTHING = {"top": "unknown", "bottom": "unknown", "shoes": "unknown", "full": "unknown"}
 
 
-def _profile_reid_block(reid: dict | None) -> dict:
+def _embedding_dim(embedding: list[float] | None) -> int | None:
+    return len(embedding) if embedding else None
+
+
+def _face_identity_block(person_id: str, state: dict, face_crops: list[str]) -> dict:
+    embedding = (state.get("face_embedding_by_person") or {}).get(person_id)
+    return {
+        "model": _FACE_MODEL_NAME,
+        "embedding_dim": _embedding_dim(embedding),
+        "embedding": embedding,
+        "source_crops": face_crops,
+        "crop_count": len(face_crops),
+        "signal_type": "permanent_biometric_identity",
+    }
+
+
+def _clothing_block(person_id: str, state: dict, best_body_crops: list[str]) -> dict:
+    clothing = dict((state.get("clothing_by_person") or {}).get(person_id, _UNKNOWN_CLOTHING))
+    return {
+        "model": _CLOTHING_MODEL_NAME,
+        "top": clothing.get("top", "unknown"),
+        "bottom": clothing.get("bottom", "unknown"),
+        "shoes": clothing.get("shoes", "unknown"),
+        "full": clothing.get("full", "unknown"),
+        "source_crops": best_body_crops,
+    }
+
+
+def _reid_block(reid: dict | None) -> dict:
     reid = reid or {}
-    # ReID is a supporting same-day appearance signal. Face embedding remains
-    # the permanent identity key.
+    # ReID is a same-day supporting appearance signal, not identity.
     block = {
         "model": reid.get("model", "OSNet_x1_0"),
         "embedding_dim": reid.get("embedding_dim"),
@@ -23,10 +52,9 @@ def _profile_reid_block(reid: dict | None) -> dict:
     return block
 
 
-def _profile_color_block(color_signals: dict | None) -> dict:
+def _color_block(color_signals: dict | None) -> dict:
     color_signals = color_signals or {}
-    # Color signals are daily supporting appearance signals. Face embedding
-    # remains the permanent identity key.
+    # Color signals are same-day supporting appearance signals, not identity.
     block = {
         "extractor": color_signals.get("extractor", "DominantColorExtractor_v1"),
         "signal_type": color_signals.get("signal_type", "same_day_supporting_appearance"),
@@ -41,91 +69,94 @@ def _profile_color_block(color_signals: dict | None) -> dict:
     return block
 
 
-def _appearance_colors(color_signals: dict) -> dict:
+def _person_profile(track: dict, state: dict) -> dict:
+    person_id = track["person_id"]
+    best_by_person = state.get("best_body_crops_by_person") or {}
+    reid_by_person = state.get("reid_by_person") or {}
+    color_by_person = state.get("color_signals_by_person") or {}
+
+    face_crops = track.get("face_paths", [])
+    body_crops = track.get("body_paths", [])
+    best_body_crops = best_by_person.get(person_id, [])
+
     return {
-        region: color_signals[region]["dominant"]
-        for region in ("top", "bottom", "shoes")
-        if color_signals.get(region)
+        "person_id": person_id,
+        "track": {
+            "frame_range": track.get("frame_range", [0, 0]),
+            "num_observations": track.get("num_observations", 0),
+            "avg_center_movement": track.get("avg_center_movement"),
+            "avg_iou": track.get("avg_iou"),
+        },
+        "identity": {
+            "face": _face_identity_block(person_id, state, face_crops),
+        },
+        "appearance": {
+            "date": date.today().isoformat(),
+            "clothing": _clothing_block(person_id, state, best_body_crops),
+            "reid": _reid_block(reid_by_person.get(person_id)),
+            "colors": _color_block(color_by_person.get(person_id)),
+        },
+        "crops": {
+            "faces": face_crops,
+            "bodies": body_crops,
+            "best_bodies": best_body_crops,
+        },
     }
 
 
-def _track_people(state: dict) -> list[dict]:
-    best_by_person = state.get("best_body_crops_by_person") or {}
-    clothing_by_person = state.get("clothing_by_person") or {}
-    reid_by_person = state.get("reid_by_person") or {}
-    color_by_person = state.get("color_signals_by_person") or {}
-    people = []
-
-    for track in state.get("person_tracks") or []:
-        person_id = track["person_id"]
-        color_signals = _profile_color_block(color_by_person.get(person_id))
-        people.append({
-            "person_id": person_id,
-            "description": clothing_by_person.get(person_id, dict(_UNKNOWN)),
-            "color_signals": color_signals,
-            "best_body_crops": best_by_person.get(person_id, []),
-            "face_crops": track.get("face_paths", []),
-            "body_crops": track.get("body_paths", []),
-            "frame_range": track.get("frame_range", [0, 0]),
-            "num_observations": track.get("num_observations", 0),
-            "reid": _profile_reid_block(reid_by_person.get(person_id)),
-        })
-
-    return people
+def _model_metadata() -> dict:
+    return {
+        "person_detector": "yolo26m.pt",
+        "face_detector": "YOLOv8-Face",
+        "face_embedder": _FACE_MODEL_NAME,
+        "clothing_describer": _CLOTHING_MODEL_NAME,
+        "reid": "OSNet_x1_0",
+        "color_extractor": "DominantColorExtractor_v1",
+        "association": "auto_associate",
+    }
 
 
 def build_multi_profile(state: dict) -> dict:
-    people = _track_people(state)
-    first = people[0] if people else None
-    first_description = first["description"] if first else dict(_UNKNOWN)
-    first_color_signals = first["color_signals"] if first else _profile_color_block(state.get("color_signals"))
+    people = [
+        _person_profile(track, state)
+        for track in state.get("person_tracks") or []
+    ]
 
     profile = {
-        "id": state["person_name"].lower(),
-        "name": state["person_name"],
-        "created_at": date.today().isoformat(),
-        "people_count": len(people),
-        "people": people,
-        "video_sources": state["video_paths"],
-        "face_embedding": state.get("mean_face_embedding", []),
-        "face_crop_count": len(first["face_crops"]) if first else 0,
-        "face_crops": first["face_crops"] if first else [],
-        "appearance": {
-            "date": date.today().isoformat(),
-            **first_description,
-            "colors": _appearance_colors(first_color_signals),
+        "schema_version": "2.0",
+        "profile_type": "multi_person_session",
+        "session": {
+            "id": state["person_name"].lower(),
+            "name": state["person_name"],
+            "created_at": date.today().isoformat(),
+            "video_sources": state["video_paths"],
+            "process_every_n": state.get("process_every_n", 5),
+            "people_count": len(people),
         },
-        "reid": first["reid"] if first else _profile_reid_block(state.get("reid")),
-        "color_signals": first_color_signals,
-        "body_crops": first["body_crops"] if first else [],
-        "best_body_crops": first["best_body_crops"] if first else [],
+        "models": _model_metadata(),
+        "people": people,
     }
 
     feedback = interrupt({
         "message": "Review the multi-person profile below. Reply with 'approve' or provide corrections.",
         "profile_preview": {
-            "name": profile["name"],
-            "people_count": profile["people_count"],
+            "session": profile["session"],
             "people": [
                 {
                     "person_id": person["person_id"],
-                    "num_observations": person["num_observations"],
-                    "face_crop_count": len(person["face_crops"]),
-                    "best_body_crops": person["best_body_crops"],
-                    "appearance": person["description"],
+                    "num_observations": person["track"]["num_observations"],
+                    "face_crop_count": person["identity"]["face"]["crop_count"],
+                    "best_body_crops": person["crops"]["best_bodies"],
+                    "clothing": person["appearance"]["clothing"],
                 }
                 for person in people
             ],
-            "face_crop_count": profile["face_crop_count"],
-            "associations_count": len(state.get("associations") or []),
-            "appearance": profile["appearance"],
-            "best_body_crops": profile["best_body_crops"],
         },
     })
 
     override = (feedback or {}).get("clothing_override") or {}
-    if override and first:
-        profile["appearance"].update({k: v for k, v in override.items() if v})
-        profile["people"][0]["description"].update({k: v for k, v in override.items() if v})
+    if override and profile["people"]:
+        clothing = profile["people"][0]["appearance"]["clothing"]
+        clothing.update({k: v for k, v in override.items() if v})
 
     return {"profile": profile, "review_feedback": feedback, "approved": True}

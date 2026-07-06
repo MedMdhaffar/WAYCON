@@ -1,5 +1,5 @@
 const NODES = [
-  { id: 'load_models',       label: 'Load Models' },
+  { id: 'prepare_runtime',   label: 'Prepare Runtime' },
   { id: 'process_video',     label: 'Extract Crops' },
   { id: 'filter_quality',    label: 'Filter Quality' },
   { id: 'auto_associate',    label: 'Automatic face-body matching' },

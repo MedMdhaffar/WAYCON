@@ -143,14 +143,11 @@ def _merge_track_into(base: dict, other: dict) -> None:
     base["last_body_bbox"] = _bbox(last_assoc)
 
 
-def _merge_tracks_by_face_embedding(tracks: list[dict]) -> list[dict]:
+def _merge_tracks_by_face_embedding(tracks: list[dict], embedder) -> list[dict]:
     print(f"[track_persons] initial_track_count={len(tracks)}")
     if len(tracks) < 2:
         valid_embeddings = 0
         if tracks:
-            from forensics.person_creation.models.face_embedder import get_face_embedder
-
-            embedder = get_face_embedder()
             valid_embeddings = sum(
                 1 for track in tracks
                 if _mean_face_embedding(track, embedder) is not None
@@ -160,9 +157,6 @@ def _merge_tracks_by_face_embedding(tracks: list[dict]) -> list[dict]:
         print(f"[track_persons] final_track_count={len(tracks)}")
         return tracks
 
-    from forensics.person_creation.models.face_embedder import get_face_embedder
-
-    embedder = get_face_embedder()
     working = list(tracks)
     merged_pairs: list[tuple[int, int, float]] = []
 
@@ -406,7 +400,22 @@ def track_persons(state: dict) -> dict:
             tracks.append(_new_track(det, next_track_id))
             next_track_id += 1
 
-    tracks = _merge_tracks_by_face_embedding(tracks)
+    from forensics.person_creation.models.face_embedder import get_face_embedder, release_face_embedder
+    from forensics.person_creation.utils.memory import cleanup_memory, log_memory, clarify_oom
+    from forensics.person_creation import config
+
+    embedder = get_face_embedder()
+    log_memory("before loading face_embedder (track_persons)")
+    try:
+        embedder.load(device=config.FACE_DEVICE)
+        log_memory("after loading face_embedder")
+        tracks = _merge_tracks_by_face_embedding(tracks, embedder)
+    except Exception as exc:
+        raise clarify_oom(exc, "track_persons/face_embedder") from exc
+    finally:
+        release_face_embedder()
+        cleanup_memory("track_persons/face_embedder")
+
     tracks.sort(key=lambda t: (t["first_frame_idx"], t["first_center_x"], t["track_id"]))
     person_tracks = [_public_track(track, idx + 1) for idx, track in enumerate(tracks)]
     _warn_track_invariants(person_tracks)

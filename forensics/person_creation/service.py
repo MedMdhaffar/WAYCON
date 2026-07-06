@@ -102,7 +102,7 @@ def _get_graph():
 
 
 _NODE_TO_STATUS = {
-    "load_models":       "loading_models",
+    "prepare_runtime":   "loading_models",
     "process_video":     "processing_video",
     "filter_quality":    "filtering",
     "auto_associate":    "associating",

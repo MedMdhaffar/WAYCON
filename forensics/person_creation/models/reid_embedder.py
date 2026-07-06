@@ -65,6 +65,9 @@ class ReIDEmbedder:
         self._extractor = None
         self._device = _default_device()
 
+    def is_loaded(self) -> bool:
+        return self._extractor is not None
+
     def load(self, device: str | None = None) -> None:
         if self._extractor is not None:
             return
@@ -85,6 +88,12 @@ class ReIDEmbedder:
         )
         print(f"[ReIDEmbedder] loaded {self.MODEL_NAME} on {self._device}")
 
+    def unload(self) -> None:
+        if self._extractor is not None:
+            from forensics.person_creation.utils.model_lifecycle import move_to_cpu
+            move_to_cpu(getattr(self._extractor, "model", None))
+            self._extractor = None
+
     def _valid_paths(self, paths: Sequence[str]) -> list[str]:
         valid = []
         for raw_path in paths:
@@ -99,23 +108,26 @@ class ReIDEmbedder:
         embeddings = self.embed_batch([path])
         return embeddings[0] if embeddings else None
 
-    def embed_batch(self, paths: Sequence[str]) -> list[list[float]]:
+    def embed_batch(self, paths: Sequence[str], batch_size: int | None = None) -> list[list[float]]:
         self.load(self._device)
         valid_paths = self._valid_paths(paths)
         if not valid_paths:
             return []
 
-        features = self._extractor(valid_paths)
-        try:
-            features_np = features.detach().cpu().numpy()
-        except AttributeError:
-            features_np = np.asarray(features)
-
+        chunk_size = batch_size or len(valid_paths)
         embeddings: list[list[float]] = []
-        for raw_embedding in np.asarray(features_np, dtype=np.float32):
-            normalized = _normalize(raw_embedding)
-            if normalized is not None:
-                embeddings.append(normalized.astype(float).tolist())
+        for start in range(0, len(valid_paths), chunk_size):
+            chunk = valid_paths[start:start + chunk_size]
+            features = self._extractor(chunk)
+            try:
+                features_np = features.detach().cpu().numpy()
+            except AttributeError:
+                features_np = np.asarray(features)
+
+            for raw_embedding in np.asarray(features_np, dtype=np.float32):
+                normalized = _normalize(raw_embedding)
+                if normalized is not None:
+                    embeddings.append(normalized.astype(float).tolist())
         return embeddings
 
 
@@ -124,3 +136,9 @@ _instance = ReIDEmbedder()
 
 def get_reid_embedder() -> ReIDEmbedder:
     return _instance
+
+
+def release_reid_embedder() -> None:
+    from forensics.person_creation.utils.memory import cleanup_memory
+    _instance.unload()
+    cleanup_memory("release_reid_embedder")

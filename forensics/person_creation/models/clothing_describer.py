@@ -36,7 +36,12 @@ class ClothingDescriber:
         self._tokenizer = None
         self._device = "cuda"
 
+    def is_loaded(self) -> bool:
+        return self._model is not None
+
     def load(self, model_id: str = "OpenGVLab/InternVL3_5-2B", device: str = "cuda") -> None:
+        if self._model is not None:
+            return
         import torch
         from transformers import AutoTokenizer, AutoModel
 
@@ -58,6 +63,14 @@ class ClothingDescriber:
             trust_remote_code=True,
         ).eval()
         print(f"[ClothingDescriber] loaded {model_id} on {device}")
+
+    def unload(self) -> None:
+        from forensics.person_creation.utils.model_lifecycle import move_to_cpu
+
+        if self._model is not None:
+            move_to_cpu(self._model)
+            self._model = None
+        self._tokenizer = None
 
     def _preprocess(self, crop_bgr: np.ndarray):
         import torch
@@ -89,13 +102,15 @@ class ClothingDescriber:
             question = f"{img_tags}{base_prompt}"
 
         gen_cfg = {"max_new_tokens": 150, "do_sample": False}
-        if n == 1:
-            response = self._model.chat(self._tokenizer, pixel_values, question, gen_cfg)
-        else:
-            response = self._model.chat(
-                self._tokenizer, pixel_values, question, gen_cfg,
-                num_patches_list=[1] * n,
-            )
+        with torch.inference_mode():
+            if n == 1:
+                response = self._model.chat(self._tokenizer, pixel_values, question, gen_cfg)
+            else:
+                response = self._model.chat(
+                    self._tokenizer, pixel_values, question, gen_cfg,
+                    num_patches_list=[1] * n,
+                )
+        del pixel_values
 
         structured = self._parse(response)
         return response, structured
@@ -124,3 +139,9 @@ _instance = ClothingDescriber()
 
 def get_clothing_describer() -> ClothingDescriber:
     return _instance
+
+
+def release_clothing_describer() -> None:
+    from forensics.person_creation.utils.memory import cleanup_memory
+    _instance.unload()
+    cleanup_memory("release_clothing_describer")
