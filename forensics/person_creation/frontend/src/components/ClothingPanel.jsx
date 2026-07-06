@@ -2,8 +2,41 @@ import { useState, useEffect } from 'react'
 
 const FIELDS = ['top', 'bottom', 'shoes', 'full']
 
-export default function ClothingPanel({ bestBodyCrops, clothingStructured, onChange }) {
+function PersonDescription({ personId, index, paths, description }) {
+  return (
+    <div style={{ background: '#0f1117', border: '1px solid #1e2330', borderRadius: 8, padding: 12 }}>
+      <div style={{ fontSize: 14, fontWeight: 600, color: '#e2e8f0', marginBottom: 10 }}>
+        Person {index + 1}
+      </div>
+      {paths.length > 0 && (
+        <div style={{ display: 'flex', gap: 8, marginBottom: 12, overflowX: 'auto', paddingBottom: 4 }}>
+          {paths.map((p, i) => (
+            <img
+              key={p + i}
+              src={`/api/images?path=${encodeURIComponent(p)}`}
+              alt={`${personId} best ${i + 1}`}
+              style={{ height: 100, width: 'auto', borderRadius: 6, border: '1px solid #1e2330', flexShrink: 0 }}
+            />
+          ))}
+        </div>
+      )}
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, fontSize: 13 }}>
+        {FIELDS.map(f => (
+          <div key={f} style={f === 'full' ? { gridColumn: '1 / -1' } : {}}>
+            <div style={{ color: '#64748b', textTransform: 'uppercase', fontSize: 11, marginBottom: 3 }}>{f}</div>
+            <div style={{ color: '#cbd5e1' }}>{description?.[f] || 'unknown'}</div>
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+export default function ClothingPanel({ bestBodyCrops, bestBodyCropsByPerson = {}, clothingStructured, clothingByPerson = {}, onChange }) {
   const [values, setValues] = useState({ top: '', bottom: '', shoes: '', full: '' })
+  const personIds = Object.keys(clothingByPerson).length
+    ? Object.keys(clothingByPerson)
+    : Object.keys(bestBodyCropsByPerson)
 
   useEffect(() => {
     if (clothingStructured && Object.keys(clothingStructured).length) {
@@ -31,9 +64,23 @@ export default function ClothingPanel({ bestBodyCrops, clothingStructured, onCha
 
   return (
     <div className="card">
-      <div className="card-title">Clothing Description</div>
+      <div className="card-title">Review generated descriptions</div>
 
-      {bestBodyCrops.length > 0 && (
+      {personIds.length > 0 && (
+        <div style={{ display: 'grid', gap: 12 }}>
+          {personIds.map((personId, i) => (
+            <PersonDescription
+              key={personId}
+              personId={personId}
+              index={i}
+              paths={bestBodyCropsByPerson[personId] ?? []}
+              description={clothingByPerson[personId] ?? {}}
+            />
+          ))}
+        </div>
+      )}
+
+      {personIds.length === 0 && bestBodyCrops.length > 0 && (
         <div style={{ display: 'flex', gap: '8px', marginBottom: '20px', overflowX: 'auto', paddingBottom: '4px' }}>
           {bestBodyCrops.map((p, i) => (
             <img
@@ -46,14 +93,14 @@ export default function ClothingPanel({ bestBodyCrops, clothingStructured, onCha
         </div>
       )}
 
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
+      {personIds.length === 0 && <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
         {FIELDS.map(f => (
           <div key={f} style={f === 'full' ? { gridColumn: '1 / -1' } : {}}>
             <label style={labelStyle}>{f}</label>
             <input style={inputStyle} value={values[f]} onChange={e => update(f, e.target.value)} placeholder={`Describe ${f}…`} />
           </div>
         ))}
-      </div>
+      </div>}
     </div>
   )
 }

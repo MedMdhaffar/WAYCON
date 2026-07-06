@@ -1,7 +1,9 @@
 import json
 import re
+import sys
 import threading
 import traceback
+import types
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -12,7 +14,33 @@ from langgraph.types import Command
 
 import cv2 as _cv2
 
-from forensics.person_identifier.config import Config as _PIConfig
+#in the future try to fix this 
+#mohamed:
+#I think that removing forensics.person_creation will make the code work
+try:
+    from forensics.person_identifier.config import Config as _PIConfig
+except ModuleNotFoundError as exc:
+    if exc.name not in {
+        "forensics.person_identifier",
+        "forensics.person_identifier.config",
+    }:
+        raise
+
+    class _PIConfig:
+        PROJECT_ROOT = Path(__file__).resolve().parents[2]
+        PROFILE_ROOT = PROJECT_ROOT / "forensics" / "person_db"
+
+        @classmethod
+        def load(cls):
+            return cls()
+
+    _pi_pkg = types.ModuleType("forensics.person_identifier")
+    _pi_pkg.__path__ = []
+    _pi_config_mod = types.ModuleType("forensics.person_identifier.config")
+    _pi_config_mod.Config = _PIConfig
+    sys.modules.setdefault("forensics.person_identifier", _pi_pkg)
+    sys.modules.setdefault("forensics.person_identifier.config", _pi_config_mod)
+
 from forensics.person_creation.path_utils import to_wsl_path as _to_wsl_path
 from forensics.person_creation.tools.cleanup_orphan_crops import (
     cleanup as _cleanup_orphan_crops,
@@ -74,14 +102,20 @@ def _get_graph():
 
 
 _NODE_TO_STATUS = {
-    "load_models":       "loading_models",
+    "prepare_runtime":   "loading_models",
     "process_video":     "processing_video",
     "filter_quality":    "filtering",
+    "auto_associate":    "associating",
+    "track_persons":     "tracking",
+    "promote_crops":     "promoting",
     "embed_faces":       "embedding",
     "human_in_the_loop": "awaiting_pairing",
     "select_best":       "selecting",
+    "select_best_per_person": "selecting",
     "describe_clothing": "describing",
+    "describe_clothing_per_person": "describing",
     "build_profile":     "awaiting_review",
+    "build_multi_profile": "awaiting_review",
     "finalize":          "finalizing",
 }
 
@@ -119,7 +153,7 @@ def _run_pipeline(job_id: str, initial_state: dict, config: dict) -> None:
         # --- Run to second interrupt (build_profile review) ---
         if interrupt_val and "profile_preview" in interrupt_val:
             job.status = "awaiting_review"
-            job.node = "build_profile"
+            job.node = "build_multi_profile"
             job.resume_event.wait()
             job.resume_event.clear()
             review_resume = job.resume_value or {"approved": True, "corrections": None}
@@ -193,9 +227,13 @@ def status(job_id: str):
         "quality_face_crops":  snap.get("quality_face_crops", []),
         "frame_groups":        snap.get("frame_groups", []),
         "associations":        snap.get("associations", []),
+        "person_tracks":       snap.get("person_tracks", []),
         "best_body_crops":     snap.get("best_body_crops", []),
+        "best_body_crops_by_person": snap.get("best_body_crops_by_person", {}),
         "clothing_structured": snap.get("clothing_structured", {}),
+        "clothing_by_person":  snap.get("clothing_by_person", {}),
         "clothing_raw":        snap.get("clothing_raw", ""),
+        "clothing_raw_by_person": snap.get("clothing_raw_by_person", {}),
         "profile":             snap.get("profile", {}),
         "human_feedback_path": snap.get("human_feedback_path", ""),
     }

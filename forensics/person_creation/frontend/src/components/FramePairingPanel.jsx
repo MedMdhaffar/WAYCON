@@ -266,7 +266,7 @@ export default function FramePairingPanel({ jobId, frameGroups, onSubmitted }) {
   if (!frameGroups.length) {
     return (
       <div className="card">
-        <div className="card-title">Pair Faces & Bodies</div>
+        <div className="card-title">Review automatic matches</div>
         <div style={{ textAlign: 'center', color: '#475569', padding: 40 }}>
           Waiting for pipeline to reach pairing stage…
         </div>
@@ -277,7 +277,7 @@ export default function FramePairingPanel({ jobId, frameGroups, onSubmitted }) {
   return (
     <div className="card">
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
-        <div className="card-title" style={{ marginBottom: 0 }}>Pair Faces & Bodies</div>
+        <div className="card-title" style={{ marginBottom: 0 }}>Review automatic matches</div>
         <span style={{ fontSize: 13, color: '#64748b' }}>
           {frameGroups.length} frame groups · {totalPairs} pairs confirmed
         </span>

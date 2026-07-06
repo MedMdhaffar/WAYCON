@@ -3,9 +3,9 @@ import { useState } from 'react'
 const DEFAULT_VIDEOS = ['']
 
 export default function StartForm({ onStart }) {
-  const [name, setName] = useState('Malek')
+  const [name, setName] = useState('session_1')
   const [videos, setVideos] = useState(DEFAULT_VIDEOS)
-  const [outputDir, setOutputDir] = useState('forensics/person_db/malek')
+  const [outputDir, setOutputDir] = useState('forensics/person_db/session_1')
   const [everyN, setEveryN] = useState(5)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
@@ -53,16 +53,19 @@ export default function StartForm({ onStart }) {
 
   return (
     <div className="card">
-      <div className="card-title">New Person Profile</div>
+      <div className="card-title">Process video automatically</div>
+      <div style={{ fontSize: 13, color: '#94a3b8', lineHeight: 1.5, marginBottom: 16 }}>
+        Process a video and automatically detect people, match faces to bodies, and generate descriptions.
+      </div>
       <form onSubmit={handleSubmit} style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
 
         <div>
-          <label style={labelStyle}>Person Name</label>
-          <input style={inputStyle} value={name} onChange={e => setName(e.target.value)} required placeholder="Malek" />
+          <label style={labelStyle}>Session/Profile name</label>
+          <input style={inputStyle} value={name} onChange={e => setName(e.target.value)} required placeholder="session_1" />
         </div>
 
         <div>
-          <label style={labelStyle}>Video Clips</label>
+          <label style={labelStyle}>Video path</label>
           <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
             {videos.map((v, i) => (
               <div key={i} style={{ display: 'flex', gap: '8px' }}>
@@ -82,8 +85,8 @@ export default function StartForm({ onStart }) {
         </div>
 
         <div>
-          <label style={labelStyle}>Output Directory</label>
-          <input style={inputStyle} value={outputDir} onChange={e => setOutputDir(e.target.value)} placeholder="forensics/person_db/malek" />
+          <label style={labelStyle}>Output directory</label>
+          <input style={inputStyle} value={outputDir} onChange={e => setOutputDir(e.target.value)} placeholder="forensics/person_db/session_1" />
         </div>
 
         <div>
@@ -111,7 +114,7 @@ export default function StartForm({ onStart }) {
         )}
 
         <button type="submit" className="btn btn-primary" disabled={loading} style={{ alignSelf: 'flex-start', padding: '10px 24px' }}>
-          {loading ? 'Starting…' : '▶ Start Pipeline'}
+          {loading ? 'Starting...' : 'Process video automatically'}
         </button>
       </form>
     </div>

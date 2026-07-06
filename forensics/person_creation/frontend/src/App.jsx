@@ -2,16 +2,15 @@ import { useState, useEffect, useRef, useCallback } from 'react'
 import StartForm from './components/StartForm.jsx'
 import ProgressTracker from './components/ProgressTracker.jsx'
 import CropsGrid from './components/CropsGrid.jsx'
-import FramePairingPanel from './components/FramePairingPanel.jsx'
 import AssociationsView from './components/AssociationsView.jsx'
 import ClothingPanel from './components/ClothingPanel.jsx'
 import ReviewPanel from './components/ReviewPanel.jsx'
 import ProfileManager from './components/ProfileManager.jsx'
 
-const TABS = ['Setup', 'Progress & Crops', 'Pair Faces & Bodies', 'Review & Approve']
+const TABS = ['Setup', 'Progress & Crops', 'Review generated descriptions']
 const RUNNING_STATUSES = new Set([
   'loading_models', 'processing_video', 'filtering', 'embedding',
-  'selecting', 'describing',
+  'associating', 'tracking', 'promoting', 'selecting', 'describing',
 ])
 
 export default function App() {
@@ -36,11 +35,8 @@ export default function App() {
     pollRef.current = setInterval(async () => {
       const data = await fetchStatus(jobId)
       if (!data) return
-      if (data.status === 'awaiting_pairing') {
+      if (data.status === 'awaiting_review') {
         setTab(2)
-        clearInterval(pollRef.current)
-      } else if (data.status === 'awaiting_review') {
-        setTab(3)
         clearInterval(pollRef.current)
       } else if (data.status === 'done' || data.status === 'error') {
         clearInterval(pollRef.current)
@@ -59,20 +55,6 @@ export default function App() {
     if (jobId) fetchStatus(jobId)
   }, [jobId, fetchStatus])
 
-  const handlePairsSubmitted = useCallback(() => {
-    // Resume polling after pairs confirmed — pipeline continues
-    if (!jobId) return
-    pollRef.current = setInterval(async () => {
-      const data = await fetchStatus(jobId)
-      if (!data) return
-      if (data.status === 'awaiting_review') {
-        setTab(3)
-        clearInterval(pollRef.current)
-      } else if (data.status === 'done' || data.status === 'error') {
-        clearInterval(pollRef.current)
-      }
-    }, 2000)
-  }, [jobId, fetchStatus])
 
   const snapshot = jobStatus?.snapshot ?? {}
   const [clothingOverride, setClothingOverride] = useState(null)
@@ -137,23 +119,18 @@ export default function App() {
         )}
 
         {tab === 2 && (
-          <FramePairingPanel
-            jobId={jobId}
-            frameGroups={snapshot.frame_groups ?? []}
-            onSubmitted={handlePairsSubmitted}
-          />
-        )}
-
-        {tab === 3 && (
           <>
             <AssociationsView
               jobId={jobId}
               associations={snapshot.associations ?? []}
+              people={snapshot.profile?.people ?? snapshot.person_tracks ?? []}
               onDeleted={refreshStatus}
             />
             <ClothingPanel
               bestBodyCrops={snapshot.best_body_crops ?? []}
+              bestBodyCropsByPerson={snapshot.best_body_crops_by_person ?? {}}
               clothingStructured={snapshot.clothing_structured ?? {}}
+              clothingByPerson={snapshot.clothing_by_person ?? {}}
               onChange={setClothingOverride}
             />
             <ReviewPanel

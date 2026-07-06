@@ -53,6 +53,8 @@ forensics/
 | YOLOv8-Face | Face detection | HF Hub `arnabdhar/YOLOv8-Face-Detection` |
 | InceptionResnetV1 (vggface2) | Face embedding → 512-d L2-normalized | `facenet_pytorch` |
 | InternVL3.5-2B | Clothing description (structured JSON) | HF Hub `OpenGVLab/InternVL3_5-2B` |
+| OSNet_x1_0 | Person ReID / body appearance embedding | `torchreid` / deep-person-reid |
+| DominantColorExtractor_v1 | Color signal extraction | Deterministic OpenCV/numpy extractor |
 
 ---
 

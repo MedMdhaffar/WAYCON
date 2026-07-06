@@ -53,11 +53,14 @@ def finalize(state: dict) -> dict:
         print(f"[finalize] removed staging tree: {staging}")
 
     # Defensive orphan sweep — catch anything that slipped through.
-    referenced = (
-        _basenames(profile.get("face_crops"))
-        | _basenames(profile.get("body_crops"))
-        | _basenames(profile.get("best_body_crops"))
-    )
+    referenced: set[str] = set()
+    for person in profile.get("people") or []:
+        crops = person.get("crops") or {}
+        referenced |= (
+            _basenames(crops.get("faces"))
+            | _basenames(crops.get("bodies"))
+            | _basenames(crops.get("best_bodies"))
+        )
     body_del, body_bytes = _prune_orphans(output_dir / "body_crops", referenced)
     face_del, face_bytes = _prune_orphans(output_dir / "face_crops", referenced)
     total_mb = (body_bytes + face_bytes) / (1024 * 1024)

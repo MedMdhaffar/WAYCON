@@ -82,6 +82,27 @@ def promote_crops(state: dict) -> dict:
     promoted_face = filter_and_remap(quality_face_crops)
     promoted_body = filter_and_remap(quality_body_crops)
 
+    promoted_tracks: list[dict] = []
+    for track in state.get("person_tracks") or []:
+        track = dict(track)
+        track["associations"] = [
+            {
+                **assoc,
+                "face_path": remap.get(assoc.get("face_path"), assoc.get("face_path")),
+                "body_path": remap.get(assoc.get("body_path"), assoc.get("body_path")),
+            }
+            for assoc in track.get("associations", [])
+        ]
+        track["face_paths"] = [
+            remap.get(path, path)
+            for path in track.get("face_paths", [])
+        ]
+        track["body_paths"] = [
+            remap.get(path, path)
+            for path in track.get("body_paths", [])
+        ]
+        promoted_tracks.append(track)
+
     print(
         f"[promote_crops] moved "
         f"{sum(1 for v in remap.values() if Path(v).parent.name == 'face_crops')} face, "
@@ -90,8 +111,11 @@ def promote_crops(state: dict) -> dict:
         f"{len(quality_body_crops) - len(promoted_body)} body rejects left in _staging/"
     )
 
-    return {
+    out = {
         "associations": promoted_assoc,
         "quality_face_crops": promoted_face,
         "quality_body_crops": promoted_body,
     }
+    if promoted_tracks:
+        out["person_tracks"] = promoted_tracks
+    return out
