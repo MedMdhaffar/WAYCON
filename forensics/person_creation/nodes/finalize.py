@@ -58,6 +58,12 @@ def finalize(state: dict) -> dict:
         | _basenames(profile.get("body_crops"))
         | _basenames(profile.get("best_body_crops"))
     )
+    for person in profile.get("people") or []:
+        referenced |= (
+            _basenames(person.get("face_crops"))
+            | _basenames(person.get("body_crops"))
+            | _basenames(person.get("best_body_crops"))
+        )
     body_del, body_bytes = _prune_orphans(output_dir / "body_crops", referenced)
     face_del, face_bytes = _prune_orphans(output_dir / "face_crops", referenced)
     total_mb = (body_bytes + face_bytes) / (1024 * 1024)

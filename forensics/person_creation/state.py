@@ -21,11 +21,15 @@ class PersonCreationState(TypedDict):
 
     frame_groups: list[dict]     # [{frame_idx, video, video_name, faces:[...], bodies:[...]}]
     associations: list[dict]     # confirmed pairs from human_in_the_loop
+    person_tracks: list[dict]
     human_feedback_path: str     # absolute path to pairing_feedback.json
     best_body_crops: list[str]   # top-5 body crop paths, temporally spread
+    best_body_crops_by_person: dict[str, list[str]]
 
     clothing_raw: str
     clothing_structured: dict  # {top, bottom, shoes, full}
+    clothing_raw_by_person: dict[str, str]
+    clothing_by_person: dict[str, dict]
 
     review_feedback: dict
     approved: bool

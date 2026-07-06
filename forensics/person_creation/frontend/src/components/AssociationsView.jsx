@@ -94,8 +94,49 @@ function AssocPair({ assoc, jobId, onDeleted }) {
   )
 }
 
-export default function AssociationsView({ jobId, associations, onDeleted }) {
+export default function AssociationsView({ jobId, associations, people = [], onDeleted }) {
   if (!associations.length) return null
+  const matchingMethod = associations.find(a => a.matching_method)?.matching_method
+  const peopleCount = people.length || new Set(associations.map(a => a.person_id).filter(Boolean)).size
+  const grouped = associations.reduce((acc, assoc) => {
+    const key = assoc.person_id || 'unassigned'
+    if (!acc[key]) acc[key] = []
+    acc[key].push(assoc)
+    return acc
+  }, {})
+  const groupIds = Object.keys(grouped)
+
+  if (groupIds.length) {
+    return (
+      <div className="card">
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '10px' }}>
+          <div className="card-title" style={{ marginBottom: 0 }}>Automatic face-body matching ({associations.length})</div>
+        </div>
+        <div style={{ fontSize: '12px', color: '#475569', marginBottom: '14px' }}>
+          Automatic matching completed.
+          {peopleCount > 0 && <> Detected people: <strong style={{ color: '#94a3b8' }}>{peopleCount}</strong>.</>}
+          {matchingMethod && <> Matching method: <code>{matchingMethod}</code>.</>}
+          {' '}Click <strong style={{ color: '#ef4444' }}>x</strong> to permanently delete a wrong pair.
+        </div>
+        <div style={{ display: 'grid', gap: 16 }}>
+          {groupIds.map((personId, groupIdx) => (
+            <div key={personId}>
+              {peopleCount > 0 && (
+                <div style={{ fontSize: 13, color: '#cbd5e1', fontWeight: 600, marginBottom: 8 }}>
+                  {personId === 'unassigned' ? 'Unassigned' : `Person ${groupIdx + 1}`}
+                </div>
+              )}
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: '12px' }}>
+                {grouped[personId].map((a, i) => (
+                  <AssocPair key={a.body_path + i} assoc={a} jobId={jobId} onDeleted={onDeleted} />
+                ))}
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    )
+  }
 
   return (
     <div className="card">

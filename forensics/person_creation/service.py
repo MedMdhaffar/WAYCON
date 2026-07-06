@@ -105,11 +105,17 @@ _NODE_TO_STATUS = {
     "load_models":       "loading_models",
     "process_video":     "processing_video",
     "filter_quality":    "filtering",
+    "auto_associate":    "associating",
+    "track_persons":     "tracking",
+    "promote_crops":     "promoting",
     "embed_faces":       "embedding",
     "human_in_the_loop": "awaiting_pairing",
     "select_best":       "selecting",
+    "select_best_per_person": "selecting",
     "describe_clothing": "describing",
+    "describe_clothing_per_person": "describing",
     "build_profile":     "awaiting_review",
+    "build_multi_profile": "awaiting_review",
     "finalize":          "finalizing",
 }
 
@@ -147,7 +153,7 @@ def _run_pipeline(job_id: str, initial_state: dict, config: dict) -> None:
         # --- Run to second interrupt (build_profile review) ---
         if interrupt_val and "profile_preview" in interrupt_val:
             job.status = "awaiting_review"
-            job.node = "build_profile"
+            job.node = "build_multi_profile"
             job.resume_event.wait()
             job.resume_event.clear()
             review_resume = job.resume_value or {"approved": True, "corrections": None}
@@ -221,9 +227,13 @@ def status(job_id: str):
         "quality_face_crops":  snap.get("quality_face_crops", []),
         "frame_groups":        snap.get("frame_groups", []),
         "associations":        snap.get("associations", []),
+        "person_tracks":       snap.get("person_tracks", []),
         "best_body_crops":     snap.get("best_body_crops", []),
+        "best_body_crops_by_person": snap.get("best_body_crops_by_person", {}),
         "clothing_structured": snap.get("clothing_structured", {}),
+        "clothing_by_person":  snap.get("clothing_by_person", {}),
         "clothing_raw":        snap.get("clothing_raw", ""),
+        "clothing_raw_by_person": snap.get("clothing_raw_by_person", {}),
         "profile":             snap.get("profile", {}),
         "human_feedback_path": snap.get("human_feedback_path", ""),
     }

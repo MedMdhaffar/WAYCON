@@ -7,6 +7,14 @@ export default function ReviewPanel({ jobId, snapshot, clothingOverride, onDone,
 
   const profile = snapshot?.profile ?? {}
   const appearance = profile.appearance ?? snapshot?.clothing_structured ?? {}
+  const people = profile.people ?? (snapshot?.person_tracks ?? []).map(track => ({
+    person_id: track.person_id,
+    description: snapshot?.clothing_by_person?.[track.person_id] ?? {},
+    best_body_crops: snapshot?.best_body_crops_by_person?.[track.person_id] ?? [],
+    face_crops: track.face_paths ?? [],
+    num_observations: track.num_observations ?? 0,
+  }))
+  const peopleCount = profile.people_count ?? people.length
 
   const handleApprove = async () => {
     setError('')
@@ -37,7 +45,7 @@ export default function ReviewPanel({ jobId, snapshot, clothingOverride, onDone,
           <div style={{ fontSize: '48px', marginBottom: '12px' }}>✓</div>
           <div style={{ fontSize: '18px', fontWeight: 600, color: '#22c55e', marginBottom: '8px' }}>Profile Saved</div>
           <div style={{ fontSize: '14px', color: '#64748b' }}>
-            {profile.name} — {profile.face_crop_count} face crops · profile.json written
+            {profile.name} - {peopleCount || 1} detected people - profile.json written
           </div>
         </div>
       </div>
@@ -50,10 +58,16 @@ export default function ReviewPanel({ jobId, snapshot, clothingOverride, onDone,
 
   return (
     <div className="card">
-      <div className="card-title">Profile Review</div>
+      <div className="card-title">Review generated profile</div>
+      <div style={{ fontSize: 13, color: '#22c55e', marginBottom: 12 }}>
+        Automatic matching completed
+      </div>
 
       <div style={{ marginBottom: '20px' }}>
-        <div style={rowStyle}><span style={keyStyle}>Name</span><span style={valStyle}>{profile.name || '—'}</span></div>
+        <div style={rowStyle}><span style={keyStyle}>Session/Profile name</span><span style={valStyle}>{profile.name || '—'}</span></div>
+        {(peopleCount || people.length) > 0 && (
+          <div style={rowStyle}><span style={keyStyle}>Detected people</span><span style={valStyle}>{peopleCount || people.length}</span></div>
+        )}
         <div style={rowStyle}><span style={keyStyle}>Face crops</span><span style={valStyle}>{profile.face_crop_count ?? (snapshot?.quality_face_crops?.length ?? '—')}</span></div>
         <div style={rowStyle}><span style={keyStyle}>Associations</span><span style={valStyle}>{(snapshot?.associations ?? []).length}</span></div>
         <div style={rowStyle}><span style={keyStyle}>Top</span><span style={valStyle}>{appearance.top || '—'}</span></div>
@@ -64,6 +78,28 @@ export default function ReviewPanel({ jobId, snapshot, clothingOverride, onDone,
           <span style={{ ...valStyle, maxWidth: '60%', textAlign: 'right' }}>{appearance.full || '—'}</span>
         </div>
       </div>
+
+      {people.length > 0 && (
+        <div style={{ display: 'grid', gap: 12, marginBottom: 20 }}>
+          {people.map((person, i) => {
+            const desc = person.description ?? {}
+            return (
+              <div key={person.person_id ?? i} style={{ background: '#0f1117', border: '1px solid #1e2330', borderRadius: 8, padding: 12 }}>
+                <div style={{ color: '#e2e8f0', fontWeight: 600, marginBottom: 8 }}>Person {i + 1}</div>
+                <div style={rowStyle}><span style={keyStyle}>Observations</span><span style={valStyle}>{person.num_observations ?? 0}</span></div>
+                <div style={rowStyle}><span style={keyStyle}>Best body crops</span><span style={valStyle}>{person.best_body_crops?.length ?? 0}</span></div>
+                <div style={rowStyle}><span style={keyStyle}>Face crops</span><span style={valStyle}>{person.face_crops?.length ?? 0}</span></div>
+                <div style={rowStyle}><span style={keyStyle}>Top</span><span style={valStyle}>{desc.top || 'unknown'}</span></div>
+                <div style={rowStyle}><span style={keyStyle}>Bottom</span><span style={valStyle}>{desc.bottom || 'unknown'}</span></div>
+                <div style={{ ...rowStyle, borderBottom: 'none' }}>
+                  <span style={keyStyle}>Full</span>
+                  <span style={{ ...valStyle, maxWidth: '60%', textAlign: 'right' }}>{desc.full || 'unknown'}</span>
+                </div>
+              </div>
+            )
+          })}
+        </div>
+      )}
 
       <div style={{ marginBottom: '16px' }}>
         <label style={{ fontSize: '13px', color: '#94a3b8', display: 'block', marginBottom: '6px' }}>Corrections / notes (optional)</label>
