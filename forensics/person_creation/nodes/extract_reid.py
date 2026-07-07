@@ -105,6 +105,18 @@ def extract_reid(state: dict) -> dict:
                 "reid": reid_by_person.get(first_person, _error_block("No valid body crops for ReID")),
             }
 
+        if state.get("person_tracks"):
+            # Multi-person mode without per-person crops: never fall back to
+            # the global crop list — it would mix people into one embedding.
+            print(
+                "[extract_reid][warn] multi-person mode but no per-person body "
+                "crops; skipping global fallback to avoid mixing people"
+            )
+            return {
+                "reid_by_person": {},
+                "reid": _error_block("No per-person body crops in multi-person mode"),
+            }
+
         reid = _extract_for_paths(list(state.get("best_body_crops") or []))
         if reid.get("embedding") is None:
             print(f"[extract_reid] {reid.get('error')}")

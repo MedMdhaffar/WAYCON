@@ -1,0 +1,1427 @@
+{
+  "input_associations_count": 67,
+  "thresholds": {
+    "conservative_tracking": true,
+    "face_continue_min_similarity": 0.72,
+    "face_merge_min_similarity": 0.88,
+    "min_face_crops_for_merge": 2,
+    "min_merge_margin": 0.05,
+    "internal_face_min_similarity": 0.65,
+    "internal_face_mean_similarity": 0.75,
+    "max_frame_gap": 20,
+    "max_match_cost": 0.55
+  },
+  "track_decisions": [
+    {
+      "frame_idx": 185,
+      "video": "4.mp4",
+      "track_id": 1,
+      "candidate_body_path": "forensics/person_db/session_1/_staging/body_crops/4_f000185_b00.jpg",
+      "accepted": false,
+      "reason": "new_track",
+      "rejected_candidates": []
+    },
+    {
+      "frame_idx": 190,
+      "video": "4.mp4",
+      "track_id": 1,
+      "candidate_body_path": "forensics/person_db/session_1/_staging/body_crops/4_f000190_b00.jpg",
+      "accepted": true,
+      "reason": "accepted",
+      "cost": 0.0731,
+      "frame_gap": 5,
+      "center_dist": 0.0363,
+      "iou": 0.9125,
+      "area_change": 0.0537,
+      "face_similarity": 0.9489
+    },
+    {
+      "frame_idx": 195,
+      "video": "4.mp4",
+      "track_id": 1,
+      "candidate_body_path": "forensics/person_db/session_1/_staging/body_crops/4_f000195_b00.jpg",
+      "accepted": true,
+      "reason": "accepted",
+      "cost": 0.0854,
+      "frame_gap": 5,
+      "center_dist": 0.0163,
+      "iou": 0.8694,
+      "area_change": 0.1306,
+      "face_similarity": 0.96
+    },
+    {
+      "frame_idx": 200,
+      "video": "4.mp4",
+      "track_id": 1,
+      "candidate_body_path": "forensics/person_db/session_1/_staging/body_crops/4_f000200_b00.jpg",
+      "accepted": true,
+      "reason": "accepted",
+      "cost": 0.0674,
+      "frame_gap": 5,
+      "center_dist": 0.0043,
+      "iou": 0.8994,
+      "area_change": 0.1006,
+      "face_similarity": 0.9607
+    },
+    {
+      "frame_idx": 205,
+      "video": "4.mp4",
+      "track_id": 1,
+      "candidate_body_path": "forensics/person_db/session_1/_staging/body_crops/4_f000205_b00.jpg",
+      "accepted": true,
+      "reason": "accepted",
+      "cost": 0.0555,
+      "frame_gap": 5,
+      "center_dist": 0.0054,
+      "iou": 0.9305,
+      "area_change": 0.0695,
+      "face_similarity": 0.9508
+    },
+    {
+      "frame_idx": 210,
+      "video": "4.mp4",
+      "track_id": 1,
+      "candidate_body_path": "forensics/person_db/session_1/_staging/body_crops/4_f000210_b00.jpg",
+      "accepted": true,
+      "reason": "accepted",
+      "cost": 0.0402,
+      "frame_gap": 5,
+      "center_dist": 0.009,
+      "iou": 0.9636,
+      "area_change": 0.0108,
+      "face_similarity": 0.9762
+    },
+    {
+      "frame_idx": 215,
+      "video": "4.mp4",
+      "track_id": 1,
+      "candidate_body_path": "forensics/person_db/session_1/_staging/body_crops/4_f000215_b00.jpg",
+      "accepted": true,
+      "reason": "accepted",
+      "cost": 0.0531,
+      "frame_gap": 5,
+      "center_dist": 0.0133,
+      "iou": 0.9343,
+      "area_change": 0.0333,
+      "face_similarity": 0.9672
+    },
+    {
+      "frame_idx": 220,
+      "video": "4.mp4",
+      "track_id": 1,
+      "candidate_body_path": "forensics/person_db/session_1/_staging/body_crops/4_f000220_b00.jpg",
+      "accepted": true,
+      "reason": "accepted",
+      "cost": 0.0564,
+      "frame_gap": 5,
+      "center_dist": 0.0129,
+      "iou": 0.9372,
+      "area_change": 0.0615,
+      "face_similarity": 0.973
+    },
+    {
+      "frame_idx": 225,
+      "video": "4.mp4",
+      "track_id": 1,
+      "candidate_body_path": "forensics/person_db/session_1/_staging/body_crops/4_f000225_b00.jpg",
+      "accepted": true,
+      "reason": "accepted",
+      "cost": 0.0505,
+      "frame_gap": 5,
+      "center_dist": 0.0099,
+      "iou": 0.9401,
+      "area_change": 0.0374,
+      "face_similarity": 0.9735
+    },
+    {
+      "frame_idx": 230,
+      "video": "4.mp4",
+      "track_id": 1,
+      "candidate_body_path": "forensics/person_db/session_1/_staging/body_crops/4_f000230_b00.jpg",
+      "accepted": true,
+      "reason": "accepted",
+      "cost": 0.0605,
+      "frame_gap": 5,
+      "center_dist": 0.0128,
+      "iou": 0.9111,
+      "area_change": 0.0461,
+      "face_similarity": 0.9553
+    },
+    {
+      "frame_idx": 235,
+      "video": "4.mp4",
+      "track_id": 1,
+      "candidate_body_path": "forensics/person_db/session_1/_staging/body_crops/4_f000235_b00.jpg",
+      "accepted": true,
+      "reason": "accepted",
+      "cost": 0.073,
+      "frame_gap": 5,
+      "center_dist": 0.0162,
+      "iou": 0.9002,
+      "area_change": 0.0998,
+      "face_similarity": 0.9609
+    },
+    {
+      "frame_idx": 240,
+      "video": "4.mp4",
+      "track_id": 1,
+      "candidate_body_path": "forensics/person_db/session_1/_staging/body_crops/4_f000240_b00.jpg",
+      "accepted": true,
+      "reason": "accepted",
+      "cost": 0.0662,
+      "frame_gap": 5,
+      "center_dist": 0.0035,
+      "iou": 0.9012,
+      "area_change": 0.0988,
+      "face_similarity": 0.9568
+    },
+    {
+      "frame_idx": 245,
+      "video": "4.mp4",
+      "track_id": 1,
+      "candidate_body_path": "forensics/person_db/session_1/_staging/body_crops/4_f000245_b00.jpg",
+      "accepted": true,
+      "reason": "accepted",
+      "cost": 0.0606,
+      "frame_gap": 5,
+      "center_dist": 0.0171,
+      "iou": 0.9266,
+      "area_change": 0.0584,
+      "face_similarity": 0.9568
+    },
+    {
+      "frame_idx": 250,
+      "video": "4.mp4",
+      "track_id": 1,
+      "candidate_body_path": "forensics/person_db/session_1/_staging/body_crops/4_f000250_b00.jpg",
+      "accepted": true,
+      "reason": "accepted",
+      "cost": 0.0682,
+      "frame_gap": 5,
+      "center_dist": 0.0313,
+      "iou": 0.898,
+      "area_change": 0.0137,
+      "face_similarity": 0.935
+    },
+    {
+      "frame_idx": 255,
+      "video": "4.mp4",
+      "track_id": 1,
+      "candidate_body_path": "forensics/person_db/session_1/_staging/body_crops/4_f000255_b00.jpg",
+      "accepted": true,
+      "reason": "accepted",
+      "cost": 0.1238,
+      "frame_gap": 5,
+      "center_dist": 0.0698,
+      "iou": 0.8078,
+      "area_change": 0.1057,
+      "face_similarity": 0.9447
+    },
+    {
+      "frame_idx": 260,
+      "video": "4.mp4",
+      "track_id": 1,
+      "candidate_body_path": "forensics/person_db/session_1/_staging/body_crops/4_f000260_b00.jpg",
+      "accepted": true,
+      "reason": "accepted",
+      "cost": 0.1142,
+      "frame_gap": 5,
+      "center_dist": 0.0672,
+      "iou": 0.8292,
+      "area_change": 0.0857,
+      "face_similarity": 0.9119
+    },
+    {
+      "frame_idx": 265,
+      "video": "4.mp4",
+      "track_id": 1,
+      "candidate_body_path": "forensics/person_db/session_1/_staging/body_crops/4_f000265_b00.jpg",
+      "accepted": true,
+      "reason": "accepted",
+      "cost": 0.0951,
+      "frame_gap": 5,
+      "center_dist": 0.0611,
+      "iou": 0.8522,
+      "area_change": 0.0171,
+      "face_similarity": 0.8366
+    },
+    {
+      "frame_idx": 270,
+      "video": "4.mp4",
+      "track_id": 1,
+      "candidate_body_path": "forensics/person_db/session_1/_staging/body_crops/4_f000270_b00.jpg",
+      "accepted": true,
+      "reason": "accepted",
+      "cost": 0.1143,
+      "frame_gap": 5,
+      "center_dist": 0.0677,
+      "iou": 0.8246,
+      "area_change": 0.0774,
+      "face_similarity": 0.8337
+    },
+    {
+      "frame_idx": 275,
+      "video": "4.mp4",
+      "track_id": 1,
+      "candidate_body_path": "forensics/person_db/session_1/_staging/body_crops/4_f000275_b00.jpg",
+      "accepted": true,
+      "reason": "accepted",
+      "cost": 0.1303,
+      "frame_gap": 5,
+      "center_dist": 0.0836,
+      "iou": 0.7908,
+      "area_change": 0.0744,
+      "face_similarity": 0.7514
+    },
+    {
+      "frame_idx": 280,
+      "video": "4.mp4",
+      "track_id": 2,
+      "candidate_body_path": "forensics/person_db/session_1/_staging/body_crops/4_f000280_b00.jpg",
+      "accepted": false,
+      "reason": "new_track",
+      "rejected_candidates": [
+        {
+          "track_id": 1,
+          "reason": "face_similarity_low",
+          "frame_gap": 5,
+          "face_similarity": 0.3471
+        }
+      ]
+    },
+    {
+      "frame_idx": 285,
+      "video": "4.mp4",
+      "track_id": 2,
+      "candidate_body_path": "forensics/person_db/session_1/_staging/body_crops/4_f000285_b00.jpg",
+      "accepted": true,
+      "reason": "accepted",
+      "cost": 0.3053,
+      "frame_gap": 5,
+      "center_dist": 0.2654,
+      "iou": 0.4397,
+      "area_change": 0.0502,
+      "face_similarity": 0.8104
+    },
+    {
+      "frame_idx": 315,
+      "video": "4.mp4",
+      "track_id": 3,
+      "candidate_body_path": "forensics/person_db/session_1/_staging/body_crops/4_f000315_b00.jpg",
+      "accepted": false,
+      "reason": "new_track",
+      "rejected_candidates": []
+    },
+    {
+      "frame_idx": 320,
+      "video": "4.mp4",
+      "track_id": 3,
+      "candidate_body_path": "forensics/person_db/session_1/_staging/body_crops/4_f000320_b00.jpg",
+      "accepted": true,
+      "reason": "accepted",
+      "cost": 0.1083,
+      "frame_gap": 5,
+      "center_dist": 0.0548,
+      "iou": 0.8539,
+      "area_change": 0.1294,
+      "face_similarity": 0.9414
+    },
+    {
+      "frame_idx": 325,
+      "video": "4.mp4",
+      "track_id": 3,
+      "candidate_body_path": "forensics/person_db/session_1/_staging/body_crops/4_f000325_b00.jpg",
+      "accepted": true,
+      "reason": "accepted",
+      "cost": 0.068,
+      "frame_gap": 5,
+      "center_dist": 0.0191,
+      "iou": 0.9013,
+      "area_change": 0.0588,
+      "face_similarity": 0.9304
+    },
+    {
+      "frame_idx": 330,
+      "video": "4.mp4",
+      "track_id": 3,
+      "candidate_body_path": "forensics/person_db/session_1/_staging/body_crops/4_f000330_b00.jpg",
+      "accepted": true,
+      "reason": "accepted",
+      "cost": 0.054,
+      "frame_gap": 5,
+      "center_dist": 0.0101,
+      "iou": 0.936,
+      "area_change": 0.0534,
+      "face_similarity": 0.9379
+    },
+    {
+      "frame_idx": 335,
+      "video": "4.mp4",
+      "track_id": 3,
+      "candidate_body_path": "forensics/person_db/session_1/_staging/body_crops/4_f000335_b00.jpg",
+      "accepted": true,
+      "reason": "accepted",
+      "cost": 0.0783,
+      "frame_gap": 5,
+      "center_dist": 0.0059,
+      "iou": 0.8738,
+      "area_change": 0.1252,
+      "face_similarity": 0.829
+    },
+    {
+      "frame_idx": 340,
+      "video": "4.mp4",
+      "track_id": 3,
+      "candidate_body_path": "forensics/person_db/session_1/_staging/body_crops/4_f000340_b00.jpg",
+      "accepted": true,
+      "reason": "accepted",
+      "cost": 0.0444,
+      "frame_gap": 5,
+      "center_dist": 0.0072,
+      "iou": 0.9553,
+      "area_change": 0.0314,
+      "face_similarity": 0.9098
+    },
+    {
+      "frame_idx": 345,
+      "video": "4.mp4",
+      "track_id": 3,
+      "candidate_body_path": "forensics/person_db/session_1/_staging/body_crops/4_f000345_b00.jpg",
+      "accepted": true,
+      "reason": "accepted",
+      "cost": 0.0709,
+      "frame_gap": 5,
+      "center_dist": 0.0217,
+      "iou": 0.8884,
+      "area_change": 0.0478,
+      "face_similarity": 0.9019
+    },
+    {
+      "frame_idx": 345,
+      "video": "4.mp4",
+      "track_id": 4,
+      "candidate_body_path": "forensics/person_db/session_1/_staging/body_crops/4_f000345_b02.jpg",
+      "accepted": false,
+      "reason": "new_track",
+      "rejected_candidates": [
+        {
+          "track_id": 3,
+          "reason": "face_similarity_low",
+          "frame_gap": 5,
+          "face_similarity": 0.3637
+        }
+      ]
+    },
+    {
+      "frame_idx": 350,
+      "video": "4.mp4",
+      "track_id": 3,
+      "candidate_body_path": "forensics/person_db/session_1/_staging/body_crops/4_f000350_b00.jpg",
+      "accepted": true,
+      "reason": "accepted",
+      "cost": 0.0634,
+      "frame_gap": 5,
+      "center_dist": 0.0112,
+      "iou": 0.9178,
+      "area_change": 0.0818,
+      "face_similarity": 0.9072
+    },
+    {
+      "frame_idx": 350,
+      "video": "4.mp4",
+      "track_id": 4,
+      "candidate_body_path": "forensics/person_db/session_1/_staging/body_crops/4_f000350_b02.jpg",
+      "accepted": true,
+      "reason": "accepted",
+      "cost": 0.0757,
+      "frame_gap": 5,
+      "center_dist": 0.0067,
+      "iou": 0.8791,
+      "area_change": 0.1141,
+      "face_similarity": 0.9783
+    },
+    {
+      "frame_idx": 355,
+      "video": "4.mp4",
+      "track_id": 3,
+      "candidate_body_path": "forensics/person_db/session_1/_staging/body_crops/4_f000355_b00.jpg",
+      "accepted": true,
+      "reason": "accepted",
+      "cost": 0.049,
+      "frame_gap": 5,
+      "center_dist": 0.006,
+      "iou": 0.9452,
+      "area_change": 0.0487,
+      "face_similarity": 0.9009
+    },
+    {
+      "frame_idx": 355,
+      "video": "4.mp4",
+      "track_id": 4,
+      "candidate_body_path": "forensics/person_db/session_1/_staging/body_crops/4_f000355_b02.jpg",
+      "accepted": true,
+      "reason": "accepted",
+      "cost": 0.0599,
+      "frame_gap": 5,
+      "center_dist": 0.0295,
+      "iou": 0.9287,
+      "area_change": 0.0154,
+      "face_similarity": 0.9544
+    },
+    {
+      "frame_idx": 360,
+      "video": "4.mp4",
+      "track_id": 3,
+      "candidate_body_path": "forensics/person_db/session_1/_staging/body_crops/4_f000360_b00.jpg",
+      "accepted": true,
+      "reason": "accepted",
+      "cost": 0.0575,
+      "frame_gap": 5,
+      "center_dist": 0.0128,
+      "iou": 0.9202,
+      "area_change": 0.0408,
+      "face_similarity": 0.8697
+    },
+    {
+      "frame_idx": 365,
+      "video": "4.mp4",
+      "track_id": 3,
+      "candidate_body_path": "forensics/person_db/session_1/_staging/body_crops/4_f000365_b00.jpg",
+      "accepted": true,
+      "reason": "accepted",
+      "cost": 0.0766,
+      "frame_gap": 5,
+      "center_dist": 0.0313,
+      "iou": 0.8744,
+      "area_change": 0.0303,
+      "face_similarity": 0.7635
+    },
+    {
+      "frame_idx": 365,
+      "video": "4.mp4",
+      "track_id": 4,
+      "candidate_body_path": "forensics/person_db/session_1/_staging/body_crops/4_f000365_b02.jpg",
+      "accepted": true,
+      "reason": "accepted",
+      "cost": 0.3512,
+      "frame_gap": 10,
+      "center_dist": 0.2134,
+      "iou": 0.4235,
+      "area_change": 0.3359,
+      "face_similarity": 0.9362
+    },
+    {
+      "frame_idx": 380,
+      "video": "4.mp4",
+      "track_id": 4,
+      "candidate_body_path": "forensics/person_db/session_1/_staging/body_crops/4_f000380_b02.jpg",
+      "accepted": true,
+      "reason": "accepted",
+      "cost": 0.3289,
+      "frame_gap": 15,
+      "center_dist": 0.2153,
+      "iou": 0.4581,
+      "area_change": 0.0717,
+      "face_similarity": 0.942
+    },
+    {
+      "frame_idx": 385,
+      "video": "4.mp4",
+      "track_id": 4,
+      "candidate_body_path": "forensics/person_db/session_1/_staging/body_crops/4_f000385_b01.jpg",
+      "accepted": true,
+      "reason": "accepted",
+      "cost": 0.3188,
+      "frame_gap": 5,
+      "center_dist": 0.1567,
+      "iou": 0.4614,
+      "area_change": 0.5386,
+      "face_similarity": 0.952
+    },
+    {
+      "frame_idx": 385,
+      "video": "4.mp4",
+      "track_id": 5,
+      "candidate_body_path": "forensics/person_db/session_1/_staging/body_crops/4_f000385_b00.jpg",
+      "accepted": false,
+      "reason": "new_track",
+      "rejected_candidates": [
+        {
+          "track_id": 3,
+          "reason": "face_similarity_low",
+          "frame_gap": 20,
+          "face_similarity": 0.2514
+        },
+        {
+          "track_id": 4,
+          "reason": "face_similarity_low",
+          "frame_gap": 5,
+          "face_similarity": 0.2265
+        }
+      ]
+    },
+    {
+      "frame_idx": 390,
+      "video": "4.mp4",
+      "track_id": 4,
+      "candidate_body_path": "forensics/person_db/session_1/_staging/body_crops/4_f000390_b01.jpg",
+      "accepted": true,
+      "reason": "accepted",
+      "cost": 0.179,
+      "frame_gap": 5,
+      "center_dist": 0.0985,
+      "iou": 0.7381,
+      "area_change": 0.2619,
+      "face_similarity": 0.9552
+    },
+    {
+      "frame_idx": 390,
+      "video": "4.mp4",
+      "track_id": 6,
+      "candidate_body_path": "forensics/person_db/session_1/_staging/body_crops/4_f000390_b02.jpg",
+      "accepted": false,
+      "reason": "new_track",
+      "rejected_candidates": [
+        {
+          "track_id": 4,
+          "reason": "face_similarity_low",
+          "frame_gap": 5,
+          "face_similarity": 0.2693
+        },
+        {
+          "track_id": 5,
+          "reason": "face_similarity_low",
+          "frame_gap": 5,
+          "face_similarity": 0.3774
+        }
+      ]
+    },
+    {
+      "frame_idx": 395,
+      "video": "4.mp4",
+      "track_id": 4,
+      "candidate_body_path": "forensics/person_db/session_1/_staging/body_crops/4_f000395_b00.jpg",
+      "accepted": true,
+      "reason": "accepted",
+      "cost": 0.0474,
+      "frame_gap": 5,
+      "center_dist": 0.0095,
+      "iou": 0.9554,
+      "area_change": 0.0433,
+      "face_similarity": 0.9606
+    },
+    {
+      "frame_idx": 395,
+      "video": "4.mp4",
+      "track_id": 5,
+      "candidate_body_path": "forensics/person_db/session_1/_staging/body_crops/4_f000395_b01.jpg",
+      "accepted": true,
+      "reason": "accepted",
+      "cost": 0.1196,
+      "frame_gap": 10,
+      "center_dist": 0.0314,
+      "iou": 0.8401,
+      "area_change": 0.0928,
+      "face_similarity": 0.8645
+    },
+    {
+      "frame_idx": 395,
+      "video": "4.mp4",
+      "track_id": 6,
+      "candidate_body_path": "forensics/person_db/session_1/_staging/body_crops/4_f000395_b02.jpg",
+      "accepted": true,
+      "reason": "accepted",
+      "cost": 0.2363,
+      "frame_gap": 5,
+      "center_dist": 0.1826,
+      "iou": 0.5611,
+      "area_change": 0.0683,
+      "face_similarity": 0.8646
+    },
+    {
+      "frame_idx": 400,
+      "video": "4.mp4",
+      "track_id": 4,
+      "candidate_body_path": "forensics/person_db/session_1/_staging/body_crops/4_f000400_b01.jpg",
+      "accepted": true,
+      "reason": "accepted",
+      "cost": 0.0307,
+      "frame_gap": 5,
+      "center_dist": 0.0032,
+      "iou": 0.9869,
+      "area_change": 0.0056,
+      "face_similarity": 0.968
+    },
+    {
+      "frame_idx": 400,
+      "video": "4.mp4",
+      "track_id": 7,
+      "candidate_body_path": "forensics/person_db/session_1/_staging/body_crops/4_f000400_b02.jpg",
+      "accepted": false,
+      "reason": "new_track",
+      "rejected_candidates": [
+        {
+          "track_id": 4,
+          "reason": "face_similarity_low",
+          "frame_gap": 5,
+          "face_similarity": 0.3219
+        },
+        {
+          "track_id": 5,
+          "reason": "face_similarity_low",
+          "frame_gap": 5,
+          "face_similarity": 0.4555
+        },
+        {
+          "track_id": 6,
+          "reason": "face_similarity_low",
+          "frame_gap": 5,
+          "face_similarity": 0.5962
+        }
+      ]
+    },
+    {
+      "frame_idx": 405,
+      "video": "4.mp4",
+      "track_id": 4,
+      "candidate_body_path": "forensics/person_db/session_1/_staging/body_crops/4_f000405_b01.jpg",
+      "accepted": true,
+      "reason": "accepted",
+      "cost": 0.0421,
+      "frame_gap": 5,
+      "center_dist": 0.0098,
+      "iou": 0.9556,
+      "area_change": 0.0071,
+      "face_similarity": 0.9779
+    },
+    {
+      "frame_idx": 410,
+      "video": "4.mp4",
+      "track_id": 4,
+      "candidate_body_path": "forensics/person_db/session_1/_staging/body_crops/4_f000410_b00.jpg",
+      "accepted": true,
+      "reason": "accepted",
+      "cost": 0.0705,
+      "frame_gap": 5,
+      "center_dist": 0.0222,
+      "iou": 0.8965,
+      "area_change": 0.057,
+      "face_similarity": 0.9681
+    },
+    {
+      "frame_idx": 415,
+      "video": "4.mp4",
+      "track_id": 4,
+      "candidate_body_path": "forensics/person_db/session_1/_staging/body_crops/4_f000415_b00.jpg",
+      "accepted": true,
+      "reason": "accepted",
+      "cost": 0.0782,
+      "frame_gap": 5,
+      "center_dist": 0.0253,
+      "iou": 0.8944,
+      "area_change": 0.0945,
+      "face_similarity": 0.9652
+    },
+    {
+      "frame_idx": 420,
+      "video": "4.mp4",
+      "track_id": 4,
+      "candidate_body_path": "forensics/person_db/session_1/_staging/body_crops/4_f000420_b00.jpg",
+      "accepted": true,
+      "reason": "accepted",
+      "cost": 0.0524,
+      "frame_gap": 5,
+      "center_dist": 0.0105,
+      "iou": 0.9423,
+      "area_change": 0.0515,
+      "face_similarity": 0.9535
+    },
+    {
+      "frame_idx": 425,
+      "video": "4.mp4",
+      "track_id": 4,
+      "candidate_body_path": "forensics/person_db/session_1/_staging/body_crops/4_f000425_b00.jpg",
+      "accepted": true,
+      "reason": "accepted",
+      "cost": 0.0481,
+      "frame_gap": 5,
+      "center_dist": 0.005,
+      "iou": 0.9411,
+      "area_change": 0.0395,
+      "face_similarity": 0.9618
+    },
+    {
+      "frame_idx": 440,
+      "video": "4.mp4",
+      "track_id": 4,
+      "candidate_body_path": "forensics/person_db/session_1/_staging/body_crops/4_f000440_b00.jpg",
+      "accepted": true,
+      "reason": "accepted",
+      "cost": 0.1579,
+      "frame_gap": 15,
+      "center_dist": 0.0228,
+      "iou": 0.8213,
+      "area_change": 0.1786,
+      "face_similarity": 0.9411
+    },
+    {
+      "frame_idx": 445,
+      "video": "4.mp4",
+      "track_id": 4,
+      "candidate_body_path": "forensics/person_db/session_1/_staging/body_crops/4_f000445_b00.jpg",
+      "accepted": true,
+      "reason": "accepted",
+      "cost": 0.0915,
+      "frame_gap": 5,
+      "center_dist": 0.0525,
+      "iou": 0.8456,
+      "area_change": 0.0109,
+      "face_similarity": 0.9191
+    },
+    {
+      "frame_idx": 450,
+      "video": "4.mp4",
+      "track_id": 4,
+      "candidate_body_path": "forensics/person_db/session_1/_staging/body_crops/4_f000450_b00.jpg",
+      "accepted": true,
+      "reason": "accepted",
+      "cost": 0.152,
+      "frame_gap": 5,
+      "center_dist": 0.1038,
+      "iou": 0.7213,
+      "area_change": 0.0362,
+      "face_similarity": 0.846
+    },
+    {
+      "frame_idx": 455,
+      "video": "4.mp4",
+      "track_id": 4,
+      "candidate_body_path": "forensics/person_db/session_1/_staging/body_crops/4_f000455_b00.jpg",
+      "accepted": true,
+      "reason": "accepted",
+      "cost": 0.1849,
+      "frame_gap": 5,
+      "center_dist": 0.1289,
+      "iou": 0.6736,
+      "area_change": 0.0924,
+      "face_similarity": 0.7659
+    },
+    {
+      "frame_idx": 455,
+      "video": "4.mp4",
+      "track_id": 8,
+      "candidate_body_path": "forensics/person_db/session_1/_staging/body_crops/4_f000455_b02.jpg",
+      "accepted": false,
+      "reason": "new_track",
+      "rejected_candidates": [
+        {
+          "track_id": 4,
+          "reason": "face_similarity_low",
+          "frame_gap": 5,
+          "face_similarity": 0.1461
+        }
+      ]
+    },
+    {
+      "frame_idx": 460,
+      "video": "4.mp4",
+      "track_id": 8,
+      "candidate_body_path": "forensics/person_db/session_1/_staging/body_crops/4_f000460_b01.jpg",
+      "accepted": true,
+      "reason": "accepted",
+      "cost": 0.1238,
+      "frame_gap": 5,
+      "center_dist": 0.0458,
+      "iou": 0.7914,
+      "area_change": 0.1579,
+      "face_similarity": 0.9567
+    },
+    {
+      "frame_idx": 460,
+      "video": "4.mp4",
+      "track_id": 9,
+      "candidate_body_path": "forensics/person_db/session_1/_staging/body_crops/4_f000460_b00.jpg",
+      "accepted": false,
+      "reason": "new_track",
+      "rejected_candidates": [
+        {
+          "track_id": 4,
+          "reason": "face_similarity_low",
+          "frame_gap": 5,
+          "face_similarity": 0.6498
+        },
+        {
+          "track_id": 8,
+          "reason": "face_similarity_low",
+          "frame_gap": 5,
+          "face_similarity": 0.2641
+        }
+      ]
+    },
+    {
+      "frame_idx": 460,
+      "video": "4.mp4",
+      "track_id": 10,
+      "candidate_body_path": "forensics/person_db/session_1/_staging/body_crops/4_f000460_b02.jpg",
+      "accepted": false,
+      "reason": "new_track",
+      "rejected_candidates": [
+        {
+          "track_id": 4,
+          "reason": "face_similarity_low",
+          "frame_gap": 5,
+          "face_similarity": 0.4182
+        },
+        {
+          "track_id": 8,
+          "reason": "face_similarity_low",
+          "frame_gap": 5,
+          "face_similarity": 0.0756
+        }
+      ]
+    },
+    {
+      "frame_idx": 465,
+      "video": "4.mp4",
+      "track_id": 8,
+      "candidate_body_path": "forensics/person_db/session_1/_staging/body_crops/4_f000465_b01.jpg",
+      "accepted": true,
+      "reason": "accepted",
+      "cost": 0.19,
+      "frame_gap": 5,
+      "center_dist": 0.099,
+      "iou": 0.675,
+      "area_change": 0.2284,
+      "face_similarity": 0.9186
+    },
+    {
+      "frame_idx": 465,
+      "video": "4.mp4",
+      "track_id": 11,
+      "candidate_body_path": "forensics/person_db/session_1/_staging/body_crops/4_f000465_b00.jpg",
+      "accepted": false,
+      "reason": "new_track",
+      "rejected_candidates": [
+        {
+          "track_id": 4,
+          "reason": "face_similarity_low",
+          "frame_gap": 10,
+          "face_similarity": 0.0243
+        },
+        {
+          "track_id": 8,
+          "reason": "face_similarity_low",
+          "frame_gap": 5,
+          "face_similarity": 0.1968
+        },
+        {
+          "track_id": 9,
+          "reason": "face_similarity_low",
+          "frame_gap": 5,
+          "face_similarity": 0.2408
+        },
+        {
+          "track_id": 10,
+          "reason": "face_similarity_low",
+          "frame_gap": 5,
+          "face_similarity": -0.0405
+        }
+      ]
+    },
+    {
+      "frame_idx": 470,
+      "video": "4.mp4",
+      "track_id": 8,
+      "candidate_body_path": "forensics/person_db/session_1/_staging/body_crops/4_f000470_b00.jpg",
+      "accepted": true,
+      "reason": "accepted",
+      "cost": 0.0959,
+      "frame_gap": 5,
+      "center_dist": 0.0453,
+      "iou": 0.8648,
+      "area_change": 0.0963,
+      "face_similarity": 0.8937
+    },
+    {
+      "frame_idx": 475,
+      "video": "4.mp4",
+      "track_id": 8,
+      "candidate_body_path": "forensics/person_db/session_1/_staging/body_crops/4_f000475_b01.jpg",
+      "accepted": true,
+      "reason": "accepted",
+      "cost": 0.0776,
+      "frame_gap": 5,
+      "center_dist": 0.0282,
+      "iou": 0.9037,
+      "area_change": 0.0963,
+      "face_similarity": 0.9353
+    },
+    {
+      "frame_idx": 480,
+      "video": "4.mp4",
+      "track_id": 8,
+      "candidate_body_path": "forensics/person_db/session_1/_staging/body_crops/4_f000480_b01.jpg",
+      "accepted": true,
+      "reason": "accepted",
+      "cost": 0.0956,
+      "frame_gap": 5,
+      "center_dist": 0.0609,
+      "iou": 0.8461,
+      "area_change": 0.0111,
+      "face_similarity": 0.8769
+    },
+    {
+      "frame_idx": 485,
+      "video": "4.mp4",
+      "track_id": 8,
+      "candidate_body_path": "forensics/person_db/session_1/_staging/body_crops/4_f000485_b01.jpg",
+      "accepted": true,
+      "reason": "accepted",
+      "cost": 0.0978,
+      "frame_gap": 5,
+      "center_dist": 0.0614,
+      "iou": 0.8374,
+      "area_change": 0.0098,
+      "face_similarity": 0.9132
+    },
+    {
+      "frame_idx": 490,
+      "video": "4.mp4",
+      "track_id": 8,
+      "candidate_body_path": "forensics/person_db/session_1/_staging/body_crops/4_f000490_b01.jpg",
+      "accepted": true,
+      "reason": "accepted",
+      "cost": 0.0875,
+      "frame_gap": 5,
+      "center_dist": 0.0449,
+      "iou": 0.8776,
+      "area_change": 0.063,
+      "face_similarity": 0.8926
+    },
+    {
+      "frame_idx": 495,
+      "video": "4.mp4",
+      "track_id": 8,
+      "candidate_body_path": "forensics/person_db/session_1/_staging/body_crops/4_f000495_b02.jpg",
+      "accepted": true,
+      "reason": "accepted",
+      "cost": 0.1248,
+      "frame_gap": 5,
+      "center_dist": 0.081,
+      "iou": 0.8202,
+      "area_change": 0.0954,
+      "face_similarity": 0.812
+    }
+  ],
+  "merge_decisions": [
+    {
+      "track_a": 1,
+      "track_b": 2,
+      "accepted": false,
+      "reason": "face_similarity_low",
+      "similarity": 0.3465
+    },
+    {
+      "track_a": 1,
+      "track_b": 3,
+      "accepted": false,
+      "reason": "face_similarity_low",
+      "similarity": 0.3339
+    },
+    {
+      "track_a": 1,
+      "track_b": 4,
+      "accepted": false,
+      "reason": "face_similarity_low",
+      "similarity": 0.382
+    },
+    {
+      "track_a": 1,
+      "track_b": 5,
+      "accepted": false,
+      "reason": "face_similarity_low",
+      "similarity": 0.4436
+    },
+    {
+      "track_a": 1,
+      "track_b": 6,
+      "accepted": false,
+      "reason": "face_similarity_low",
+      "similarity": 0.3054
+    },
+    {
+      "track_a": 1,
+      "track_b": 7,
+      "accepted": false,
+      "reason": "insufficient_face_evidence",
+      "similarity": 0.1308
+    },
+    {
+      "track_a": 1,
+      "track_b": 8,
+      "accepted": false,
+      "reason": "face_similarity_low",
+      "similarity": 0.3046
+    },
+    {
+      "track_a": 1,
+      "track_b": 9,
+      "accepted": false,
+      "reason": "insufficient_face_evidence",
+      "similarity": 0.4663
+    },
+    {
+      "track_a": 1,
+      "track_b": 10,
+      "accepted": false,
+      "reason": "insufficient_face_evidence",
+      "similarity": 0.6167
+    },
+    {
+      "track_a": 1,
+      "track_b": 11,
+      "accepted": false,
+      "reason": "insufficient_face_evidence",
+      "similarity": 0.0133
+    },
+    {
+      "track_a": 2,
+      "track_b": 3,
+      "accepted": false,
+      "reason": "face_similarity_low",
+      "similarity": 0.1228
+    },
+    {
+      "track_a": 2,
+      "track_b": 4,
+      "accepted": false,
+      "reason": "face_similarity_low",
+      "similarity": 0.365
+    },
+    {
+      "track_a": 2,
+      "track_b": 5,
+      "accepted": false,
+      "reason": "face_similarity_low",
+      "similarity": 0.7433
+    },
+    {
+      "track_a": 2,
+      "track_b": 6,
+      "accepted": false,
+      "reason": "face_similarity_low",
+      "similarity": 0.3781
+    },
+    {
+      "track_a": 2,
+      "track_b": 7,
+      "accepted": false,
+      "reason": "insufficient_face_evidence",
+      "similarity": 0.3417
+    },
+    {
+      "track_a": 2,
+      "track_b": 8,
+      "accepted": false,
+      "reason": "face_similarity_low",
+      "similarity": 0.0473
+    },
+    {
+      "track_a": 2,
+      "track_b": 9,
+      "accepted": false,
+      "reason": "insufficient_face_evidence",
+      "similarity": 0.4385
+    },
+    {
+      "track_a": 2,
+      "track_b": 10,
+      "accepted": false,
+      "reason": "insufficient_face_evidence",
+      "similarity": 0.5183
+    },
+    {
+      "track_a": 2,
+      "track_b": 11,
+      "accepted": false,
+      "reason": "insufficient_face_evidence",
+      "similarity": 0.1008
+    },
+    {
+      "track_a": 3,
+      "track_b": 4,
+      "accepted": false,
+      "reason": "face_similarity_low",
+      "similarity": 0.4648
+    },
+    {
+      "track_a": 3,
+      "track_b": 5,
+      "accepted": false,
+      "reason": "face_similarity_low",
+      "similarity": 0.2552
+    },
+    {
+      "track_a": 3,
+      "track_b": 6,
+      "accepted": false,
+      "reason": "face_similarity_low",
+      "similarity": 0.6179
+    },
+    {
+      "track_a": 3,
+      "track_b": 7,
+      "accepted": false,
+      "reason": "insufficient_face_evidence",
+      "similarity": 0.3092
+    },
+    {
+      "track_a": 3,
+      "track_b": 8,
+      "accepted": false,
+      "reason": "face_similarity_low",
+      "similarity": 0.0408
+    },
+    {
+      "track_a": 3,
+      "track_b": 9,
+      "accepted": false,
+      "reason": "insufficient_face_evidence",
+      "similarity": 0.4604
+    },
+    {
+      "track_a": 3,
+      "track_b": 10,
+      "accepted": false,
+      "reason": "insufficient_face_evidence",
+      "similarity": 0.332
+    },
+    {
+      "track_a": 3,
+      "track_b": 11,
+      "accepted": false,
+      "reason": "insufficient_face_evidence",
+      "similarity": -0.0975
+    },
+    {
+      "track_a": 4,
+      "track_b": 5,
+      "accepted": false,
+      "reason": "face_similarity_low",
+      "similarity": 0.3363
+    },
+    {
+      "track_a": 4,
+      "track_b": 6,
+      "accepted": false,
+      "reason": "face_similarity_low",
+      "similarity": 0.4064
+    },
+    {
+      "track_a": 4,
+      "track_b": 7,
+      "accepted": false,
+      "reason": "insufficient_face_evidence",
+      "similarity": 0.3537
+    },
+    {
+      "track_a": 4,
+      "track_b": 8,
+      "accepted": false,
+      "reason": "face_similarity_low",
+      "similarity": 0.1987
+    },
+    {
+      "track_a": 4,
+      "track_b": 9,
+      "accepted": false,
+      "reason": "insufficient_face_evidence",
+      "similarity": 0.6498
+    },
+    {
+      "track_a": 4,
+      "track_b": 10,
+      "accepted": false,
+      "reason": "insufficient_face_evidence",
+      "similarity": 0.4182
+    },
+    {
+      "track_a": 4,
+      "track_b": 11,
+      "accepted": false,
+      "reason": "insufficient_face_evidence",
+      "similarity": 0.0243
+    },
+    {
+      "track_a": 5,
+      "track_b": 6,
+      "accepted": false,
+      "reason": "face_similarity_low",
+      "similarity": 0.4727
+    },
+    {
+      "track_a": 5,
+      "track_b": 7,
+      "accepted": false,
+      "reason": "insufficient_face_evidence",
+      "similarity": 0.4555
+    },
+    {
+      "track_a": 5,
+      "track_b": 8,
+      "accepted": false,
+      "reason": "face_similarity_low",
+      "similarity": 0.3553
+    },
+    {
+      "track_a": 5,
+      "track_b": 9,
+      "accepted": false,
+      "reason": "insufficient_face_evidence",
+      "similarity": 0.4094
+    },
+    {
+      "track_a": 5,
+      "track_b": 10,
+      "accepted": false,
+      "reason": "insufficient_face_evidence",
+      "similarity": 0.5869
+    },
+    {
+      "track_a": 5,
+      "track_b": 11,
+      "accepted": false,
+      "reason": "insufficient_face_evidence",
+      "similarity": -0.049
+    },
+    {
+      "track_a": 6,
+      "track_b": 7,
+      "accepted": false,
+      "reason": "insufficient_face_evidence",
+      "similarity": 0.5962
+    },
+    {
+      "track_a": 6,
+      "track_b": 8,
+      "accepted": false,
+      "reason": "face_similarity_low",
+      "similarity": 0.2021
+    },
+    {
+      "track_a": 6,
+      "track_b": 9,
+      "accepted": false,
+      "reason": "insufficient_face_evidence",
+      "similarity": 0.5204
+    },
+    {
+      "track_a": 6,
+      "track_b": 10,
+      "accepted": false,
+      "reason": "insufficient_face_evidence",
+      "similarity": 0.5297
+    },
+    {
+      "track_a": 6,
+      "track_b": 11,
+      "accepted": false,
+      "reason": "insufficient_face_evidence",
+      "similarity": -0.091
+    },
+    {
+      "track_a": 7,
+      "track_b": 8,
+      "accepted": false,
+      "reason": "insufficient_face_evidence",
+      "similarity": 0.3122
+    },
+    {
+      "track_a": 7,
+      "track_b": 9,
+      "accepted": false,
+      "reason": "insufficient_face_evidence",
+      "similarity": 0.3713
+    },
+    {
+      "track_a": 7,
+      "track_b": 10,
+      "accepted": false,
+      "reason": "insufficient_face_evidence",
+      "similarity": 0.2498
+    },
+    {
+      "track_a": 7,
+      "track_b": 11,
+      "accepted": false,
+      "reason": "insufficient_face_evidence",
+      "similarity": 0.1368
+    },
+    {
+      "track_a": 8,
+      "track_b": 9,
+      "accepted": false,
+      "reason": "insufficient_face_evidence",
+      "similarity": 0.3002
+    },
+    {
+      "track_a": 8,
+      "track_b": 10,
+      "accepted": false,
+      "reason": "insufficient_face_evidence",
+      "similarity": 0.1736
+    },
+    {
+      "track_a": 8,
+      "track_b": 11,
+      "accepted": false,
+      "reason": "insufficient_face_evidence",
+      "similarity": 0.1781
+    },
+    {
+      "track_a": 9,
+      "track_b": 10,
+      "accepted": false,
+      "reason": "insufficient_face_evidence",
+      "similarity": 0.5421
+    },
+    {
+      "track_a": 9,
+      "track_b": 11,
+      "accepted": false,
+      "reason": "insufficient_face_evidence",
+      "similarity": 0.2408
+    },
+    {
+      "track_a": 10,
+      "track_b": 11,
+      "accepted": false,
+      "reason": "insufficient_face_evidence",
+      "similarity": -0.0405
+    }
+  ],
+  "split_decisions": [
+    {
+      "track_id": 3,
+      "split": false,
+      "reason": "no_clear_split_point",
+      "internal_min_similarity": 0.5585,
+      "internal_mean_similarity": 0.8235
+    },
+    {
+      "track_id": 4,
+      "split": false,
+      "reason": "no_clear_split_point",
+      "internal_min_similarity": 0.6229,
+      "internal_mean_similarity": 0.893
+    }
+  ],
+  "warnings": [
+    "track_3 has inconsistent face identities (min_sim=0.5585, mean_sim=0.8235) \u2014 probably mixed",
+    "track_4 has inconsistent face identities (min_sim=0.6229, mean_sim=0.8930) \u2014 probably mixed",
+    "person_3 still has low internal face similarity (min=0.5585, mean=0.8235) \u2014 review its crops",
+    "person_4 still has low internal face similarity (min=0.6229, mean=0.8930) \u2014 review its crops"
+  ],
+  "initial_tracks_count": 11,
+  "final_tracks_count": 11
+}

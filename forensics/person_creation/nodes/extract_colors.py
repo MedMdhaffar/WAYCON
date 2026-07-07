@@ -73,6 +73,20 @@ def extract_colors(state: dict) -> dict:
             "color_signals_debug": debug_by_person.get(first_person, {"per_crop": []}),
         }
 
+    if state.get("person_tracks"):
+        # Multi-person mode without per-person crops: never fall back to the
+        # global crop list — it would mix people into one color signal.
+        print(
+            "[extract_colors][warn] multi-person mode but no per-person body "
+            "crops; skipping global fallback to avoid mixing people"
+        )
+        return {
+            "color_signals": _error_block("No per-person body crops in multi-person mode"),
+            "color_signals_debug": {"per_crop": []},
+            "color_signals_by_person": {},
+            "color_signals_debug_by_person": {},
+        }
+
     signals, debug = _extract_for_paths(list(state.get("best_body_crops") or []))
     if signals.get("error"):
         print(f"[extract_colors] {signals['error']}")

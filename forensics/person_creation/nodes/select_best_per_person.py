@@ -46,6 +46,8 @@ def select_best_per_person(state: dict) -> dict:
     for track in person_tracks:
         person_id = track["person_id"]
         best_by_person[person_id] = _select_best_from_associations(track.get("associations") or [])
+        if not best_by_person[person_id]:
+            print(f"[select_best_per_person][warn] {person_id}: no valid body crops")
 
     legacy_best = next((paths for paths in best_by_person.values() if paths), [])
     print(

@@ -4,9 +4,13 @@ from pathlib import Path
 
 from scipy.optimize import linear_sum_assignment
 
+from forensics.person_creation import config
 
-_MATCHING_METHOD = "geometry_hungarian_v1"
-_ACCEPT_COST_THRESHOLD = 0.50
+
+_MATCHING_METHOD = "geometry_hungarian_v2"
+_ACCEPT_COST_THRESHOLD = config.ASSOCIATION_MAX_COST
+_AMBIGUITY_MARGIN = config.ASSOCIATION_AMBIGUITY_MARGIN
+_IMPLAUSIBLE_COST = 1_000_000.0
 
 
 def _clip01(value: float) -> float:
@@ -33,6 +37,30 @@ def _distance_outside_rect(
     dx = max(left - x, 0.0, x - right)
     dy = max(top - y, 0.0, y - bottom)
     return (dx * dx + dy * dy) ** 0.5
+
+
+def _plausible_pair(face: dict, body: dict) -> bool:
+    """Hard gates a face/body pair must pass before it can even be scored.
+    In crowded frames the soft cost alone can still rank an anatomically
+    impossible pair best, so reject those outright."""
+    _fx1, _fy1, _fx2, _fy2, _face_w, face_h, face_cx, face_cy = _bbox_parts(face)
+    body_x1, body_y1, body_x2, _body_y2, body_w, body_h, _body_cx, _body_cy = _bbox_parts(body)
+
+    if body_w <= 0 or body_h <= 0 or face_h <= 0:
+        return False
+
+    ratio = face_h / body_h
+    if not (0.04 <= ratio <= 0.50):
+        return False
+
+    # Face center must sit horizontally within the body (10% slack) and in
+    # the upper half of it.
+    if not (body_x1 - 0.10 * body_w <= face_cx <= body_x2 + 0.10 * body_w):
+        return False
+    if not (body_y1 - 0.10 * body_h <= face_cy <= body_y1 + 0.50 * body_h):
+        return False
+
+    return True
 
 
 def _geometry_cost(face: dict, body: dict) -> float:
@@ -153,19 +181,51 @@ def auto_associate(state: dict) -> dict:
     accepted_face_paths: set[str] = set()
     accepted_body_paths: set[str] = set()
     accepted_costs: list[float] = []
+    rejected_ambiguous = 0
 
     for group in frame_groups:
         faces = group["faces"]
         bodies = group["bodies"]
         cost_matrix = [
-            [_geometry_cost(face, body) for body in bodies]
+            [
+                _geometry_cost(face, body) if _plausible_pair(face, body) else _IMPLAUSIBLE_COST
+                for body in bodies
+            ]
             for face in faces
         ]
 
+        # Hungarian assignment guarantees one face per body and one body per
+        # face within the frame.
         row_ind, col_ind = linear_sum_assignment(cost_matrix)
         for face_idx, body_idx in zip(row_ind, col_ind):
             cost = float(cost_matrix[face_idx][body_idx])
             if cost > _ACCEPT_COST_THRESHOLD:
+                continue
+
+            # Ambiguity rejection: if another body is nearly as good for this
+            # face (or another face for this body), skip the pair rather than
+            # risk corrupting a person profile with the wrong body.
+            alt_body_cost = min(
+                (float(cost_matrix[face_idx][b]) for b in range(len(bodies)) if b != body_idx),
+                default=None,
+            )
+            alt_face_cost = min(
+                (float(cost_matrix[f][body_idx]) for f in range(len(faces)) if f != face_idx),
+                default=None,
+            )
+            ambiguous = any(
+                alt is not None
+                and alt <= _ACCEPT_COST_THRESHOLD
+                and (alt - cost) < _AMBIGUITY_MARGIN
+                for alt in (alt_body_cost, alt_face_cost)
+            )
+            if ambiguous:
+                rejected_ambiguous += 1
+                print(
+                    f"[auto_associate] rejected ambiguous pair in frame "
+                    f"{group['frame_idx']} ({group['video_name']}): "
+                    f"cost={cost:.4f}, alt_body={alt_body_cost}, alt_face={alt_face_cost}"
+                )
                 continue
 
             face = faces[face_idx]
@@ -200,6 +260,7 @@ def auto_associate(state: dict) -> dict:
         "video_sources": state.get("video_paths", []),
         "total_frame_groups_shown": len(frame_groups),
         "confirmed_pairs_count": len(associations),
+        "rejected_ambiguous_count": rejected_ambiguous,
         "deleted_paths_count": len(deleted_paths),
         "confirmed_by_human": False,
         "associations": associations,
@@ -213,6 +274,7 @@ def auto_associate(state: dict) -> dict:
     avg_cost = sum(accepted_costs) / len(accepted_costs) if accepted_costs else 0.0
     print(f"[auto_associate] frame_groups={len(frame_groups)}")
     print(f"[auto_associate] associations={len(associations)}")
+    print(f"[auto_associate] rejected_ambiguous={rejected_ambiguous}")
     print(f"[auto_associate] rejected_crops={len(deleted_paths)}")
     print(f"[auto_associate] avg_accepted_cost={avg_cost:.4f}")
 
