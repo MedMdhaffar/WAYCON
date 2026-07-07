@@ -51,3 +51,9 @@ class PersonCreationState(TypedDict):
 
     profile: dict
     per_cluster_profiles: dict[int, dict]
+    profile_path: str
+    profile_paths: list[str]
+
+    global_memory_db_path: str
+    global_memory_registered_person_ids: list[str]
+    global_memory_registered_count: int

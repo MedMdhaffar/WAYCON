@@ -9,6 +9,7 @@ const NODES = [
   { id: 'describe_clothing', label: 'Describe Clothing' },
   { id: 'build_profile',     label: 'Build Profile' },
   { id: 'finalize',          label: 'Finalize' },
+  { id: 'register_global_memory', label: 'register_global_memory' },
 ]
 
 const STATUS_COLORS = {

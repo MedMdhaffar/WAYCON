@@ -93,12 +93,14 @@ def finalize(state: dict) -> dict:
     output_dir = Path(state["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
     profiles = state.get("per_cluster_profiles") or {}
+    profile_paths: list[str] = []
 
     for raw_cid, profile in profiles.items():
         cid = int(raw_cid)
         profile = _normalize_profile_schema(profile)
         profile_path = output_dir / f"cluster_{cid}" / "profile.json"
         _write_json(profile_path, profile)
+        profile_paths.append(str(profile_path.resolve()))
         print(f"[finalize] profile saved -> {profile_path}")
 
         referenced = (
@@ -128,4 +130,7 @@ def finalize(state: dict) -> dict:
         shutil.rmtree(staging, ignore_errors=True)
         print(f"[finalize] removed staging tree: {staging}")
 
-    return {}
+    return {
+        "profile_path": profile_paths[0] if profile_paths else "",
+        "profile_paths": profile_paths,
+    }

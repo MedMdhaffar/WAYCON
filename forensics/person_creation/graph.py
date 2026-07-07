@@ -14,6 +14,7 @@ from forensics.person_creation.nodes.compute_reid import compute_reid
 from forensics.person_creation.nodes.describe_clothing import describe_clothing
 from forensics.person_creation.nodes.build_profile import build_profile
 from forensics.person_creation.nodes.finalize import finalize
+from forensics.person_creation.nodes.register_global_memory import register_global_memory
 
 
 def build_graph():
@@ -31,6 +32,7 @@ def build_graph():
     builder.add_node("describe_clothing",   describe_clothing)
     builder.add_node("build_profile",       build_profile)
     builder.add_node("finalize",            finalize)
+    builder.add_node("register_global_memory", register_global_memory)
 
     builder.add_edge(START,                 "load_models")
     builder.add_edge("load_models",         "process_video")
@@ -44,7 +46,8 @@ def build_graph():
     builder.add_edge("compute_reid",        "describe_clothing")
     builder.add_edge("describe_clothing",   "build_profile")
     builder.add_edge("build_profile",       "finalize")
-    builder.add_edge("finalize",            END)
+    builder.add_edge("finalize",            "register_global_memory")
+    builder.add_edge("register_global_memory", END)
 
     return builder.compile(checkpointer=MemorySaver())
 

@@ -74,19 +74,21 @@ def _get_graph():
 
 
 _NODE_TO_STATUS = {
-    "load_models":       "loading_models",
-    "process_video":     "processing_video",
-    "filter_quality":    "filtering",
-    "embed_all_faces":   "embedding",
+    "prepare_runtime": "preparing_runtime",
+    "load_models": "loading_models",
+    "process_video": "processing_video",
+    "filter_quality": "filtering",
+    "embed_all_faces": "embedding",
     "cluster_identities": "clustering",
     "assign_bodies_to_clusters": "auto_pairing",
-    "select_best":       "selecting",
-    "compute_reid":      "computing_reid",
+    "promote_crops": "promoting_crops",
+    "select_best": "selecting",
+    "compute_reid": "computing_reid",
     "describe_clothing": "describing",
-    "build_profile":     "awaiting_review",
-    "finalize":          "finalizing",
+    "build_profile": "awaiting_review",
+    "finalize": "finalizing",
+    "register_global_memory": "registering_global_memory",
 }
-
 
 def _run_pipeline(job_id: str, initial_state: dict, config: dict) -> None:
     job = _jobs[job_id]
@@ -205,6 +207,10 @@ def status(job_id: str):
         "per_cluster_clothing": snap.get("per_cluster_clothing", {}),
         "profile":             snap.get("profile", {}),
         "human_feedback_path": snap.get("human_feedback_path", ""),
+        "profile_path": snap.get("profile_path", ""),
+        "global_memory_db_path": snap.get("global_memory_db_path", ""),
+        "global_memory_registered_person_ids": snap.get("global_memory_registered_person_ids", []),
+        "global_memory_registered_count": snap.get("global_memory_registered_count", 0),
     }
     return jsonify({
         "job_id":   job_id,
@@ -220,18 +226,30 @@ def approve(job_id: str):
     job = _jobs.get(job_id)
     if not job:
         return jsonify({"error": "job not found"}), 404
+
+    if job.status == "done":
+        return jsonify({
+            "ok": True,
+            "message": "job already done; approval not needed",
+            "current_status": job.status,
+            "current_node": job.node,
+        })
+
     if job.status != "awaiting_review":
-        return jsonify({"error": "job not awaiting review"}), 400
+        return jsonify({
+            "error": "job not awaiting review",
+            "current_status": job.status,
+            "current_node": job.node,
+        }), 400
 
     body = request.get_json(force=True)
     job.resume_value = {
-        "approved":          True,
-        "corrections":       body.get("corrections"),
+        "approved": True,
+        "corrections": body.get("corrections"),
         "clothing_override": body.get("clothing_override"),
     }
     job.resume_event.set()
     return jsonify({"ok": True})
-
 
 @app.delete("/api/person/crop/<job_id>")
 def delete_crop(job_id: str):
