@@ -35,6 +35,35 @@ def _write_json(path: Path, data: dict) -> None:
     path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
+def _normalize_profile_schema(profile: dict) -> dict:
+    profile = dict(profile)
+    profile.setdefault("face_embedding_meta", {
+        "model": "facenet_pytorch.InceptionResnetV1.vggface2",
+        "dim": 512,
+        "norm": "L2",
+    })
+    reid = dict(profile.get("reid") or {})
+    association_meta = dict(profile.get("association_meta") or {})
+    if "association_source" in reid:
+        association_meta.setdefault("source", reid.pop("association_source"))
+    if "association_count" in reid:
+        association_meta.setdefault("association_count", reid.pop("association_count"))
+    if "auto_pair_score_mean" in reid:
+        association_meta.setdefault("auto_pair_score_mean", reid.pop("auto_pair_score_mean"))
+    for key in ("primary_key", "embedding_model", "face_embedding_dim"):
+        reid.pop(key, None)
+    if not reid or "status" not in reid:
+        reid = {
+            "status": "not_computed",
+            "reason": "no_reid_model_configured",
+            "body_embedding": None,
+            "note": "Reserved for body ReID embedding (OSNet or equivalent). Permanent identity is in face_embedding.",
+        }
+    profile["reid"] = reid
+    profile["association_meta"] = association_meta
+    return profile
+
+
 def _session_report(state: dict, profiles_written: int) -> dict:
     clusters = state.get("identity_clusters", [])
     low_confidence = [c for c in clusters if c.get("low_confidence")]
@@ -49,6 +78,7 @@ def _session_report(state: dict, profiles_written: int) -> dict:
         "unresolved_faces": len(state.get("unresolved_faces", [])),
         "unattached_bodies": len(state.get("unattached_bodies", [])),
         "identity_clustering_config": state.get("identity_clustering_config", {}),
+        "reid_config": state.get("reid_config", {}),
     }
 
 
@@ -66,6 +96,7 @@ def finalize(state: dict) -> dict:
 
     for raw_cid, profile in profiles.items():
         cid = int(raw_cid)
+        profile = _normalize_profile_schema(profile)
         profile_path = output_dir / f"cluster_{cid}" / "profile.json"
         _write_json(profile_path, profile)
         print(f"[finalize] profile saved -> {profile_path}")

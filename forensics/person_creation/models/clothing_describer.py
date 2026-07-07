@@ -19,6 +19,7 @@ def _load_prompt() -> str:
         cfg["instruction"],
         cfg["constraints"],
         cfg["detail"],
+        cfg.get("consistency", ""),
         cfg["output_format"],
     ])
 

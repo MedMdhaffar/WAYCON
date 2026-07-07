@@ -4,13 +4,42 @@ from pathlib import Path
 from langgraph.types import interrupt
 
 from forensics.person_creation.nodes.profile_signals import (
-    build_reid_signal,
+    build_association_meta,
     color_signals_from_crops,
 )
 
 
 def _session_id(state: dict) -> str:
     return Path(state["output_dir"]).name or state.get("person_name", "session")
+
+
+def _reid_signal_for_cluster(state: dict, cid: int) -> dict:
+    embeddings = state.get("reid_embeddings") or {}
+    reasons = state.get("reid_reasons") or {}
+    crop_counts = state.get("reid_crop_counts") or {}
+    config = state.get("reid_config") or {}
+
+    body_embedding = embeddings.get(cid, embeddings.get(str(cid)))
+    reason = reasons.get(cid, reasons.get(str(cid), "no_reid_model_configured"))
+    crop_count = int(crop_counts.get(cid, crop_counts.get(str(cid), 0)) or 0)
+
+    if body_embedding:
+        return {
+            "status": "computed",
+            "model": config.get("model", "osnet_x0_25"),
+            "weights": config.get("weights", "market1501"),
+            "embedding_dim": int(config.get("embedding_dim", len(body_embedding))),
+            "body_embedding": body_embedding,
+            "aggregation": "mean_of_best_5_body_crops",
+            "crop_count": crop_count,
+        }
+
+    return {
+        "status": "not_computed",
+        "reason": reason,
+        "body_embedding": None,
+        "note": "Reserved for body ReID embedding (OSNet or equivalent). Permanent identity is in face_embedding.",
+    }
 
 
 def _profile_for_cluster(state: dict, cluster: dict) -> dict:
@@ -27,8 +56,10 @@ def _profile_for_cluster(state: dict, cluster: dict) -> dict:
         **state,
         "associations": associations,
         "mean_face_embedding": cluster.get("representative_embedding", []),
+        "best_body_crops": best_body_crops,
     }
-    reid_signal = build_reid_signal(cluster_state, color_signals)
+    association_meta = build_association_meta(cluster_state)
+    reid_signal = _reid_signal_for_cluster(state, cid)
     sid = _session_id(state)
     profile_id = f"person_{sid}_cluster_{cid}"
 
@@ -42,6 +73,11 @@ def _profile_for_cluster(state: dict, cluster: dict) -> dict:
         "face_count": cluster.get("face_count", 0),
         "created_at": date.today().isoformat(),
         "face_embedding": cluster.get("representative_embedding", []),
+        "face_embedding_meta": {
+            "model": "facenet_pytorch.InceptionResnetV1.vggface2",
+            "dim": 512,
+            "norm": "L2",
+        },
         "face_crop_count": cluster.get("face_count", 0),
         "face_crops": [r["crop_path"] for r in cluster.get("face_records", []) if r.get("crop_path")],
         "appearance": {
@@ -54,6 +90,7 @@ def _profile_for_cluster(state: dict, cluster: dict) -> dict:
         "appearance_signals": {
             "color": color_signals,
         },
+        "association_meta": association_meta,
         "reid": reid_signal,
     }
 

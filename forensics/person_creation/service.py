@@ -81,6 +81,7 @@ _NODE_TO_STATUS = {
     "cluster_identities": "clustering",
     "assign_bodies_to_clusters": "auto_pairing",
     "select_best":       "selecting",
+    "compute_reid":      "computing_reid",
     "describe_clothing": "describing",
     "build_profile":     "awaiting_review",
     "finalize":          "finalizing",
@@ -133,6 +134,7 @@ def start():
     output_dir = body.get("output_dir", f"forensics/person_db/{name.lower()}")
     every_n = int(body.get("every_n", 15))
     identity_config = body.get("identity_clustering_config", {})
+    reid_config = body.get("reid", body.get("reid_config", {}))
 
     if not name or not video_paths:
         return jsonify({"error": "name and video_paths required"}), 400
@@ -164,6 +166,7 @@ def start():
         "output_dir": str(Path(output_dir)),
         "process_every_n": every_n,
         "identity_clustering_config": identity_config,
+        "reid_config": reid_config,
         "body_crops": [],
         "face_crops": [],
     }
@@ -193,6 +196,10 @@ def status(job_id: str):
         "profile_preview":     snap.get("profile_preview", {}),
         "best_body_crops":     snap.get("best_body_crops", []),
         "per_cluster_best_body_crops": snap.get("per_cluster_best_body_crops", {}),
+        "reid_embeddings":    snap.get("reid_embeddings", {}),
+        "reid_crop_counts":   snap.get("reid_crop_counts", {}),
+        "reid_reasons":       snap.get("reid_reasons", {}),
+        "reid_unavailable_reason": snap.get("reid_unavailable_reason", ""),
         "clothing_structured": snap.get("clothing_structured", {}),
         "clothing_raw":        snap.get("clothing_raw", ""),
         "per_cluster_clothing": snap.get("per_cluster_clothing", {}),

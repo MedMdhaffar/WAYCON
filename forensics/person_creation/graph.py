@@ -10,6 +10,7 @@ from forensics.person_creation.nodes.cluster_identities import cluster_identitie
 from forensics.person_creation.nodes.assign_bodies_to_clusters import assign_bodies_to_clusters
 from forensics.person_creation.nodes.promote_crops import promote_crops
 from forensics.person_creation.nodes.select_best import select_best
+from forensics.person_creation.nodes.compute_reid import compute_reid
 from forensics.person_creation.nodes.describe_clothing import describe_clothing
 from forensics.person_creation.nodes.build_profile import build_profile
 from forensics.person_creation.nodes.finalize import finalize
@@ -26,6 +27,7 @@ def build_graph():
     builder.add_node("assign_bodies_to_clusters", assign_bodies_to_clusters)
     builder.add_node("promote_crops",       promote_crops)
     builder.add_node("select_best",         select_best)
+    builder.add_node("compute_reid",        compute_reid)
     builder.add_node("describe_clothing",   describe_clothing)
     builder.add_node("build_profile",       build_profile)
     builder.add_node("finalize",            finalize)
@@ -38,7 +40,8 @@ def build_graph():
     builder.add_edge("cluster_identities",  "assign_bodies_to_clusters")
     builder.add_edge("assign_bodies_to_clusters", "promote_crops")
     builder.add_edge("promote_crops",       "select_best")
-    builder.add_edge("select_best",         "describe_clothing")
+    builder.add_edge("select_best",         "compute_reid")
+    builder.add_edge("compute_reid",        "describe_clothing")
     builder.add_edge("describe_clothing",   "build_profile")
     builder.add_edge("build_profile",       "finalize")
     builder.add_edge("finalize",            END)

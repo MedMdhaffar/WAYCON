@@ -9,6 +9,9 @@ class PersonCreationState(TypedDict):
     output_dir: str
     process_every_n: int
     identity_clustering_config: dict
+    reid_config: dict
+    reid_available: bool
+    reid_unavailable_reason: str
 
     body_crops: Annotated[list[dict], operator.add]
     face_crops: Annotated[list[dict], operator.add]
@@ -35,6 +38,9 @@ class PersonCreationState(TypedDict):
     human_feedback_path: str     # absolute path to pairing_feedback.json
     best_body_crops: list[str]   # top-5 body crop paths, temporally spread
     per_cluster_best_body_crops: dict[int, list[str]]
+    reid_embeddings: dict[int, list[float] | None]
+    reid_crop_counts: dict[int, int]
+    reid_reasons: dict[int, str]
 
     clothing_raw: str
     clothing_structured: dict  # {top, bottom, shoes, full}

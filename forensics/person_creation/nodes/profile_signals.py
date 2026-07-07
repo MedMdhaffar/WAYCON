@@ -92,27 +92,72 @@ def color_signals_from_crops(paths: list[str]) -> dict:
 
     return {
         "method": "dominant_rgb_body_crop_split_v1",
+        "sample_count": len(samples),
         "top": majority(top_names),
         "bottom": majority(bottom_names),
         "samples": samples,
     }
 
 
-def build_reid_signal(state: dict, color_signals: dict) -> dict:
+def build_association_meta(state: dict) -> dict:
     associations = state.get("associations") or []
     return {
-        "version": "person_creation_reid_v1",
-        "primary_key": "face_embedding",
-        "embedding_model": "facenet_pytorch.InceptionResnetV1.vggface2",
-        "face_embedding_dim": len(state.get("mean_face_embedding") or []),
-        "association_source": "automatic_multi_cue_v2",
+        "source": "automatic_multi_cue_v2",
         "association_count": len(associations),
         "auto_pair_score_mean": round(
             sum(float(a.get("auto_score", 0.0)) for a in associations) / max(len(associations), 1),
             4,
         ),
-        "temporary_appearance_signals": {
-            "top_color": color_signals.get("top", "unknown"),
-            "bottom_color": color_signals.get("bottom", "unknown"),
-        },
     }
+
+
+def build_reid_signal(state: dict, _color_signals: dict) -> dict:
+    try:
+        from forensics.person_creation.models.body_reid import get_body_reid
+
+        reid = get_body_reid()
+        if not reid.is_available():
+            return {
+                "status": "not_computed",
+                "reason": "no_reid_model_configured",
+                "body_embedding": None,
+                "note": "Reserved for body ReID embedding (OSNet or equivalent). Permanent identity is in face_embedding.",
+            }
+
+        embeddings = []
+        for raw in state.get("best_body_crops", [])[:5]:
+            p = Path(raw)
+            if not p.exists():
+                continue
+            img = cv2.imread(str(p.resolve()))
+            if img is None:
+                continue
+            emb = reid.embed(img)
+            if emb is not None:
+                embeddings.append(emb)
+        if not embeddings:
+            return {
+                "status": "not_computed",
+                "reason": "no_reid_embedding_produced",
+                "body_embedding": None,
+                "note": "Reserved for body ReID embedding (OSNet or equivalent). Permanent identity is in face_embedding.",
+            }
+
+        body_embedding = np.mean(np.asarray(embeddings, dtype=np.float64), axis=0)
+        norm = np.linalg.norm(body_embedding)
+        if norm > 0:
+            body_embedding = body_embedding / norm
+        return {
+            "status": "computed",
+            "model": "osnet_x0_25",
+            "embedding_dim": int(len(body_embedding)),
+            "body_embedding": body_embedding.tolist(),
+            "aggregation": "mean_of_best_5_body_crops",
+        }
+    except Exception as exc:
+        return {
+            "status": "not_computed",
+            "reason": f"reid_error: {exc}",
+            "body_embedding": None,
+            "note": "Reserved for body ReID embedding (OSNet or equivalent). Permanent identity is in face_embedding.",
+        }

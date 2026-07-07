@@ -11,6 +11,8 @@ def main():
     parser.add_argument("--videos", nargs="+", required=True, help="Paths to video clips")
     parser.add_argument("--output", required=True, help="Output directory (e.g. forensics/person_db/malek)")
     parser.add_argument("--every", type=int, default=5, help="Process every N frames (default: 5)")
+    parser.add_argument("--reid-model", default="osnet_x0_25", help="Body ReID model name (default: osnet_x0_25)")
+    parser.add_argument("--reid-weights", default="market1501", help="Body ReID weights label (default: market1501)")
     args = parser.parse_args()
 
     graph = build_graph()
@@ -22,6 +24,12 @@ def main():
         "video_paths": args.videos,
         "output_dir": args.output,
         "process_every_n": args.every,
+        "reid_config": {
+            "model": args.reid_model,
+            "weights": args.reid_weights,
+            "input_size": [256, 128],
+            "embedding_dim": 512,
+        },
         "body_crops": [],
         "face_crops": [],
     }
