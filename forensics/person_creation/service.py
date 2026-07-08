@@ -9,6 +9,7 @@ from pathlib import Path
 from flask import Flask, jsonify, request, send_file
 from flask_cors import CORS
 from langgraph.types import Command
+from werkzeug.utils import secure_filename
 
 import cv2 as _cv2
 
@@ -24,6 +25,15 @@ from forensics.person_creation.tools.add_face_photos import (
     add_face_photos as _add_face_photos,
     AddFacePhotosError as _AddFacePhotosError,
 )
+from forensics.person_creation.models.device import log_device_info_once
+from forensics.person_creation.global_memory.config import (
+    FACE_AUTO_MATCH_THRESHOLD,
+    FACE_NO_MATCH_THRESHOLD,
+)
+from forensics.person_creation.global_memory.media_paths import resolve_media_path
+
+_GM_COMPARE_THRESHOLD = FACE_AUTO_MATCH_THRESHOLD
+_UPLOAD_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
 
 
 def _validate_video_path(p: str) -> str | None:
@@ -39,10 +49,22 @@ def _validate_video_path(p: str) -> str | None:
     finally:
         cap.release()
 
+
+def _used_output_dir(path: Path) -> bool:
+    if not path.exists():
+        return False
+    if not path.is_dir():
+        return True
+    if (path / "session_report.json").exists():
+        return True
+    return any(p.is_dir() and p.name.startswith("cluster_") for p in path.iterdir())
+
+
 _PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 app = Flask(__name__)
 CORS(app)
+_DEVICE_INFO = log_device_info_once()
 
 
 @dataclass
@@ -125,6 +147,11 @@ def _run_pipeline(job_id: str, initial_state: dict, config: dict) -> None:
 
 # ─── Endpoints ────────────────────────────────────────────────────────────────
 
+@app.get("/api/health")
+def health():
+    return jsonify({"ok": True, "device": _DEVICE_INFO})
+
+
 @app.post("/api/person/start")
 def start():
     body = request.get_json(force=True)
@@ -136,6 +163,12 @@ def start():
 
     if not name or not video_paths:
         return jsonify({"error": "name and video_paths required"}), 400
+
+    output_path = Path(output_dir)
+    if _used_output_dir(output_path):
+        return jsonify({
+            "error": "Output directory already contains a previous run. Choose a new output directory."
+        }), 400
 
     # Pre-flight: normalize Windows-style paths and confirm each video opens.
     # Bad paths return 400 before we spend ~90s loading models.
@@ -161,7 +194,7 @@ def start():
     initial_state = {
         "person_name": name,
         "video_paths": normalized,
-        "output_dir": str(Path(output_dir)),
+        "output_dir": str(output_path),
         "process_every_n": every_n,
         "identity_clustering_config": identity_config,
         "body_crops": [],
@@ -198,6 +231,7 @@ def status(job_id: str):
         "per_cluster_clothing": snap.get("per_cluster_clothing", {}),
         "profile":             snap.get("profile", {}),
         "human_feedback_path": snap.get("human_feedback_path", ""),
+        "global_memory":       snap.get("global_memory", {}),
     }
     return jsonify({
         "job_id":   job_id,
@@ -270,8 +304,8 @@ def crops(job_id: str):
 @app.get("/api/images")
 def serve_image():
     path_str = request.args.get("path", "")
-    path = Path(path_str).resolve()
-    if not path.exists() or not path.is_file():
+    path = resolve_media_path(path_str)
+    if path is None:
         return jsonify({"error": "file not found"}), 404
     return send_file(str(path))
 
@@ -294,6 +328,265 @@ def _load_profile_json(name: str) -> dict | None:
 
 def _valid_profile_name(name: str) -> bool:
     return bool(_PROFILE_NAME_RE.fullmatch(name or ""))
+
+
+def _global_memory_store():
+    from forensics.person_creation.global_memory import GlobalMemoryStore
+
+    return GlobalMemoryStore()
+
+
+def _strip_embedding_from_person_detail(detail: dict) -> dict:
+    safe = dict(detail)
+    person = dict(safe.get("person") or {})
+    if "face_embedding" in person:
+        person["face_embedding_dim"] = len(person.get("face_embedding") or [])
+        person.pop("face_embedding", None)
+    safe["person"] = person
+    return safe
+
+
+def _json_error(message: str, status: int = 400):
+    return jsonify({"ok": False, "error": message}), status
+
+
+def _safe_upload_folder(name: str) -> Path:
+    slug = secure_filename(name.strip()) or "person"
+    return Path("forensics/person_db/_global_memory_uploads") / f"{slug}_{uuid.uuid4().hex[:8]}"
+
+
+def _save_uploaded_photos(files, name: str) -> list[str]:
+    upload_dir = _safe_upload_folder(name)
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    saved: list[str] = []
+
+    for idx, file in enumerate(files):
+        filename = secure_filename(file.filename or "")
+        if not filename:
+            raise ValueError("one uploaded photo has no filename")
+        suffix = Path(filename).suffix.lower()
+        if suffix not in _UPLOAD_EXTS:
+            raise ValueError(f"unsupported image extension for {filename}; allowed: jpg, jpeg, png, webp")
+        out_path = upload_dir / f"{idx:03d}_{filename}"
+        file.save(str(out_path))
+        saved.append(str(out_path))
+
+    return saved
+
+
+# â”€â”€â”€ Global Memory endpoints â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+@app.post("/api/global-memory/register-face-photos")
+def global_memory_register_face_photos():
+    name = (request.form.get("name") or "").strip()
+    notes = (request.form.get("notes") or "").strip()
+    photos = [p for p in request.files.getlist("photos") if p and p.filename]
+
+    if not name:
+        return jsonify({"ok": False, "error": "name is required"}), 400
+    if not photos:
+        return jsonify({"ok": False, "error": "at least one photo is required"}), 400
+
+    try:
+        image_paths = _save_uploaded_photos(photos, name)
+        if notes:
+            notes_path = Path(image_paths[0]).parent / "notes.json"
+            notes_path.write_text(json.dumps({"name": name, "notes": notes}, indent=2), encoding="utf-8")
+
+        with _global_memory_store() as store:
+            result = store.register_face_photo_identity_with_result(name, image_paths)
+            person_id = result["person_id"]
+            if notes:
+                store.update_person_details(person_id, notes=notes)
+            detail = store.get_person(person_id) or {}
+            person = detail.get("person") or {}
+            return jsonify({
+                "ok": True,
+                "person_id": person_id,
+                "name": person.get("name", name),
+                "action": result.get("action", "created"),
+                "identity_source": person.get("identity_source", ""),
+                "image_count": len(image_paths),
+                "possible_duplicate": bool(result.get("possible_duplicate")),
+                "suggestion_id": result.get("suggestion_id"),
+                "best_match": result.get("best_match"),
+                "review_threshold": result.get("review_threshold", FACE_NO_MATCH_THRESHOLD),
+                "auto_match_threshold": result.get("auto_match_threshold", FACE_AUTO_MATCH_THRESHOLD),
+                "message": "Created new phone-photo identity",
+            })
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+
+
+@app.get("/api/global-memory/persons")
+def global_memory_persons():
+    try:
+        with _global_memory_store() as store:
+            return jsonify({
+                "ok": True,
+                "db_path": str(store.db_path),
+                "persons": store.list_persons(),
+                "review_threshold": FACE_NO_MATCH_THRESHOLD,
+                "auto_match_threshold": FACE_AUTO_MATCH_THRESHOLD,
+            })
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+@app.get("/api/global-memory/persons/<person_id>")
+def global_memory_person_detail(person_id: str):
+    try:
+        with _global_memory_store() as store:
+            detail = store.get_person(person_id)
+            if detail is None:
+                return jsonify({"ok": False, "error": "person not found"}), 404
+            return jsonify({"ok": True, "person": _strip_embedding_from_person_detail(detail)})
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+@app.post("/api/global-memory/persons/<person_id>/add-face-photos")
+def global_memory_add_face_photos_to_person(person_id: str):
+    photos = [p for p in request.files.getlist("photos") if p and p.filename]
+    if not photos:
+        return jsonify({"ok": False, "error": "at least one photo is required"}), 400
+
+    try:
+        with _global_memory_store() as store:
+            existing = store.get_person(person_id)
+            if existing is None:
+                return jsonify({"ok": False, "error": "person not found"}), 404
+            person_name = (existing.get("person") or {}).get("name", person_id)
+            image_paths = _save_uploaded_photos(photos, person_name)
+            result = store.add_face_photos_to_person(person_id, image_paths)
+            detail = store.get_person(person_id) or {}
+            person = detail.get("person") or {}
+            return jsonify({
+                "ok": True,
+                "person_id": person_id,
+                "name": person.get("name", person_name),
+                "action": result.get("action", "updated_target"),
+                "identity_source": person.get("identity_source", ""),
+                "image_count": len(image_paths),
+                "message": "Added phone photos to existing identity",
+            })
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+
+
+@app.patch("/api/global-memory/persons/<person_id>")
+def global_memory_update_person(person_id: str):
+    body = request.get_json(silent=True) or {}
+    try:
+        with _global_memory_store() as store:
+            person = store.update_person_details(
+                person_id,
+                name=body.get("name"),
+                notes=body.get("notes"),
+            )
+            person.pop("face_embedding", None)
+            return jsonify({"ok": True, "person": person})
+    except KeyError:
+        return _json_error("person not found", 404)
+    except Exception as exc:
+        return _json_error(str(exc), 400)
+
+
+@app.post("/api/global-memory/persons/merge")
+def global_memory_merge_persons():
+    body = request.get_json(silent=True) or {}
+    source_person_id = (body.get("source_person_id") or "").strip()
+    target_person_id = (body.get("target_person_id") or "").strip()
+    new_name = body.get("new_name")
+    if not source_person_id or not target_person_id:
+        return _json_error("source_person_id and target_person_id are required", 400)
+    try:
+        with _global_memory_store() as store:
+            result = store.merge_persons(source_person_id, target_person_id, new_name=new_name)
+            return jsonify(result)
+    except KeyError as exc:
+        return _json_error(str(exc), 404)
+    except Exception as exc:
+        return _json_error(str(exc), 400)
+
+
+@app.get("/api/global-memory/suggestions")
+def global_memory_suggestions():
+    try:
+        with _global_memory_store() as store:
+            return jsonify({
+                "ok": True,
+                "suggestions": store.list_suggestions(status="pending"),
+                "review_threshold": FACE_NO_MATCH_THRESHOLD,
+                "auto_match_threshold": FACE_AUTO_MATCH_THRESHOLD,
+            })
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+@app.post("/api/global-memory/suggestions/<suggestion_id>/accept")
+def global_memory_accept_suggestion(suggestion_id: str):
+    try:
+        with _global_memory_store() as store:
+            return jsonify(store.accept_suggestion(suggestion_id))
+    except KeyError:
+        return _json_error("suggestion not found", 404)
+    except Exception as exc:
+        return _json_error(str(exc), 400)
+
+
+@app.post("/api/global-memory/suggestions/<suggestion_id>/reject")
+def global_memory_reject_suggestion(suggestion_id: str):
+    try:
+        with _global_memory_store() as store:
+            return jsonify(store.reject_suggestion(suggestion_id))
+    except KeyError:
+        return _json_error("suggestion not found", 404)
+    except Exception as exc:
+        return _json_error(str(exc), 400)
+
+
+@app.post("/api/global-memory/compare-profile")
+def global_memory_compare_profile():
+    body = request.get_json(silent=True) or {}
+    profile_raw = (body.get("profile_path") or "").strip()
+    if not profile_raw:
+        return jsonify({"ok": False, "error": "profile_path is required"}), 400
+    profile_path = Path(profile_raw)
+    if not profile_path.exists() or not profile_path.is_file():
+        return jsonify({"ok": False, "error": f"profile_path not found: {profile_path}"}), 400
+
+    try:
+        profile = json.loads(profile_path.read_text(encoding="utf-8-sig"))
+    except Exception as exc:
+        return jsonify({"ok": False, "error": f"failed to read profile JSON: {exc}"}), 400
+
+    embedding = profile.get("face_embedding")
+    if not embedding:
+        return jsonify({"ok": False, "error": "profile has no face_embedding"}), 400
+
+    try:
+        with _global_memory_store() as store:
+            matches = store.search_by_face(embedding, top_k=10, threshold=None)
+            enriched = [
+                {
+                    **m,
+                    "passes_threshold": float(m.get("similarity", 0.0)) >= _GM_COMPARE_THRESHOLD,
+                }
+                for m in matches
+            ]
+            return jsonify({
+                "ok": True,
+                "db_path": str(store.db_path),
+                "profile_path": str(profile_path),
+                "threshold": _GM_COMPARE_THRESHOLD,
+                "review_threshold": FACE_NO_MATCH_THRESHOLD,
+                "auto_match_threshold": FACE_AUTO_MATCH_THRESHOLD,
+                "matches": enriched,
+                "best_match_passes_threshold": bool(enriched and enriched[0]["passes_threshold"]),
+            })
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 500
 
 
 @app.get("/api/profiles")

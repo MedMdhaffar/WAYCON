@@ -6,6 +6,7 @@ import AssociationsView from './components/AssociationsView.jsx'
 import ClothingPanel from './components/ClothingPanel.jsx'
 import ReviewPanel from './components/ReviewPanel.jsx'
 import ProfileManager from './components/ProfileManager.jsx'
+import GlobalMemory from './components/GlobalMemory.jsx'
 
 const TABS = ['Setup', 'Progress & Crops', 'Review & Approve']
 const RUNNING_STATUSES = new Set([
@@ -14,7 +15,7 @@ const RUNNING_STATUSES = new Set([
 ])
 
 export default function App() {
-  const [mode, setMode] = useState('enroll')   // 'enroll' | 'manage'
+  const [mode, setMode] = useState('enroll')   // 'enroll' | 'manage' | 'memory'
   const [tab, setTab] = useState(0)
   const [jobId, setJobId] = useState(null)
   const [jobStatus, setJobStatus] = useState(null)
@@ -52,7 +53,8 @@ export default function App() {
   }
 
   const refreshStatus = useCallback(() => {
-    if (jobId) fetchStatus(jobId)
+    if (jobId) return fetchStatus(jobId)
+    return Promise.resolve(null)
   }, [jobId, fetchStatus])
 
   const snapshot = jobStatus?.snapshot ?? {}
@@ -80,12 +82,23 @@ export default function App() {
           >
             Manage
           </button>
+          <button
+            className={`btn ${mode === 'memory' ? 'btn-primary' : 'btn-ghost'}`}
+            onClick={() => setMode('memory')}
+            style={{ padding: '6px 14px', fontSize: 13 }}
+          >
+            Global Memory
+          </button>
         </div>
       </div>
 
       {mode === 'manage' ? (
         <div className="tab-content">
           <ProfileManager />
+        </div>
+      ) : mode === 'memory' ? (
+        <div className="tab-content">
+          <GlobalMemory />
         </div>
       ) : (
         <>

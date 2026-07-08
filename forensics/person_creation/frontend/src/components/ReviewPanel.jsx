@@ -8,6 +8,7 @@ export default function ReviewPanel({ jobId, snapshot, clothingOverride, onDone,
   const profile = snapshot?.profile ?? {}
   const appearance = profile.appearance ?? snapshot?.clothing_structured ?? {}
   const previewProfiles = snapshot?.profile_preview?.profiles ?? []
+  const globalMemory = snapshot?.global_memory ?? {}
 
   const handleApprove = async () => {
     setError('')
@@ -23,7 +24,11 @@ export default function ReviewPanel({ jobId, snapshot, clothingOverride, onDone,
       })
       const data = await res.json()
       if (data.error) throw new Error(data.error)
-      onDone()
+      for (let i = 0; i < 20; i += 1) {
+        await new Promise(resolve => setTimeout(resolve, 1000))
+        const status = await onDone?.()
+        if (status?.status === 'done' || status?.status === 'error') break
+      }
     } catch (err) {
       setError(err.message)
     } finally {
@@ -32,6 +37,8 @@ export default function ReviewPanel({ jobId, snapshot, clothingOverride, onDone,
   }
 
   if (finalStatus === 'done') {
+    const registrations = globalMemory.registrations ?? []
+    const errors = globalMemory.errors ?? []
     return (
       <div className="card" style={{ borderColor: '#22c55e' }}>
         <div style={{ textAlign: 'center', padding: '24px' }}>
@@ -40,6 +47,34 @@ export default function ReviewPanel({ jobId, snapshot, clothingOverride, onDone,
           <div style={{ fontSize: '14px', color: '#64748b' }}>
             {(snapshot?.per_cluster_profiles && Object.keys(snapshot.per_cluster_profiles).length) || 1} profile(s) written
           </div>
+        </div>
+        <div style={{ borderTop: '1px solid #1e2330', paddingTop: 16 }}>
+          <div className="card-title">Global Memory</div>
+          {globalMemory.db_path && (
+            <div style={{ fontSize: 13, color: '#94a3b8', marginBottom: 10 }}>
+              DB: <code>{globalMemory.db_path}</code>
+            </div>
+          )}
+          {errors.length > 0 && (
+            <div style={{ color: '#ef4444', background: '#1e1015', borderRadius: 6, padding: '9px 12px', fontSize: 13, marginBottom: 10 }}>
+              Global Memory warning: {errors.join('; ')}
+            </div>
+          )}
+          {registrations.length === 0 && errors.length === 0 && (
+            <div style={{ color: '#f59e0b', fontSize: 13 }}>No Global Memory registration result was reported.</div>
+          )}
+          {registrations.map((r, idx) => (
+            <div key={`${r.profile_path || idx}-${r.person_id}`} style={{ background: '#0f1117', border: '1px solid #1e2330', borderRadius: 6, padding: 10, marginBottom: 8, fontSize: 13 }}>
+              <div><strong>{r.action || 'unknown'}</strong> | person_id=<code>{r.person_id}</code> | matched={String(!!r.matched)} | review_required={String(!!r.review_required)}</div>
+              <div style={{ color: '#94a3b8', marginTop: 4 }}>profile: <code>{r.profile_path || '-'}</code></div>
+              {r.best_match && (
+                <div style={{ color: '#94a3b8', marginTop: 4 }}>
+                  best match: {r.best_match.name} (<code>{r.best_match.person_id}</code>) similarity={Number(r.best_match.similarity).toFixed(4)}
+                </div>
+              )}
+              {r.suggestion_id && <div style={{ color: '#f59e0b', marginTop: 4 }}>suggestion: <code>{r.suggestion_id}</code></div>}
+            </div>
+          ))}
         </div>
       </div>
     )

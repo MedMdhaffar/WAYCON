@@ -2,10 +2,25 @@ import { useState } from 'react'
 
 const DEFAULT_VIDEOS = ['']
 
+function safeName(name) {
+  return (name || 'person').trim().toLowerCase().replace(/[^a-z0-9_-]+/g, '_').replace(/^_+|_+$/g, '') || 'person'
+}
+
+function timestamp() {
+  const d = new Date()
+  const pad = (n) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}_${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`
+}
+
+function defaultOutputDir(name) {
+  return `forensics/person_db/runs/${safeName(name)}_${timestamp()}`
+}
+
 export default function StartForm({ onStart }) {
   const [name, setName] = useState('Malek')
   const [videos, setVideos] = useState(DEFAULT_VIDEOS)
-  const [outputDir, setOutputDir] = useState('forensics/person_db/malek')
+  const [outputDir, setOutputDir] = useState(() => defaultOutputDir('Malek'))
+  const [outputEdited, setOutputEdited] = useState(false)
   const [everyN, setEveryN] = useState(5)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
@@ -14,6 +29,10 @@ export default function StartForm({ onStart }) {
   const addVideo = () => setVideos(v => [...v, ''])
   const removeVideo = (i) => setVideos(v => v.filter((_, idx) => idx !== i))
   const updateVideo = (i, val) => setVideos(v => v.map((x, idx) => idx === i ? val : x))
+  const updateName = (val) => {
+    setName(val)
+    if (!outputEdited) setOutputDir(defaultOutputDir(val))
+  }
 
   const handleSubmit = async (e) => {
     e.preventDefault()
@@ -58,7 +77,7 @@ export default function StartForm({ onStart }) {
 
         <div>
           <label style={labelStyle}>Person Name</label>
-          <input style={inputStyle} value={name} onChange={e => setName(e.target.value)} required placeholder="Malek" />
+          <input style={inputStyle} value={name} onChange={e => updateName(e.target.value)} required placeholder="Malek" />
         </div>
 
         <div>
@@ -83,7 +102,12 @@ export default function StartForm({ onStart }) {
 
         <div>
           <label style={labelStyle}>Output Directory</label>
-          <input style={inputStyle} value={outputDir} onChange={e => setOutputDir(e.target.value)} placeholder="forensics/person_db/malek" />
+          <input
+            style={inputStyle}
+            value={outputDir}
+            onChange={e => { setOutputEdited(true); setOutputDir(e.target.value) }}
+            placeholder="forensics/person_db/runs/malek_YYYYMMDD_HHMMSS"
+          />
         </div>
 
         <div>
