@@ -109,15 +109,12 @@ def add_face_photos(
     if not dry_run:
         face_crops_dir.mkdir(parents=True, exist_ok=True)
 
-    # --- Lazy-load models (only when we will actually run detection) ---
-    from forensics.person_creation.models.face_detector import get_face_detector
-    from forensics.person_creation.models.face_embedder import get_face_embedder
+    # --- Face engine client (only when we will actually run detection) ---
+    from forensics.face_engine.client import FaceEngineClient
 
-    detector = get_face_detector()
-    embedder = get_face_embedder()
+    face_engine = FaceEngineClient()
     if not dry_run:
-        detector.load(device=cfg.DEVICE)
-        embedder.load()
+        face_engine.ensure_healthy()
 
     # --- Process each input image ---
     new_crop_names: list[str] = []
@@ -132,7 +129,7 @@ def add_face_photos(
             new_crop_names.append(f"iphone_{idx:03d}_{src.stem}.jpg")
             continue
 
-        dets = detector.detect(img)
+        dets = face_engine.detect(img)
         face = _largest_face(dets)
         if face is None:
             skipped.append({"file": src.name, "reason": "no face detected"})
@@ -192,7 +189,7 @@ def add_face_photos(
         if img is None:
             missing += 1
             continue
-        all_embs.append(np.asarray(embedder.embed(img), dtype=np.float32))
+        all_embs.append(np.asarray(face_engine.embed(img), dtype=np.float32))
 
     if not all_embs:
         raise AddFacePhotosError("no usable face crops to embed after writing — refusing to corrupt profile.json")

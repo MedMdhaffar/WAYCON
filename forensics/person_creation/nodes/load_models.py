@@ -7,15 +7,13 @@ _INTERNVL_MODEL_ID = os.getenv("PERSON_CREATION_INTERNVL_MODEL", "OpenGVLab/Inte
 
 def load_models(state: dict) -> dict:
     from forensics.person_creation.models.person_detector import get_person_detector
-    from forensics.person_creation.models.face_detector import get_face_detector
-    from forensics.person_creation.models.face_embedder import get_face_embedder
     from forensics.person_creation.models.clothing_describer import get_clothing_describer
     from forensics.person_creation.models.pose_estimator import get_pose_estimator
     from forensics.person_creation.models.reid_extractor import get_reid_extractor, normalize_reid_config
+    from forensics.face_engine.client import FaceEngineClient
 
     get_person_detector().load(model_path=_YOLO_MODEL_PATH, device="auto")
-    get_face_detector().load(device="auto")
-    get_face_embedder().load(device="auto")
+    FaceEngineClient().ensure_healthy()
     get_clothing_describer().load(model_id=_INTERNVL_MODEL_ID, device="auto")
 
     # Optional auto_pair pose cue. It is a no-op when the optional dependency

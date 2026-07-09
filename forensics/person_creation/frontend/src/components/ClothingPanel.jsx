@@ -2,8 +2,15 @@ import { useState, useEffect } from 'react'
 
 const FIELDS = ['top', 'bottom', 'shoes', 'full']
 
-function ClusterClothingCard({ clusterId, crops, clothing }) {
+function isInternalLabel(value) {
+  return /cluster[_\s-]?\d+/i.test(value || '')
+}
+
+function ClusterClothingCard({ clusterId, crops, clothing, profile }) {
   const structured = clothing?.structured ?? clothing ?? {}
+  const title = !isInternalLabel(profile?.name)
+    ? profile?.name
+    : (!isInternalLabel(profile?.id) ? profile?.id : 'Pending identity')
   const labelStyle = { fontSize: '12px', color: '#94a3b8', marginBottom: '5px', display: 'block', textTransform: 'uppercase', letterSpacing: '0.05em' }
   const valueStyle = {
     width: '100%', padding: '7px 11px', background: '#0f1117',
@@ -14,7 +21,12 @@ function ClusterClothingCard({ clusterId, crops, clothing }) {
   return (
     <div style={{ border: '1px solid #1e2330', borderRadius: '6px', padding: '12px', background: '#11151f' }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
-        <div style={{ fontSize: '14px', fontWeight: 600, color: '#e2e8f0' }}>Cluster {clusterId}</div>
+        <div>
+          <div style={{ fontSize: '14px', fontWeight: 600, color: '#e2e8f0' }}>{title}</div>
+          {profile?.id && !isInternalLabel(profile.id) && (
+            <div style={{ fontSize: '12px', color: '#64748b' }}>{profile.id}</div>
+          )}
+        </div>
         <div style={{ fontSize: '12px', color: '#64748b' }}>{crops.length} crops</div>
       </div>
 
@@ -43,7 +55,7 @@ function ClusterClothingCard({ clusterId, crops, clothing }) {
   )
 }
 
-export default function ClothingPanel({ bestBodyCrops, clothingStructured, perClusterBestBodyCrops = {}, perClusterClothing = {}, onChange }) {
+export default function ClothingPanel({ bestBodyCrops, clothingStructured, perClusterBestBodyCrops = {}, perClusterClothing = {}, clusterProfiles = {}, onChange }) {
   const [values, setValues] = useState({ top: '', bottom: '', shoes: '', full: '' })
   const clusterIds = Object.keys(perClusterBestBodyCrops).sort((a, b) => Number(a) - Number(b))
 
@@ -82,6 +94,7 @@ export default function ClothingPanel({ bestBodyCrops, clothingStructured, perCl
               clusterId={cid}
               crops={perClusterBestBodyCrops[cid] ?? []}
               clothing={perClusterClothing[cid] ?? {}}
+              profile={clusterProfiles[cid] ?? clusterProfiles[Number(cid)] ?? {}}
             />
           ))}
         </div>

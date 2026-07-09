@@ -62,10 +62,21 @@ def _profile_for_cluster(state: dict, cluster: dict) -> dict:
     reid_signal = _reid_signal_for_cluster(state, cid)
     sid = _session_id(state)
     profile_id = f"person_{sid}_cluster_{cid}"
+    display_name = state.get("person_name") or state.get("name") or "Unknown"
+    face_crop_sharpness = {
+        r["crop_path"]: float(r.get("sharpness", 0.0) or 0.0)
+        for r in cluster.get("face_records", [])
+        if r.get("crop_path")
+    }
+    body_crop_sharpness = {
+        a["body_path"]: float(a.get("body_sharpness", 0.0) or 0.0)
+        for a in associations
+        if a.get("body_path")
+    }
 
     return {
         "id": profile_id,
-        "name": profile_id,
+        "name": display_name,
         "cluster_id": cid,
         "cluster_confidence": cluster.get("confidence", 0.0),
         "cluster_face_count": cluster.get("face_count", 0),
@@ -80,12 +91,14 @@ def _profile_for_cluster(state: dict, cluster: dict) -> dict:
         },
         "face_crop_count": cluster.get("face_count", 0),
         "face_crops": [r["crop_path"] for r in cluster.get("face_records", []) if r.get("crop_path")],
+        "face_crop_sharpness": face_crop_sharpness,
         "appearance": {
             "date": date.today().isoformat(),
             **clothing_structured,
         },
         "body_crops": [a["body_path"] for a in associations],
         "best_body_crops": best_body_crops,
+        "body_crop_sharpness": body_crop_sharpness,
         "video_sources": state["video_paths"],
         "appearance_signals": {
             "color": color_signals,
@@ -118,6 +131,7 @@ def build_profile(state: dict) -> dict:
         "profiles": [
             {
                 "cluster_id": p["cluster_id"],
+                "id": p["id"],
                 "name": p["name"],
                 "face_crop_count": p["face_crop_count"],
                 "associations_count": len(p["body_crops"]),

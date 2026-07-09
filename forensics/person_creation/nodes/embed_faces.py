@@ -10,9 +10,9 @@ def embed_faces(state: dict) -> dict:
     paired with a body in HITL. Falls back to `quality_face_crops` if no
     associations exist (matches select_best.py's fallback contract).
     """
-    from forensics.person_creation.models.face_embedder import get_face_embedder
+    from forensics.face_engine.client import FaceEngineClient
 
-    embedder = get_face_embedder()
+    embedder = FaceEngineClient()
 
     associations = state.get("associations") or []
     if associations:
@@ -31,7 +31,7 @@ def embed_faces(state: dict) -> dict:
         img = cv2.imread(str(Path(p).resolve()))
         if img is None:
             continue
-        emb = embedder.embed(img)
+        emb = embedder.embed(img).tolist()
         embeddings.append(emb)
 
     if not embeddings:

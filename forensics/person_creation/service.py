@@ -9,6 +9,7 @@ from pathlib import Path
 from flask import Flask, jsonify, request, send_file
 from flask_cors import CORS
 from langgraph.types import Command
+from werkzeug.utils import secure_filename
 
 import cv2 as _cv2
 
@@ -40,9 +41,14 @@ def _validate_video_path(p: str) -> str | None:
         cap.release()
 
 _PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_ALLOWED_PROFILE_IMAGE_EXTENSIONS = {"jpg", "jpeg", "png"}
 
 app = Flask(__name__)
 CORS(app)
+
+
+def _allowed_profile_image(filename: str) -> bool:
+    return "." in filename and filename.rsplit(".", 1)[1].lower() in _ALLOWED_PROFILE_IMAGE_EXTENSIONS
 
 
 @dataclass
@@ -281,6 +287,185 @@ def serve_image():
     if not path.exists() or not path.is_file():
         return jsonify({"error": "file not found"}), 404
     return send_file(str(path))
+
+
+# --- Global Memory read endpoints -------------------------------------------------
+
+@app.get("/api/memory/persons")
+def memory_persons():
+    from forensics.global_memory import GlobalMemory
+
+    gm = GlobalMemory()
+    try:
+        return jsonify(gm.list_all())
+    finally:
+        gm.close()
+
+
+@app.get("/api/memory/persons/<person_id>")
+def memory_person_detail(person_id):
+    from forensics.global_memory import GlobalMemory
+
+    gm = GlobalMemory()
+    try:
+        person = gm.get_person(person_id)
+        if person is None:
+            return jsonify({"error": "not found"}), 404
+        history = gm.get_recognition_history(person_id=person_id, limit=50)
+        return jsonify({**person, "recognition_history": history})
+    finally:
+        gm.close()
+
+
+@app.patch("/api/memory/persons/<person_id>/rename")
+def memory_rename_person(person_id):
+    data = request.get_json(silent=True) or {}
+    new_name = (data.get("name") or "").strip()
+    if not new_name:
+        return jsonify({"error": "name is required"}), 400
+    if len(new_name) > 100:
+        return jsonify({"error": "name too long (max 100 chars)"}), 400
+
+    from forensics.global_memory import GlobalMemory
+
+    gm = GlobalMemory()
+    try:
+        person = gm.get_person(person_id)
+        if person is None:
+            return jsonify({"error": f"{person_id} not found"}), 404
+        gm.rename_person(person_id, new_name)
+        return jsonify({
+            "person_id": person_id,
+            "name": new_name,
+            "message": f"Renamed to '{new_name}'",
+        })
+    finally:
+        gm.close()
+
+
+@app.post("/api/memory/persons/<person_id>/profile-image")
+def memory_upload_profile_image(person_id):
+    from forensics.global_memory import GlobalMemory
+
+    gm = GlobalMemory()
+    try:
+        person = gm.get_person(person_id)
+        if person is None:
+            return jsonify({"error": f"{person_id} not found"}), 404
+
+        if "image" in request.files:
+            file = request.files["image"]
+            if not file or not _allowed_profile_image(file.filename or ""):
+                return jsonify({"error": "Invalid file. Use JPEG or PNG."}), 400
+
+            person_dir = Path("forensics/person_db") / person_id
+            person_dir.mkdir(parents=True, exist_ok=True)
+            original = secure_filename(file.filename or "profile_image.jpg")
+            ext = original.rsplit(".", 1)[1].lower()
+            dest = person_dir / f"profile_image.{ext}"
+            file.save(str(dest))
+            image_path = str(dest.resolve())
+
+        elif request.is_json and (request.get_json(silent=True) or {}).get("path"):
+            data = request.get_json(silent=True) or {}
+            source = Path(str(data.get("path", "")).strip())
+            if not source.exists() or not source.is_file():
+                return jsonify({"error": f"File not found: {source}"}), 400
+            if not _allowed_profile_image(str(source)):
+                return jsonify({"error": "Invalid file type. Use JPEG or PNG."}), 400
+            image_path = str(source.resolve())
+
+        else:
+            return jsonify({"error": "Provide 'image' file or JSON { path }"}), 400
+
+        gm.set_profile_image(person_id, image_path, source="manual")
+        return jsonify({
+            "person_id": person_id,
+            "profile_image": image_path,
+            "source": "manual",
+            "message": "Profile image updated.",
+        })
+    finally:
+        gm.close()
+
+
+@app.post("/api/memory/persons/<person_id>/profile-image/auto")
+def memory_auto_profile_image(person_id):
+    from forensics.global_memory import GlobalMemory
+
+    gm = GlobalMemory()
+    try:
+        person = gm.get_person(person_id)
+        if person is None:
+            return jsonify({"error": f"{person_id} not found"}), 404
+
+        force = request.args.get("force", "false").lower() == "true"
+        if person.get("profile_image_source") == "manual" and not force:
+            return jsonify({
+                "error": "Profile image was manually set. Pass ?force=true to override.",
+            }), 409
+
+        best = gm.get_best_face_crop(person_id)
+        if best is None:
+            return jsonify({"error": "No face crops found in recognition log."}), 404
+
+        gm.set_profile_image(person_id, best["path"], source="auto")
+        return jsonify({
+            "person_id": person_id,
+            "profile_image": best["path"],
+            "sharpness": best["sharpness"],
+            "source": "auto",
+        })
+    finally:
+        gm.close()
+
+
+@app.get("/api/memory/persons/<person_id>/gallery")
+def memory_person_gallery(person_id):
+    from forensics.global_memory import GlobalMemory
+
+    crop_type = request.args.get("type")
+    if crop_type and crop_type not in {"face", "body"}:
+        return jsonify({"error": "type must be face or body"}), 400
+
+    gm = GlobalMemory()
+    try:
+        if gm.get_person(person_id) is None:
+            return jsonify({"error": f"{person_id} not found"}), 404
+        return jsonify(gm.get_gallery(person_id, crop_type=crop_type))
+    finally:
+        gm.close()
+
+
+@app.get("/api/memory/log")
+def memory_log():
+    from forensics.global_memory import GlobalMemory
+
+    person_id = request.args.get("person_id")
+    gm = GlobalMemory()
+    try:
+        return jsonify(gm.get_recognition_history(person_id=person_id, limit=100))
+    finally:
+        gm.close()
+
+
+@app.get("/api/memory/search")
+def memory_search():
+    from forensics.global_memory import GlobalMemory
+
+    q = request.args.get("q", "").strip().lower()
+    gm = GlobalMemory()
+    try:
+        persons = gm.list_all()
+        if not q:
+            return jsonify(persons)
+        results = [
+            p for p in persons
+            if q in (p.get("name") or "").lower() or q in (p.get("person_id") or "").lower()
+        ]
+        return jsonify(results)
+    finally:
+        gm.close()
 
 
 # ─── Profile management endpoints ─────────────────────────────────────────────
