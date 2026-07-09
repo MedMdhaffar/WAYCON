@@ -5,7 +5,7 @@ import threading
 from pathlib import Path
 
 import numpy as np
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 
 from forensics.face_engine import DEFAULT_HOST, DEFAULT_PORT, SERVICE_NAME
 from forensics.face_engine.path_utils import resolve_file_path, resolve_output_dir
@@ -68,6 +68,18 @@ def _read_image(path: Path):
     image = cv2.imread(str(path))
     if image is None:
         raise ValueError(f"could not read image: {path.as_posix()}")
+    return image
+
+
+def _read_image_bytes(image_bytes: bytes):
+    import cv2
+
+    if not image_bytes:
+        raise ValueError("missing image bytes")
+    encoded = np.frombuffer(image_bytes, dtype=np.uint8)
+    image = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
+    if image is None:
+        raise ValueError("could not decode image bytes")
     return image
 
 
@@ -139,6 +151,21 @@ def detect():
         body = require_json()
         image_path = resolve_file_path(require_path_field(body, "image_path"))
         image = _read_image(image_path)
+        faces = [_face_payload(det) for det in _detect(image)]
+        return jsonify({"ok": True, "faces": faces})
+    except ValueError as exc:
+        return error_response(str(exc), 400)
+    except Exception as exc:
+        return error_response(str(exc), 500)
+
+
+@app.post("/detect-bytes")
+def detect_bytes():
+    try:
+        uploaded = request.files.get("image")
+        if uploaded is None:
+            raise ValueError("missing image field")
+        image = _read_image_bytes(uploaded.read())
         faces = [_face_payload(det) for det in _detect(image)]
         return jsonify({"ok": True, "faces": faces})
     except ValueError as exc:

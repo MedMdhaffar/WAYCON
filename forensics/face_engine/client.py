@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import uuid
 from typing import Any
 from urllib import error, request
 
@@ -54,11 +55,67 @@ class FaceEngineClient:
             raise FaceEngineClientError(str(parsed.get("error", "face_engine request failed")))
         return parsed
 
+    def _request_multipart(
+        self,
+        path: str,
+        field_name: str,
+        filename: str,
+        content_type: str,
+        payload: bytes,
+    ) -> dict[str, Any]:
+        boundary = f"----WAYCON{uuid.uuid4().hex}"
+        body = b"".join([
+            f"--{boundary}\r\n".encode("utf-8"),
+            (
+                f'Content-Disposition: form-data; name="{field_name}"; '
+                f'filename="{filename}"\r\n'
+            ).encode("utf-8"),
+            f"Content-Type: {content_type}\r\n\r\n".encode("utf-8"),
+            payload,
+            f"\r\n--{boundary}--\r\n".encode("utf-8"),
+        ])
+        req = request.Request(
+            f"{self.base_url}{path}",
+            data=body,
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+            method="POST",
+        )
+        try:
+            with request.urlopen(req, timeout=self.timeout) as resp:
+                raw = resp.read().decode("utf-8")
+        except error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            try:
+                parsed = json.loads(body)
+                message = parsed.get("error", body)
+            except json.JSONDecodeError:
+                message = body or str(exc)
+            raise FaceEngineClientError(f"face_engine HTTP {exc.code}: {message}") from exc
+        except error.URLError as exc:
+            raise FaceEngineClientError(f"face_engine unavailable: {exc.reason}") from exc
+
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise FaceEngineClientError("face_engine returned non-JSON response") from exc
+
+        if parsed.get("ok") is False:
+            raise FaceEngineClientError(str(parsed.get("error", "face_engine request failed")))
+        return parsed
+
     def health(self) -> dict[str, Any]:
         return self._request("GET", "/health")
 
     def detect(self, image_path: str) -> dict[str, Any]:
         return self._request("POST", "/detect", {"image_path": image_path})
+
+    def detect_bytes(
+        self,
+        image_bytes: bytes,
+        filename: str = "frame.png",
+        content_type: str = "image/png",
+    ) -> dict[str, Any]:
+        return self._request_multipart("/detect-bytes", "image", filename, content_type, image_bytes)
 
     def embed(self, face_crop_path: str) -> dict[str, Any]:
         return self._request("POST", "/embed", {"face_crop_path": face_crop_path})

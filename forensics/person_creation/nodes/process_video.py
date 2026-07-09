@@ -1,6 +1,8 @@
+import os
+from pathlib import Path
+
 import cv2
 import numpy as np
-from pathlib import Path
 
 
 def _sharpness(img_bgr: np.ndarray) -> float:
@@ -18,12 +20,57 @@ def _crop(frame: np.ndarray, bbox: list[float], padding: int = 2) -> np.ndarray:
     return frame[y1:y2, x1:x2]
 
 
+def _enabled(name: str, default: str = "0") -> bool:
+    return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _face_engine_detect(client, frame: np.ndarray) -> list[dict]:
+    success, buf = cv2.imencode(".png", frame)
+    if not success:
+        raise ValueError("failed to encode frame as PNG")
+
+    result = client.detect_bytes(buf.tobytes())
+    faces = result.get("faces")
+    if faces is None:
+        raise ValueError("face_engine returned no faces list")
+
+    normalized = []
+    for face in faces:
+        bbox = face.get("bbox")
+        if not bbox:
+            raise ValueError("face_engine returned face without bbox")
+        normalized.append({
+            "bbox": [float(v) for v in bbox],
+            "score": float(face.get("confidence", face.get("score", 0.0))),
+        })
+    return normalized
+
+
 def process_video(state: dict) -> dict:
     from forensics.person_creation.models.person_detector import get_person_detector
-    from forensics.person_creation.models.face_detector import get_face_detector
 
     person_det = get_person_detector()
-    face_det = get_face_detector()
+    face_det = None
+    use_face_engine = _enabled("PERSON_CREATION_USE_FACE_ENGINE")
+    fallback_local = _enabled("FACE_ENGINE_FALLBACK_LOCAL")
+    face_engine_client = None
+    fallback_warned = False
+    service_failed = False
+
+    if use_face_engine:
+        from forensics.face_engine.client import FaceEngineClient
+
+        face_engine_client = FaceEngineClient()
+        print("[process_video] using face_engine for face detection")
+
+    def local_face_detect(frame: np.ndarray) -> list[dict]:
+        nonlocal face_det
+        if face_det is None:
+            from forensics.person_creation.models.face_detector import get_face_detector
+
+            face_det = get_face_detector()
+        return face_det.detect(frame)
+
     every_n = state.get("process_every_n", 5)
     output_dir = Path(state["output_dir"])
 
@@ -52,7 +99,24 @@ def process_video(state: dict) -> dict:
 
             if frame_idx % every_n == 0:
                 persons = person_det.detect(frame)
-                faces = face_det.detect(frame)
+                if use_face_engine and not service_failed:
+                    try:
+                        faces = _face_engine_detect(face_engine_client, frame)
+                    except Exception as exc:
+                        if not fallback_local:
+                            raise RuntimeError(
+                                f"face_engine face detection failed and local fallback is disabled: {exc}"
+                            ) from exc
+                        service_failed = True
+                        if not fallback_warned:
+                            print(
+                                "[process_video] warning: face_engine face detection failed; "
+                                f"falling back to local detector: {exc}"
+                            )
+                            fallback_warned = True
+                        faces = local_face_detect(frame)
+                else:
+                    faces = local_face_detect(frame)
 
                 for det_idx, det in enumerate(persons):
                     crop = _crop(frame, det["bbox"])

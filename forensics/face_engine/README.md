@@ -4,7 +4,8 @@ Standalone local service for face detection, face embedding, and read-only
 Global Memory face recognition.
 
 The service is optional. `person_creation` still uses local face models unless
-phone-photo registration is explicitly configured to call `face_engine`.
+phone-photo registration, video face crop embedding, or video face detection is
+explicitly configured to call `face_engine`.
 
 ## Start In WSL
 
@@ -49,7 +50,22 @@ python3 -m forensics.person_creation.tools.register_face_photos_to_memory \
 ```
 
 Set `FACE_ENGINE_FALLBACK_LOCAL=1` to fall back to local models if the service
-is unavailable. Video processing is not wired to `face_engine` yet.
+is unavailable.
+
+## Optional Video Face Detection
+
+`process_video.py` can use `face_engine` for video face detection while keeping
+body detection, crop saving, crop names, and metadata local:
+
+```bash
+export PERSON_CREATION_USE_FACE_ENGINE=1
+export FACE_ENGINE_URL=http://127.0.0.1:5010
+export FACE_ENGINE_FALLBACK_LOCAL=0
+```
+
+Unset `PERSON_CREATION_USE_FACE_ENGINE` or set it to `0` to use the local face
+detector. Set `FACE_ENGINE_FALLBACK_LOCAL=1` to fall back to the local detector
+if service detection fails.
 
 ## Health
 
@@ -63,6 +79,45 @@ curl http://127.0.0.1:5010/health
 curl -X POST http://127.0.0.1:5010/detect \
   -H "Content-Type: application/json" \
   -d '{"image_path":"forensics/person_creation/videos/test.jpg"}'
+```
+
+## Detect Bytes
+
+`/detect-bytes` accepts a PNG or JPG encoded image using multipart form field
+`image`. It detects faces only; it does not save crops or embed faces.
+
+```bash
+curl -X POST http://127.0.0.1:5010/detect-bytes \
+  -F "image=@/mnt/c/path/to/frame.png;type=image/png"
+```
+
+Python standard-library example:
+
+```bash
+python3 - <<'PY'
+import urllib.request
+import uuid
+from pathlib import Path
+
+image_path = Path("/mnt/c/path/to/frame.png")
+boundary = "----WAYCON" + uuid.uuid4().hex
+body = b""
+body += f"--{boundary}\r\n".encode()
+body += b'Content-Disposition: form-data; name="image"; filename="frame.png"\r\n'
+body += b"Content-Type: image/png\r\n\r\n"
+body += image_path.read_bytes()
+body += f"\r\n--{boundary}--\r\n".encode()
+
+req = urllib.request.Request(
+    "http://127.0.0.1:5010/detect-bytes",
+    data=body,
+    headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+    method="POST",
+)
+with urllib.request.urlopen(req) as resp:
+    print(resp.status)
+    print(resp.read().decode())
+PY
 ```
 
 ## Embed
