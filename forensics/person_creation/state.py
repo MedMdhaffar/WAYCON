@@ -46,8 +46,5 @@ class PersonCreationState(TypedDict):
     clothing_structured: dict  # {top, bottom, shoes, full}
     per_cluster_clothing: dict[int, dict]
 
-    review_feedback: dict
-    approved: bool
-
     profile: dict
     per_cluster_profiles: dict[int, dict]

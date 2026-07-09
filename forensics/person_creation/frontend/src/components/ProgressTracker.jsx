@@ -13,7 +13,6 @@ const NODES = [
 
 const STATUS_COLORS = {
   done:             '#22c55e',
-  awaiting_review:  '#f59e0b',
   error:            '#ef4444',
   default:          '#7c9ef8',
 }
@@ -22,9 +21,8 @@ export default function ProgressTracker({ status, node, error }) {
   const currentIdx = NODES.findIndex(n => n.id === node)
 
   const statusColor = STATUS_COLORS[status] ?? STATUS_COLORS.default
-  const statusLabel = status === 'awaiting_review' ? '⏸ Awaiting Review'
-    : status === 'done'            ? '✓ Done'
-    : status === 'error'           ? '✕ Error'
+  const statusLabel = status === 'done'  ? '✓ Done'
+    : status === 'error'                 ? '✕ Error'
     : status ? `⟳ ${status.replace(/_/g, ' ')}` : '—'
 
   return (

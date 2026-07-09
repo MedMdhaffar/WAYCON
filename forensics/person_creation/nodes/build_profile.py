@@ -1,8 +1,6 @@
 from datetime import date
 from pathlib import Path
 
-from langgraph.types import interrupt
-
 from forensics.person_creation.nodes.profile_signals import (
     build_association_meta,
     color_signals_from_crops,
@@ -109,57 +107,28 @@ def _profile_for_cluster(state: dict, cluster: dict) -> dict:
 
 
 def build_profile(state: dict) -> dict:
-    """Assemble one profile dict per identity cluster and interrupt for review.
+    """Assemble one profile dict per identity cluster.
+
+    Fully automatic — trusts the VLM clothing output and the automated
+    face/body assignment with no human review step.
 
     Input state:  `identity_clusters`, `associations`,
                   `per_cluster_best_body_crops`, `per_cluster_clothing`.
-    Output state: `per_cluster_profiles`, single-cluster `profile`,
-                  `review_feedback`, `approved`.
+    Output state: `per_cluster_profiles`, single-cluster `profile`.
     """
     clusters = state.get("identity_clusters") or []
     if not clusters:
-        print("[build_profile] no identity clusters - no profile review needed")
-        return {"per_cluster_profiles": {}, "profile": {}, "approved": True}
+        print("[build_profile] no identity clusters - no profile built")
+        return {"per_cluster_profiles": {}, "profile": {}}
 
     profiles: dict[int, dict] = {}
     for cluster in clusters:
         profile = _profile_for_cluster(state, cluster)
         profiles[int(cluster["cluster_id"])] = profile
 
-    preview = {
-        "profiles_count": len(profiles),
-        "profiles": [
-            {
-                "cluster_id": p["cluster_id"],
-                "id": p["id"],
-                "name": p["name"],
-                "face_crop_count": p["face_crop_count"],
-                "associations_count": len(p["body_crops"]),
-                "cluster_confidence": p["cluster_confidence"],
-                "appearance": p["appearance"],
-                "color_signals": p["appearance_signals"]["color"],
-                "reid": p["reid"],
-                "best_body_crops": p["best_body_crops"],
-            }
-            for p in profiles.values()
-        ],
-    }
-
-    feedback = interrupt({
-        "message": "Review the generated person profiles below. Reply with 'approve' or provide corrections.",
-        "profile_preview": preview,
-    })
-
-    override = (feedback or {}).get("clothing_override") or {}
-    if override:
-        for profile in profiles.values():
-            profile["appearance"].update({k: v for k, v in override.items() if v})
-
     first_id = sorted(profiles)[0]
     print(f"[build_profile] built {len(profiles)} profile(s)")
     return {
         "per_cluster_profiles": profiles,
         "profile": profiles[first_id],
-        "review_feedback": feedback,
-        "approved": True,
     }

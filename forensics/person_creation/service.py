@@ -8,7 +8,6 @@ from pathlib import Path
 
 from flask import Flask, jsonify, request, send_file
 from flask_cors import CORS
-from langgraph.types import Command
 from werkzeug.utils import secure_filename
 
 import cv2 as _cv2
@@ -56,13 +55,11 @@ class JobState:
     job_id: str
     status: str = "idle"
     # idle | loading_models | processing_video | filtering | embedding | clustering
-    # | auto_pairing | selecting | describing | awaiting_review
+    # | auto_pairing | selecting | computing_reid | describing | building_profile
     # | finalizing | done | error
     node: str = ""
     error: str | None = None
     snapshot: dict = field(default_factory=dict)
-    resume_event: threading.Event = field(default_factory=threading.Event)
-    resume_value: dict | None = None
 
 
 _jobs: dict[str, JobState] = {}
@@ -89,39 +86,23 @@ _NODE_TO_STATUS = {
     "select_best":       "selecting",
     "compute_reid":      "computing_reid",
     "describe_clothing": "describing",
-    "build_profile":     "awaiting_review",
+    "build_profile":     "building_profile",
     "finalize":          "finalizing",
 }
 
 
-def _run_pipeline(job_id: str, initial_state: dict, config: dict) -> None:
+def _run_pipeline(job_id: str, initial_state: dict) -> None:
+    """Run the graph start to end with no human interrupts."""
     job = _jobs[job_id]
     graph = _get_graph()
 
-    def _stream_until_interrupt(input_val):
-        """Stream events, update job state, return interrupt value or None."""
-        for event in graph.stream(input_val, config, stream_mode="updates"):
+    try:
+        for event in graph.stream(initial_state, stream_mode="updates"):
             for node_name, update in event.items():
-                if node_name == "__interrupt__":
-                    return update[0].value
                 job.node = node_name
                 job.status = _NODE_TO_STATUS.get(node_name, node_name)
                 if isinstance(update, dict):
                     job.snapshot.update(update)
-        return None
-
-    try:
-        # --- Run to the profile-review interrupt (pairing is fully automatic) ---
-        interrupt_val = _stream_until_interrupt(initial_state)
-
-        if interrupt_val and "profile_preview" in interrupt_val:
-            job.status = "awaiting_review"
-            job.node = "build_profile"
-            job.snapshot["profile_preview"] = interrupt_val.get("profile_preview", {})
-            job.resume_event.wait()
-            job.resume_event.clear()
-            review_resume = job.resume_value or {"approved": True, "corrections": None}
-            _stream_until_interrupt(Command(resume=review_resume))
 
         job.status = "done"
 
@@ -176,9 +157,8 @@ def start():
         "body_crops": [],
         "face_crops": [],
     }
-    config = {"configurable": {"thread_id": job_id}}
 
-    t = threading.Thread(target=_run_pipeline, args=(job_id, initial_state, config), daemon=True)
+    t = threading.Thread(target=_run_pipeline, args=(job_id, initial_state), daemon=True)
     t.start()
     return jsonify({"job_id": job_id})
 
@@ -199,7 +179,6 @@ def status(job_id: str):
         "unresolved_faces":    snap.get("unresolved_faces", []),
         "unattached_bodies":   snap.get("unattached_bodies", []),
         "per_cluster_profiles": snap.get("per_cluster_profiles", {}),
-        "profile_preview":     snap.get("profile_preview", {}),
         "best_body_crops":     snap.get("best_body_crops", []),
         "per_cluster_best_body_crops": snap.get("per_cluster_best_body_crops", {}),
         "reid_embeddings":    snap.get("reid_embeddings", {}),
@@ -219,24 +198,6 @@ def status(job_id: str):
         "error":    job.error,
         "snapshot": safe_snap,
     })
-
-
-@app.post("/api/person/approve/<job_id>")
-def approve(job_id: str):
-    job = _jobs.get(job_id)
-    if not job:
-        return jsonify({"error": "job not found"}), 404
-    if job.status != "awaiting_review":
-        return jsonify({"error": "job not awaiting review"}), 400
-
-    body = request.get_json(force=True)
-    job.resume_value = {
-        "approved":          True,
-        "corrections":       body.get("corrections"),
-        "clothing_override": body.get("clothing_override"),
-    }
-    job.resume_event.set()
-    return jsonify({"ok": True})
 
 
 @app.delete("/api/person/crop/<job_id>")

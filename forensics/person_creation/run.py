@@ -1,7 +1,4 @@
 import argparse
-import json
-import uuid
-from langgraph.types import Command
 from forensics.person_creation.graph import build_graph
 
 
@@ -16,8 +13,6 @@ def main():
     args = parser.parse_args()
 
     graph = build_graph()
-    thread_id = str(uuid.uuid4())
-    config = {"configurable": {"thread_id": thread_id}}
 
     initial_state = {
         "person_name": args.name,
@@ -39,30 +34,17 @@ def main():
     print(f"Output : {args.output}")
     print(f"Every N: {args.every}\n")
 
-    def _stream(input_val):
-        """Stream graph events and return when interrupted or done."""
-        for event in graph.stream(input_val, config, stream_mode="updates"):
-            for node, update in event.items():
-                if node == "__interrupt__":
-                    return update[0].value
-                print(f"  [{node}] done")
-        return None
+    # Fully automatic — no human interrupts. Accumulate each node's partial
+    # update the same way the Flask service does, so the final dict below
+    # is the complete end-of-run state without needing a checkpointer.
+    state: dict = {}
+    for event in graph.stream(initial_state, stream_mode="updates"):
+        for node, update in event.items():
+            print(f"  [{node}] done")
+            state.update(update)
 
-    # --- Run until the profile-review interrupt (pairing is fully automatic) ---
-    interrupt_data = _stream(initial_state)
-
-    if interrupt_data and "profile_preview" in interrupt_data:
-        print("\n" + "=" * 60)
-        print("REVIEW REQUIRED")
-        print(json.dumps(interrupt_data.get("profile_preview", {}), indent=2))
-        print("=" * 60)
-        answer = input("\nType 'approve' to save, or describe corrections: ").strip()
-        resume_value = {"approved": True, "corrections": None if answer.lower() == "approve" else answer}
-        _stream(Command(resume=resume_value))
-
-    snapshot = graph.get_state(config)
-    profiles = snapshot.values.get("per_cluster_profiles", {})
-    profile = snapshot.values.get("profile", {})
+    profiles = state.get("per_cluster_profiles", {})
+    profile = state.get("profile", {})
     if profiles:
         print(f"\nProfiles saved under: {args.output}")
         for cid, item in profiles.items():
@@ -72,7 +54,7 @@ def main():
         print(f"\nProfile saved: {args.output}/profile.json")
         print(f"  Face crops : {profile.get('face_crop_count', 0)}")
         print(f"  Appearance : {profile.get('appearance', {})}")
-        feedback_path = snapshot.values.get("human_feedback_path", "")
+        feedback_path = state.get("human_feedback_path", "")
         if feedback_path:
             print(f"  Feedback   : {feedback_path}")
 

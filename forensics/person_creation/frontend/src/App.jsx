@@ -8,11 +8,7 @@ import ReviewPanel from './components/ReviewPanel.jsx'
 import ProfileManager from './components/ProfileManager.jsx'
 import MemoryTab from './components/MemoryTab.jsx'
 
-const TABS = ['Setup', 'Progress & Crops', 'Review & Approve', 'Memory']
-const RUNNING_STATUSES = new Set([
-  'loading_models', 'processing_video', 'filtering', 'embedding', 'clustering',
-  'auto_pairing', 'selecting', 'computing_reid', 'describing',
-])
+const TABS = ['Setup', 'Progress & Crops', 'Results', 'Memory']
 
 export default function App() {
   const [mode, setMode] = useState('enroll')   // 'enroll' | 'manage'
@@ -36,10 +32,8 @@ export default function App() {
     pollRef.current = setInterval(async () => {
       const data = await fetchStatus(jobId)
       if (!data) return
-      if (data.status === 'awaiting_review') {
+      if (data.status === 'done' || data.status === 'error') {
         setTab(2)
-        clearInterval(pollRef.current)
-      } else if (data.status === 'done' || data.status === 'error') {
         clearInterval(pollRef.current)
       }
     }, 2000)
@@ -57,11 +51,9 @@ export default function App() {
   }, [jobId, fetchStatus])
 
   const snapshot = jobStatus?.snapshot ?? {}
-  const [clothingOverride, setClothingOverride] = useState(null)
-  const clusterProfiles = Object.fromEntries([
-    ...Object.values(snapshot.profile_preview?.profiles ?? {}),
-    ...Object.values(snapshot.per_cluster_profiles ?? {}),
-  ].map(profile => [String(profile.cluster_id), profile]))
+  const clusterProfiles = Object.fromEntries(
+    Object.values(snapshot.per_cluster_profiles ?? {}).map(profile => [String(profile.cluster_id), profile])
+  )
 
   return (
     <>
@@ -135,13 +127,9 @@ export default function App() {
               perClusterBestBodyCrops={snapshot.per_cluster_best_body_crops ?? {}}
               perClusterClothing={snapshot.per_cluster_clothing ?? {}}
               clusterProfiles={clusterProfiles}
-              onChange={setClothingOverride}
             />
             <ReviewPanel
-              jobId={jobId}
               snapshot={snapshot}
-              clothingOverride={clothingOverride}
-              onDone={refreshStatus}
               finalStatus={jobStatus?.status}
             />
           </>

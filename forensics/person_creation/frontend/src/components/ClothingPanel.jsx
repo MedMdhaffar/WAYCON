@@ -1,5 +1,3 @@
-import { useState, useEffect } from 'react'
-
 const FIELDS = ['top', 'bottom', 'shoes', 'full']
 
 function isInternalLabel(value) {
@@ -55,33 +53,15 @@ function ClusterClothingCard({ clusterId, crops, clothing, profile }) {
   )
 }
 
-export default function ClothingPanel({ bestBodyCrops, clothingStructured, perClusterBestBodyCrops = {}, perClusterClothing = {}, clusterProfiles = {}, onChange }) {
-  const [values, setValues] = useState({ top: '', bottom: '', shoes: '', full: '' })
+export default function ClothingPanel({ bestBodyCrops, clothingStructured, perClusterBestBodyCrops = {}, perClusterClothing = {}, clusterProfiles = {} }) {
   const clusterIds = Object.keys(perClusterBestBodyCrops).sort((a, b) => Number(a) - Number(b))
 
-  useEffect(() => {
-    if (clothingStructured && Object.keys(clothingStructured).length) {
-      setValues({
-        top: clothingStructured.top ?? '',
-        bottom: clothingStructured.bottom ?? '',
-        shoes: clothingStructured.shoes ?? '',
-        full: clothingStructured.full ?? '',
-      })
-    }
-  }, [clothingStructured])
-
-  const update = (field, val) => {
-    const next = { ...values, [field]: val }
-    setValues(next)
-    onChange?.(next)
-  }
-
-  const inputStyle = {
+  const labelStyle = { fontSize: '12px', color: '#94a3b8', marginBottom: '5px', display: 'block', textTransform: 'uppercase', letterSpacing: '0.05em' }
+  const valueStyle = {
     width: '100%', padding: '7px 11px', background: '#0f1117',
     border: '1px solid #1e2330', borderRadius: '6px',
-    color: '#e2e8f0', fontSize: '14px',
+    color: '#e2e8f0', fontSize: '14px', minHeight: '34px',
   }
-  const labelStyle = { fontSize: '12px', color: '#94a3b8', marginBottom: '5px', display: 'block', textTransform: 'uppercase', letterSpacing: '0.05em' }
 
   if (clusterIds.length > 1 || (clusterIds.length === 1 && Object.keys(perClusterClothing).length)) {
     return (
@@ -123,7 +103,7 @@ export default function ClothingPanel({ bestBodyCrops, clothingStructured, perCl
         {FIELDS.map(f => (
           <div key={f} style={f === 'full' ? { gridColumn: '1 / -1' } : {}}>
             <label style={labelStyle}>{f}</label>
-            <input style={inputStyle} value={values[f]} onChange={e => update(f, e.target.value)} placeholder={`Describe ${f}…`} />
+            <div style={valueStyle}>{clothingStructured[f] || '-'}</div>
           </div>
         ))}
       </div>
