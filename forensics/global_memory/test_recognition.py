@@ -24,13 +24,20 @@ def extract_face_embeddings_from_video(
     min_face_size: int = 60,
 ) -> list[np.ndarray]:
     import cv2
-    import torch
-    from facenet_pytorch import InceptionResnetV1, MTCNN
-    from PIL import Image
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    mtcnn = MTCNN(keep_all=True, device=device, min_face_size=min_face_size)
-    embedder = InceptionResnetV1(pretrained="vggface2").eval().to(device)
+    from forensics.face_engine.client import FaceEngineClient
+
+    def _crop(frame, bbox, padding: int = 2):
+        h, w = frame.shape[:2]
+        x1, y1, x2, y2 = [int(v) for v in bbox]
+        x1 = max(0, x1 - padding)
+        y1 = max(0, y1 - padding)
+        x2 = min(w, x2 + padding)
+        y2 = min(h, y2 + padding)
+        return frame[y1:y2, x1:x2]
+
+    face_engine = FaceEngineClient()
+    face_engine.ensure_healthy()
 
     cap = cv2.VideoCapture(str(video_path))
     embeddings: list[np.ndarray] = []
@@ -44,21 +51,25 @@ def extract_face_embeddings_from_video(
             if frame_idx % every_n != 0:
                 continue
 
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             try:
-                faces = mtcnn(Image.fromarray(rgb))
+                faces = face_engine.detect(frame)
             except Exception:
                 continue
-            if faces is None:
-                continue
-            if faces.ndim == 3:
-                faces = faces.unsqueeze(0)
 
-            with torch.no_grad():
-                batch = faces.to(device)
-                embs = embedder(batch)
-                embs = torch.nn.functional.normalize(embs, p=2, dim=1)
-                embeddings.extend(e.cpu().numpy() for e in embs)
+            for face in faces:
+                bbox = face.get("bbox") or []
+                if len(bbox) != 4:
+                    continue
+                x1, y1, x2, y2 = bbox
+                if min(x2 - x1, y2 - y1) < min_face_size:
+                    continue
+                crop = _crop(frame, bbox)
+                if crop.size == 0:
+                    continue
+                try:
+                    embeddings.append(face_engine.embed(crop))
+                except Exception:
+                    continue
     finally:
         cap.release()
 
@@ -149,6 +160,9 @@ def run_recognition_test(
 
     gm = GlobalMemory()
     try:
+        from forensics.face_engine.client import FaceEngineClient
+
+        face_engine = FaceEngineClient()
         log_before = {entry["id"] for entry in gm.get_recognition_history(limit=200)}
         enrolled = gm.list_all()
         print(f"\nGlobal memory currently has {len(enrolled)} enrolled person(s):")
@@ -161,7 +175,8 @@ def run_recognition_test(
         new_count = 0
         for i, cluster_emb in enumerate(clusters):
             print(f"\n--- Cluster {i} ---")
-            results = gm.query_by_face(cluster_emb.tolist(), top_k=3, threshold=threshold)
+            recognition = face_engine.recognize(cluster_emb, top_k=3, threshold=threshold)
+            results = recognition.get("matches", [])
             if results:
                 matched_count += 1
                 best = results[0]

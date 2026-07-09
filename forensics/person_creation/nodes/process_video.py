@@ -20,10 +20,10 @@ def _crop(frame: np.ndarray, bbox: list[float], padding: int = 2) -> np.ndarray:
 
 def process_video(state: dict) -> dict:
     from forensics.person_creation.models.person_detector import get_person_detector
-    from forensics.person_creation.models.face_detector import get_face_detector
+    from forensics.face_engine.client import FaceEngineClient
 
     person_det = get_person_detector()
-    face_det = get_face_detector()
+    face_det = FaceEngineClient()
     every_n = state.get("process_every_n", 5)
     output_dir = Path(state["output_dir"])
 

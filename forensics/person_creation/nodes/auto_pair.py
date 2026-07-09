@@ -221,12 +221,12 @@ class _ScoringContext:
 
 def _attach_available_cues(ctx: _ScoringContext) -> None:
     try:
-        from forensics.person_creation.models.face_embedder import get_face_embedder
+        from forensics.face_engine.client import FaceEngineClient
 
-        embedder = get_face_embedder()
-        if embedder.is_loaded():
-            ctx.face_embedder = embedder
-            ctx.cues_enabled["face"] = True
+        embedder = FaceEngineClient()
+        embedder.ensure_healthy()
+        ctx.face_embedder = embedder
+        ctx.cues_enabled["face"] = True
     except Exception:
         pass
     try:

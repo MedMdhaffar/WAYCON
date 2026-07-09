@@ -4,9 +4,9 @@ from pathlib import Path
 
 def embed_all_faces(state: dict) -> dict:
     """Embed every quality face crop before any identity decision is made."""
-    from forensics.person_creation.models.face_embedder import get_face_embedder
+    from forensics.face_engine.client import FaceEngineClient
 
-    embedder = get_face_embedder()
+    embedder = FaceEngineClient()
     records: list[dict] = []
     failed: list[dict] = []
 
@@ -20,7 +20,7 @@ def embed_all_faces(state: dict) -> dict:
                 print(f"[embed_all_faces] warning: unreadable face crop skipped: {path}")
                 failed.append({**crop, "crop_path": path, "reason": "unreadable_face_crop"})
                 continue
-            emb = embedder.embed(img)
+            emb = embedder.embed(img).tolist()
         except Exception as exc:
             print(f"[embed_all_faces] warning: failed to embed {path}: {exc}")
             failed.append({**crop, "crop_path": path, "reason": f"embedding_failed: {exc}"})
