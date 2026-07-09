@@ -1,6 +1,8 @@
 import threading
 import numpy as np
 
+from forensics.person_creation.models.device import resolve_device
+
 
 class PersonDetector:
     def __init__(self) -> None:
@@ -8,13 +10,18 @@ class PersonDetector:
         self._device = None
         self._lock = threading.Lock()
 
+<<<<<<< HEAD
     def is_loaded(self) -> bool:
         return self._model is not None
 
     def load(self, model_path: str, device: str = "cuda") -> None:
         if self._model is not None:
             return
+=======
+    def load(self, model_path: str, device: str = "auto") -> None:
+>>>>>>> Khalifa_branch
         from ultralytics import YOLO
+        device = resolve_device(device)
         self._model = YOLO(model_path)
         self._model.to(device)
         self._device = device

@@ -2,6 +2,8 @@ import json
 import numpy as np
 from pathlib import Path
 
+from forensics.person_creation.models.device import resolve_device
+
 _PROMPTS_PATH = Path(__file__).parent.parent / "prompts" / "clothing.yaml"
 _INPUT_SIZE = 448
 _IMAGENET_MEAN = (0.485, 0.456, 0.406)
@@ -17,6 +19,7 @@ def _load_prompt() -> str:
         cfg["instruction"],
         cfg["constraints"],
         cfg["detail"],
+        cfg.get("consistency", ""),
         cfg["output_format"],
     ])
 
@@ -34,21 +37,27 @@ class ClothingDescriber:
     def __init__(self) -> None:
         self._model = None
         self._tokenizer = None
-        self._device = "cuda"
+        self._device = "cpu"
+        self._dtype = None
 
+<<<<<<< HEAD
     def is_loaded(self) -> bool:
         return self._model is not None
 
     def load(self, model_id: str = "OpenGVLab/InternVL3_5-2B", device: str = "cuda") -> None:
         if self._model is not None:
             return
+=======
+    def load(self, model_id: str = "OpenGVLab/InternVL3_5-2B", device: str = "auto") -> None:
+>>>>>>> Khalifa_branch
         import torch
         from transformers import AutoTokenizer, AutoModel
 
-        self._device = device
+        self._device = resolve_device(device)
+        self._dtype = torch.bfloat16 if self._device == "cuda" else torch.float32
         try:
             import flash_attn
-            use_flash = True
+            use_flash = self._device == "cuda"
         except ImportError:
             use_flash = False
 
@@ -57,12 +66,12 @@ class ClothingDescriber:
         )
         self._model = AutoModel.from_pretrained(
             model_id,
-            torch_dtype=torch.bfloat16,
+            torch_dtype=self._dtype,
             use_flash_attn=use_flash,
-            device_map=device,
+            device_map=self._device,
             trust_remote_code=True,
         ).eval()
-        print(f"[ClothingDescriber] loaded {model_id} on {device}")
+        print(f"[ClothingDescriber] loaded {model_id} on {self._device}")
 
     def unload(self) -> None:
         from forensics.person_creation.utils.model_lifecycle import move_to_cpu
@@ -86,7 +95,7 @@ class ClothingDescriber:
             transforms.Normalize(mean=_IMAGENET_MEAN, std=_IMAGENET_STD),
         ])
         rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
-        return t(Image.fromarray(rgb)).unsqueeze(0).to(self._device, dtype=torch.bfloat16)
+        return t(Image.fromarray(rgb)).unsqueeze(0).to(self._device, dtype=self._dtype)
 
     def describe(self, crops_bgr: list[np.ndarray]) -> tuple[str, dict]:
         import torch

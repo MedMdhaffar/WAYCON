@@ -7,10 +7,17 @@ import ClothingPanel from './components/ClothingPanel.jsx'
 import ReviewPanel from './components/ReviewPanel.jsx'
 import ProfileManager from './components/ProfileManager.jsx'
 
+<<<<<<< HEAD
 const TABS = ['Setup', 'Progress & Crops', 'Review generated descriptions']
 const RUNNING_STATUSES = new Set([
   'loading_models', 'processing_video', 'filtering', 'embedding',
   'associating', 'tracking', 'promoting', 'selecting', 'describing',
+=======
+const TABS = ['Setup', 'Progress & Crops', 'Review & Approve']
+const RUNNING_STATUSES = new Set([
+  'loading_models', 'processing_video', 'filtering', 'embedding', 'clustering',
+  'auto_pairing', 'selecting', 'describing',
+>>>>>>> Khalifa_branch
 ])
 
 export default function App() {
@@ -55,7 +62,10 @@ export default function App() {
     if (jobId) fetchStatus(jobId)
   }, [jobId, fetchStatus])
 
+<<<<<<< HEAD
 
+=======
+>>>>>>> Khalifa_branch
   const snapshot = jobStatus?.snapshot ?? {}
   const [clothingOverride, setClothingOverride] = useState(null)
 
@@ -130,7 +140,12 @@ export default function App() {
               bestBodyCrops={snapshot.best_body_crops ?? []}
               bestBodyCropsByPerson={snapshot.best_body_crops_by_person ?? {}}
               clothingStructured={snapshot.clothing_structured ?? {}}
+<<<<<<< HEAD
               clothingByPerson={snapshot.clothing_by_person ?? {}}
+=======
+              perClusterBestBodyCrops={snapshot.per_cluster_best_body_crops ?? {}}
+              perClusterClothing={snapshot.per_cluster_clothing ?? {}}
+>>>>>>> Khalifa_branch
               onChange={setClothingOverride}
             />
             <ReviewPanel

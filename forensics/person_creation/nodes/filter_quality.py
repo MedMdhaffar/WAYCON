@@ -21,4 +21,9 @@ def filter_quality(state: dict) -> dict:
     quality_body = [c for c in state["body_crops"] if _body_ok(c)]
     quality_face = [c for c in state["face_crops"] if _face_ok(c)]
     print(f"[filter_quality] body: {len(state['body_crops'])} → {len(quality_body)} | face: {len(state['face_crops'])} → {len(quality_face)}")
-    return {"quality_body_crops": quality_body, "quality_face_crops": quality_face}
+    return {
+        "quality_body_crops": quality_body,
+        "quality_face_crops": quality_face,
+        "total_quality_body_crops": len(quality_body),
+        "total_quality_face_crops": len(quality_face),
+    }

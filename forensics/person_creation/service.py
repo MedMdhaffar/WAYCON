@@ -77,8 +77,8 @@ CORS(app)
 class JobState:
     job_id: str
     status: str = "idle"
-    # idle | loading_models | processing_video | filtering | embedding
-    # | awaiting_pairing | selecting | describing | awaiting_review
+    # idle | loading_models | processing_video | filtering | embedding | clustering
+    # | auto_pairing | selecting | describing | awaiting_review
     # | finalizing | done | error
     node: str = ""
     error: str | None = None
@@ -105,6 +105,7 @@ _NODE_TO_STATUS = {
     "prepare_runtime":   "loading_models",
     "process_video":     "processing_video",
     "filter_quality":    "filtering",
+<<<<<<< HEAD
     "auto_associate":    "associating",
     "track_persons":     "tracking",
     "promote_crops":     "promoting",
@@ -112,6 +113,13 @@ _NODE_TO_STATUS = {
     "human_in_the_loop": "awaiting_pairing",
     "select_best":       "selecting",
     "select_best_per_person": "selecting",
+=======
+    "embed_all_faces":   "embedding",
+    "cluster_identities": "clustering",
+    "assign_bodies_to_clusters": "auto_pairing",
+    "select_best":       "selecting",
+    "compute_reid":      "computing_reid",
+>>>>>>> Khalifa_branch
     "describe_clothing": "describing",
     "describe_clothing_per_person": "describing",
     "build_profile":     "awaiting_review",
@@ -137,23 +145,17 @@ def _run_pipeline(job_id: str, initial_state: dict, config: dict) -> None:
         return None
 
     try:
-        # --- Run to first interrupt (human_in_the_loop pairing) ---
+        # --- Run to the profile-review interrupt (pairing is fully automatic) ---
         interrupt_val = _stream_until_interrupt(initial_state)
 
-        if interrupt_val and "frame_groups" in interrupt_val:
-            job.status = "awaiting_pairing"
-            job.node = "human_in_the_loop"
-            # Merge frame_groups into snapshot for UI access
-            job.snapshot["frame_groups"] = interrupt_val.get("frame_groups", [])
-            job.resume_event.wait()
-            job.resume_event.clear()
-            pairing_resume = job.resume_value or {"human_pairs": [], "deleted_paths": []}
-            interrupt_val = _stream_until_interrupt(Command(resume=pairing_resume))
-
-        # --- Run to second interrupt (build_profile review) ---
         if interrupt_val and "profile_preview" in interrupt_val:
             job.status = "awaiting_review"
+<<<<<<< HEAD
             job.node = "build_multi_profile"
+=======
+            job.node = "build_profile"
+            job.snapshot["profile_preview"] = interrupt_val.get("profile_preview", {})
+>>>>>>> Khalifa_branch
             job.resume_event.wait()
             job.resume_event.clear()
             review_resume = job.resume_value or {"approved": True, "corrections": None}
@@ -175,6 +177,8 @@ def start():
     video_paths = body.get("video_paths", [])
     output_dir = body.get("output_dir", f"forensics/person_db/{name.lower()}")
     every_n = int(body.get("every_n", 15))
+    identity_config = body.get("identity_clustering_config", {})
+    reid_config = body.get("reid", body.get("reid_config", {}))
 
     if not name or not video_paths:
         return jsonify({"error": "name and video_paths required"}), 400
@@ -205,6 +209,8 @@ def start():
         "video_paths": normalized,
         "output_dir": str(Path(output_dir)),
         "process_every_n": every_n,
+        "identity_clustering_config": identity_config,
+        "reid_config": reid_config,
         "body_crops": [],
         "face_crops": [],
     }
@@ -227,13 +233,31 @@ def status(job_id: str):
         "quality_face_crops":  snap.get("quality_face_crops", []),
         "frame_groups":        snap.get("frame_groups", []),
         "associations":        snap.get("associations", []),
+<<<<<<< HEAD
         "person_tracks":       snap.get("person_tracks", []),
         "best_body_crops":     snap.get("best_body_crops", []),
         "best_body_crops_by_person": snap.get("best_body_crops_by_person", {}),
+=======
+        "identity_clusters":   snap.get("identity_clusters", []),
+        "unresolved_faces":    snap.get("unresolved_faces", []),
+        "unattached_bodies":   snap.get("unattached_bodies", []),
+        "per_cluster_profiles": snap.get("per_cluster_profiles", {}),
+        "profile_preview":     snap.get("profile_preview", {}),
+        "best_body_crops":     snap.get("best_body_crops", []),
+        "per_cluster_best_body_crops": snap.get("per_cluster_best_body_crops", {}),
+        "reid_embeddings":    snap.get("reid_embeddings", {}),
+        "reid_crop_counts":   snap.get("reid_crop_counts", {}),
+        "reid_reasons":       snap.get("reid_reasons", {}),
+        "reid_unavailable_reason": snap.get("reid_unavailable_reason", ""),
+>>>>>>> Khalifa_branch
         "clothing_structured": snap.get("clothing_structured", {}),
         "clothing_by_person":  snap.get("clothing_by_person", {}),
         "clothing_raw":        snap.get("clothing_raw", ""),
+<<<<<<< HEAD
         "clothing_raw_by_person": snap.get("clothing_raw_by_person", {}),
+=======
+        "per_cluster_clothing": snap.get("per_cluster_clothing", {}),
+>>>>>>> Khalifa_branch
         "profile":             snap.get("profile", {}),
         "human_feedback_path": snap.get("human_feedback_path", ""),
     }
@@ -244,23 +268,6 @@ def status(job_id: str):
         "error":    job.error,
         "snapshot": safe_snap,
     })
-
-
-@app.post("/api/person/confirm-pairs/<job_id>")
-def confirm_pairs(job_id: str):
-    job = _jobs.get(job_id)
-    if not job:
-        return jsonify({"error": "job not found"}), 404
-    if job.status != "awaiting_pairing":
-        return jsonify({"error": "job not awaiting pairing"}), 400
-
-    body = request.get_json(force=True)
-    job.resume_value = {
-        "human_pairs":   body.get("pairs", []),
-        "deleted_paths": body.get("deleted_paths", []),
-    }
-    job.resume_event.set()
-    return jsonify({"ok": True})
 
 
 @app.post("/api/person/approve/<job_id>")

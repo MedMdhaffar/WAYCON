@@ -2,6 +2,7 @@ const NODES = [
   { id: 'prepare_runtime',   label: 'Prepare Runtime' },
   { id: 'process_video',     label: 'Extract Crops' },
   { id: 'filter_quality',    label: 'Filter Quality' },
+<<<<<<< HEAD
   { id: 'auto_associate',    label: 'Automatic face-body matching' },
   { id: 'track_persons',     label: 'Detected people' },
   { id: 'promote_crops',     label: 'Save Matches' },
@@ -9,13 +10,20 @@ const NODES = [
   { id: 'select_best_per_person', label: 'Select Best' },
   { id: 'describe_clothing_per_person', label: 'Review generated descriptions' },
   { id: 'build_multi_profile', label: 'Build Profile' },
+=======
+  { id: 'embed_all_faces',   label: 'Embed Faces' },
+  { id: 'cluster_identities', label: 'Cluster Identities' },
+  { id: 'assign_bodies_to_clusters', label: 'Assign Bodies' },
+  { id: 'select_best',       label: 'Select Best' },
+  { id: 'describe_clothing', label: 'Describe Clothing' },
+  { id: 'build_profile',     label: 'Build Profile' },
+>>>>>>> Khalifa_branch
   { id: 'finalize',          label: 'Finalize' },
 ]
 
 const STATUS_COLORS = {
   done:             '#22c55e',
   awaiting_review:  '#f59e0b',
-  awaiting_pairing: '#a78bfa',
   error:            '#ef4444',
   default:          '#7c9ef8',
 }
@@ -24,8 +32,12 @@ export default function ProgressTracker({ status, node, error }) {
   const currentIdx = NODES.findIndex(n => n.id === node)
 
   const statusColor = STATUS_COLORS[status] ?? STATUS_COLORS.default
+<<<<<<< HEAD
   const statusLabel = status === 'awaiting_pairing'  ? 'Review automatic matches'
     : status === 'awaiting_review' ? 'Review generated descriptions'
+=======
+  const statusLabel = status === 'awaiting_review' ? '⏸ Awaiting Review'
+>>>>>>> Khalifa_branch
     : status === 'done'            ? '✓ Done'
     : status === 'error'           ? '✕ Error'
     : status ? `⟳ ${status.replace(/_/g, ' ')}` : '—'
