@@ -30,6 +30,36 @@ The tool detects the face with the existing YOLO face detector, embeds the crop
 with the existing FaceNet embedder, averages all valid photo embeddings, and
 stores or updates the matching person.
 
+Phone-photo registration can optionally use the standalone local face engine for
+detection and embedding:
+
+```bash
+cd /mnt/c/Users/aziza/Documents/GitHub/WAYCON
+PERSON_CREATION_DEVICE=cuda python3 -m forensics.face_engine.service
+```
+
+In another shell:
+
+```bash
+export PERSON_CREATION_USE_FACE_ENGINE=1
+export FACE_ENGINE_URL=http://127.0.0.1:5010
+export FACE_ENGINE_FALLBACK_LOCAL=0
+python3 -m forensics.person_creation.tools.register_face_photos_to_memory \
+  --name Malek \
+  --images /mnt/c/path/to/photo1.jpg /mnt/c/path/to/photo2.jpg
+```
+
+Defaults are unchanged: if `PERSON_CREATION_USE_FACE_ENGINE` is unset or `0`,
+registration uses the local detector and embedder. If `FACE_ENGINE_FALLBACK_LOCAL=1`,
+a service outage falls back to local models with a warning.
+
+Compare local and service embeddings for the same photo set:
+
+```bash
+python3 -m forensics.person_creation.tools.compare_face_engine_photo_embedding \
+  --images /mnt/c/path/to/photo1.jpg
+```
+
 ## Run Video Enrollment
 
 Run the current enrollment UI/backend as usual. After the profile approval

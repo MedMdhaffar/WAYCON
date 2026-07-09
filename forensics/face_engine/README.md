@@ -3,7 +3,8 @@
 Standalone local service for face detection, face embedding, and read-only
 Global Memory face recognition.
 
-Phase 1 only adds this service. It does not rewire `person_creation`.
+The service is optional. `person_creation` still uses local face models unless
+phone-photo registration is explicitly configured to call `face_engine`.
 
 ## Start In WSL
 
@@ -25,11 +26,30 @@ Useful environment variables:
 export FACE_ENGINE_HOST=127.0.0.1
 export FACE_ENGINE_PORT=5010
 export PERSON_CREATION_DEVICE=auto
+export PERSON_CREATION_USE_FACE_ENGINE=0
+export FACE_ENGINE_URL=http://127.0.0.1:5010
+export FACE_ENGINE_FALLBACK_LOCAL=0
 export PERSON_GLOBAL_MEMORY_DB=/mnt/c/Users/aziza/Documents/GitHub/WAYCON/forensics/person_db/global_memory.sqlite
 ```
 
 Use `PERSON_CREATION_DEVICE=cuda` when you want startup to fail clearly if CUDA
 is not available.
+
+## Optional Phone-Photo Registration
+
+Phone-photo registration can use this service for face detection and embedding:
+
+```bash
+export PERSON_CREATION_USE_FACE_ENGINE=1
+export FACE_ENGINE_URL=http://127.0.0.1:5010
+export FACE_ENGINE_FALLBACK_LOCAL=0
+python3 -m forensics.person_creation.tools.register_face_photos_to_memory \
+  --name TestService \
+  --images /mnt/c/path/to/photo.jpg
+```
+
+Set `FACE_ENGINE_FALLBACK_LOCAL=1` to fall back to local models if the service
+is unavailable. Video processing is not wired to `face_engine` yet.
 
 ## Health
 
