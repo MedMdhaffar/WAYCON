@@ -6,11 +6,12 @@ import AssociationsView from './components/AssociationsView.jsx'
 import ClothingPanel from './components/ClothingPanel.jsx'
 import ReviewPanel from './components/ReviewPanel.jsx'
 import ProfileManager from './components/ProfileManager.jsx'
+import MemoryTab from './components/MemoryTab.jsx'
 
-const TABS = ['Setup', 'Progress & Crops', 'Review & Approve']
+const TABS = ['Setup', 'Progress & Crops', 'Review & Approve', 'Memory']
 const RUNNING_STATUSES = new Set([
   'loading_models', 'processing_video', 'filtering', 'embedding', 'clustering',
-  'auto_pairing', 'selecting', 'describing',
+  'auto_pairing', 'selecting', 'computing_reid', 'describing',
 ])
 
 export default function App() {
@@ -57,6 +58,10 @@ export default function App() {
 
   const snapshot = jobStatus?.snapshot ?? {}
   const [clothingOverride, setClothingOverride] = useState(null)
+  const clusterProfiles = Object.fromEntries([
+    ...Object.values(snapshot.profile_preview?.profiles ?? {}),
+    ...Object.values(snapshot.per_cluster_profiles ?? {}),
+  ].map(profile => [String(profile.cluster_id), profile]))
 
   return (
     <>
@@ -95,7 +100,7 @@ export default function App() {
                 key={label}
                 className={`tab-btn${tab === i ? ' active' : ''}`}
                 onClick={() => setTab(i)}
-                disabled={i > 0 && !jobId}
+                disabled={i > 0 && i !== 3 && !jobId}
               >
                 {label}
               </button>
@@ -129,6 +134,7 @@ export default function App() {
               clothingStructured={snapshot.clothing_structured ?? {}}
               perClusterBestBodyCrops={snapshot.per_cluster_best_body_crops ?? {}}
               perClusterClothing={snapshot.per_cluster_clothing ?? {}}
+              clusterProfiles={clusterProfiles}
               onChange={setClothingOverride}
             />
             <ReviewPanel
@@ -140,6 +146,8 @@ export default function App() {
             />
           </>
         )}
+
+        {tab === 3 && <MemoryTab />}
           </div>
         </>
       )}
