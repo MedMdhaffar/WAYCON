@@ -43,7 +43,7 @@ app = create_app(load_models=False)
 def main() -> None:
     global app
     app = create_app(load_models=True)
-    app.run(host="0.0.0.0", port=config.PORT, debug=False)
+    app.run(host=config.HOST, port=config.PORT, debug=False)
 
 
 if __name__ == "__main__":

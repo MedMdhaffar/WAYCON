@@ -117,9 +117,10 @@ def _normalize_profile_schema(profile: dict) -> dict:
 def _session_report(state: dict, profiles_written: int) -> dict:
     clusters = state.get("identity_clusters", [])
     low_confidence = [c for c in clusters if c.get("low_confidence")]
-    return {
+    report = {
         "session_id": Path(state["output_dir"]).name,
         "video_sources": state.get("video_paths", []),
+        "source_type": state.get("source_type", "video_file"),
         "profiles_written": profiles_written,
         "total_face_crops": state.get("total_quality_face_crops", len(state.get("quality_face_crops", []))),
         "total_body_crops": state.get("total_quality_body_crops", len(state.get("quality_body_crops", []))),
@@ -130,6 +131,15 @@ def _session_report(state: dict, profiles_written: int) -> dict:
         "identity_clustering_config": state.get("identity_clustering_config", {}),
         "reid_config": state.get("reid_config", {}),
     }
+    if state.get("source_type") == "live_camera":
+        report.update({
+            "camera_uri_masked": state.get("source_uri_masked", ""),
+            "camera_id": state.get("camera_id"),
+            "duration_seconds": state.get("duration_seconds", 30),
+            "stream_stats": state.get("stream_stats", {}),
+            "stream_report_path": state.get("stream_report_path", ""),
+        })
+    return report
 
 
 def finalize(state: dict) -> dict:

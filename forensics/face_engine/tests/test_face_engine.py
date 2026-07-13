@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import base64
 
 import numpy as np
 import pytest
@@ -92,6 +93,13 @@ def test_detect_no_face():
     assert res.get_json() == {"faces": [], "count": 0}
 
 
+def test_detect_accepts_json_base64(client):
+    encoded = base64.b64encode(_jpg_bytes()).decode("ascii")
+    res = client.post("/detect", json={"image_b64": encoded})
+    assert res.status_code == 200
+    assert res.get_json()["count"] == 1
+
+
 def test_embed_shape_and_norm(client):
     res = client.post(
         "/embed",
@@ -102,6 +110,13 @@ def test_embed_shape_and_norm(client):
     data = res.get_json()
     assert data["dim"] == 512
     assert np.linalg.norm(np.asarray(data["embedding"], dtype=np.float32)) == pytest.approx(1.0, abs=1e-5)
+
+
+def test_embed_accepts_json_base64(client):
+    encoded = base64.b64encode(_jpg_bytes()).decode("ascii")
+    res = client.post("/embed", json={"image_b64": encoded})
+    assert res.status_code == 200
+    assert res.get_json()["dim"] == 512
 
 
 def test_embed_bad_input(client):
@@ -135,4 +150,3 @@ def test_client_engine_down():
     client = FaceEngineClient(base_url="http://127.0.0.1:9", timeout=0.1)
     with pytest.raises(FaceEngineConnectionError, match="Start it with"):
         client.health()
-

@@ -27,6 +27,12 @@ class FaceEngineClient:
             raise FaceEngineConnectionError(
                 f"Face engine at {self.base_url} is reachable but models are not loaded."
             )
+        print(
+            f"[face_engine] using {self.base_url} "
+            f"(service={data.get('service', 'legacy')}, "
+            f"api_version={data.get('api_version', 'unknown')}, "
+            f"device={data.get('device', 'unknown')})"
+        )
 
     def detect(self, image_bgr: np.ndarray) -> list[dict]:
         data = self._request("POST", "/detect", files=self._image_files(image_bgr))
@@ -82,4 +88,3 @@ class FaceEngineClient:
         if not ok:
             raise ValueError("failed to encode image for face engine request")
         return {"image": ("image.jpg", io.BytesIO(encoded.tobytes()), "image/jpeg")}
-

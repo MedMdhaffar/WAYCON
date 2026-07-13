@@ -4,7 +4,11 @@ const DEFAULT_VIDEOS = ['']
 
 export default function StartForm({ onStart }) {
   const [name, setName] = useState('Malek')
+  const [inputType, setInputType] = useState('video_file')
   const [videos, setVideos] = useState(DEFAULT_VIDEOS)
+  const [cameraUri, setCameraUri] = useState('')
+  const [cameraId, setCameraId] = useState('')
+  const [durationSeconds, setDurationSeconds] = useState(30)
   const [outputDir, setOutputDir] = useState('forensics/person_db/malek')
   const [everyN, setEveryN] = useState(5)
   const [loading, setLoading] = useState(false)
@@ -21,12 +25,23 @@ export default function StartForm({ onStart }) {
     setPathErrors([])
     setLoading(true)
     try {
+      const sourcePayload = inputType === 'camera_uri'
+        ? {
+            input_type: 'camera_uri',
+            camera_uri: cameraUri.trim(),
+            camera_id: cameraId.trim() || undefined,
+            duration_seconds: Number(durationSeconds),
+          }
+        : {
+            input_type: 'video_file',
+            video_paths: videos.filter(v => v.trim()),
+          }
       const res = await fetch('/api/person/start', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           name,
-          video_paths: videos.filter(v => v.trim()),
+          ...sourcePayload,
           output_dir: outputDir,
           every_n: everyN,
         }),
@@ -62,24 +77,69 @@ export default function StartForm({ onStart }) {
         </div>
 
         <div>
-          <label style={labelStyle}>Video Clips</label>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-            {videos.map((v, i) => (
-              <div key={i} style={{ display: 'flex', gap: '8px' }}>
-                <input
-                  style={{ ...inputStyle, flex: 1 }}
-                  value={v}
-                  onChange={e => updateVideo(i, e.target.value)}
-                  placeholder="/mnt/c/Users/.../clip.mp4"
-                />
-                {videos.length > 1 && (
-                  <button type="button" className="btn btn-danger" onClick={() => removeVideo(i)} style={{ padding: '8px 12px' }}>✕</button>
-                )}
-              </div>
-            ))}
-            <button type="button" className="btn btn-ghost" onClick={addVideo} style={{ alignSelf: 'flex-start' }}>+ Add video</button>
-          </div>
+          <label style={labelStyle}>Input Source</label>
+          <select style={inputStyle} value={inputType} onChange={e => setInputType(e.target.value)}>
+            <option value="video_file">Video file/path</option>
+            <option value="camera_uri">Live camera URI</option>
+          </select>
         </div>
+
+        {inputType === 'video_file' ? (
+          <div>
+            <label style={labelStyle}>Video Clips</label>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+              {videos.map((v, i) => (
+                <div key={i} style={{ display: 'flex', gap: '8px' }}>
+                  <input
+                    style={{ ...inputStyle, flex: 1 }}
+                    value={v}
+                    onChange={e => updateVideo(i, e.target.value)}
+                    placeholder="/home/user/video.mp4"
+                    required
+                  />
+                  {videos.length > 1 && (
+                    <button type="button" className="btn btn-danger" onClick={() => removeVideo(i)} style={{ padding: '8px 12px' }}>✕</button>
+                  )}
+                </div>
+              ))}
+              <button type="button" className="btn btn-ghost" onClick={addVideo} style={{ alignSelf: 'flex-start' }}>+ Add video</button>
+            </div>
+          </div>
+        ) : (
+          <>
+            <div>
+              <label style={labelStyle}>Camera URI</label>
+              <input
+                style={inputStyle}
+                value={cameraUri}
+                onChange={e => setCameraUri(e.target.value)}
+                placeholder="rtsp://user:password@camera:554/Streaming/Channels/101"
+                required
+              />
+              <div style={{ color: '#64748b', fontSize: 12, marginTop: 6 }}>
+                RTSP/HTTP camera URI. Passwords are masked in backend logs.
+              </div>
+            </div>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+              <div>
+                <label style={labelStyle}>Camera ID (optional)</label>
+                <input style={inputStyle} value={cameraId} onChange={e => setCameraId(e.target.value)} placeholder="103" />
+              </div>
+              <div>
+                <label style={labelStyle}>Duration (seconds)</label>
+                <input
+                  style={inputStyle}
+                  type="number"
+                  min={5}
+                  max={300}
+                  value={durationSeconds}
+                  onChange={e => setDurationSeconds(Number(e.target.value))}
+                  required
+                />
+              </div>
+            </div>
+          </>
+        )}
 
         <div>
           <label style={labelStyle}>Output Directory</label>

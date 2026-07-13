@@ -1,11 +1,15 @@
-const NODES = [
+const pipelineNodes = (sourceType) => [
   { id: 'load_models',       label: 'Load Models' },
-  { id: 'process_video',     label: 'Extract Crops' },
+  sourceType === 'live_camera'
+    ? { id: 'process_live_stream', label: 'Process Live Stream' }
+    : { id: 'process_video', label: 'Extract Video Crops' },
   { id: 'filter_quality',    label: 'Filter Quality' },
   { id: 'embed_all_faces',   label: 'Embed Faces' },
   { id: 'cluster_identities', label: 'Cluster Identities' },
   { id: 'assign_bodies_to_clusters', label: 'Assign Bodies' },
+  { id: 'promote_crops',     label: 'Promote Crops' },
   { id: 'select_best',       label: 'Select Best' },
+  { id: 'compute_reid',      label: 'Compute ReID' },
   { id: 'describe_clothing', label: 'Describe Clothing' },
   { id: 'build_profile',     label: 'Build Profile' },
   { id: 'finalize',          label: 'Finalize' },
@@ -17,7 +21,8 @@ const STATUS_COLORS = {
   default:          '#7c9ef8',
 }
 
-export default function ProgressTracker({ status, node, error }) {
+export default function ProgressTracker({ status, node, error, sourceType }) {
+  const NODES = pipelineNodes(sourceType)
   const currentIdx = NODES.findIndex(n => n.id === node)
 
   const statusColor = STATUS_COLORS[status] ?? STATUS_COLORS.default

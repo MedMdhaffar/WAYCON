@@ -5,6 +5,7 @@ import traceback
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from flask import Flask, jsonify, request, send_file
 from flask_cors import CORS
@@ -14,6 +15,7 @@ import cv2 as _cv2
 
 from forensics.person_identifier.config import Config as _PIConfig
 from forensics.person_creation.path_utils import to_wsl_path as _to_wsl_path
+from forensics.person_creation.live_stream import mask_camera_uri
 from forensics.person_creation.tools.cleanup_orphan_crops import (
     cleanup as _cleanup_orphan_crops,
     CleanupError as _CleanupError,
@@ -38,6 +40,99 @@ def _validate_video_path(p: str) -> str | None:
         return None
     finally:
         cap.release()
+
+
+class StartRequestError(ValueError):
+    def __init__(self, message: str, details: list[dict] | None = None) -> None:
+        super().__init__(message)
+        self.details = details or []
+
+
+def _as_int(value, field_name: str) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise StartRequestError(f"{field_name} must be an integer") from exc
+
+
+def build_initial_state(body: dict, *, validate_video_paths: bool = True) -> dict:
+    """Validate a start payload and build graph state for video or live input."""
+    if not isinstance(body, dict):
+        raise StartRequestError("JSON object required")
+    name = str(body.get("name", "")).strip()
+    if not name:
+        raise StartRequestError("name required")
+
+    input_type = str(body.get("input_type") or "video_file").strip().lower()
+    if input_type not in {"video", "video_file", "camera_uri"}:
+        raise StartRequestError("input_type must be 'video_file' or 'camera_uri'")
+    if input_type == "video":
+        input_type = "video_file"
+
+    output_dir = str(body.get("output_dir") or f"forensics/person_db/{name.lower()}")
+    every_n = max(1, _as_int(body.get("every_n", 15), "every_n"))
+    initial_state = {
+        "person_name": name,
+        "input_type": input_type,
+        "source_type": "live_camera" if input_type == "camera_uri" else "video_file",
+        "video_paths": [],
+        "output_dir": str(Path(output_dir)),
+        "process_every_n": every_n,
+        "identity_clustering_config": body.get("identity_clustering_config", {}),
+        "reid_config": body.get("reid", body.get("reid_config", {})),
+        "body_crops": [],
+        "face_crops": [],
+    }
+
+    if input_type == "camera_uri":
+        camera_uri = str(body.get("camera_uri") or "").strip()
+        if not camera_uri:
+            raise StartRequestError("camera_uri required when input_type is 'camera_uri'")
+        try:
+            parsed = urlsplit(camera_uri)
+        except ValueError as exc:
+            raise StartRequestError("camera_uri is invalid") from exc
+        if parsed.scheme.lower() not in {"rtsp", "http", "https", "file"}:
+            raise StartRequestError("camera_uri scheme must be rtsp://, http://, https://, or file://")
+        if parsed.scheme.lower() == "file":
+            if not parsed.path:
+                raise StartRequestError("file:// camera_uri must include a path")
+        elif not parsed.netloc:
+            raise StartRequestError("camera_uri must include a host")
+
+        duration = _as_int(body.get("duration_seconds", 30), "duration_seconds")
+        duration = max(5, min(duration, 300))
+        camera_id = str(body.get("camera_id") or "").strip()[:128] or None
+        live_config = body.get("live_stream_config") or {}
+        if not isinstance(live_config, dict):
+            raise StartRequestError("live_stream_config must be an object")
+        initial_state.update({
+            "camera_uri": camera_uri,
+            "source_uri_masked": mask_camera_uri(camera_uri),
+            "camera_id": camera_id,
+            "duration_seconds": duration,
+            "live_stream_config": live_config,
+        })
+        return initial_state
+
+    video_paths = body.get("video_paths", [])
+    if not isinstance(video_paths, list) or not video_paths:
+        raise StartRequestError("name and video_paths required")
+    normalized: list[str] = []
+    details: list[dict] = []
+    for raw_value in video_paths:
+        raw = str(raw_value)
+        norm = _to_wsl_path(raw)
+        reason = _validate_video_path(norm) if validate_video_paths else None
+        if reason is not None:
+            details.append({"input": raw, "normalized": norm, "reason": reason})
+        else:
+            normalized.append(norm)
+    if details:
+        raise StartRequestError("video_paths failed validation", details)
+    initial_state["video_paths"] = normalized
+    return initial_state
+
 
 _PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _ALLOWED_PROFILE_IMAGE_EXTENSIONS = {"jpg", "jpeg", "png"}
@@ -79,10 +174,12 @@ def _get_graph():
 _NODE_TO_STATUS = {
     "load_models":       "loading_models",
     "process_video":     "processing_video",
+    "process_live_stream": "processing_live_frames",
     "filter_quality":    "filtering",
     "embed_all_faces":   "embedding",
     "cluster_identities": "clustering",
     "assign_bodies_to_clusters": "auto_pairing",
+    "promote_crops":     "promoting_crops",
     "select_best":       "selecting",
     "compute_reid":      "computing_reid",
     "describe_clothing": "describing",
@@ -96,6 +193,15 @@ def _run_pipeline(job_id: str, initial_state: dict) -> None:
     job = _jobs[job_id]
     graph = _get_graph()
 
+    def update_live_status(status: str, snapshot_update: dict | None = None) -> None:
+        job.node = "process_live_stream"
+        job.status = status
+        if snapshot_update:
+            job.snapshot.update(snapshot_update)
+
+    if initial_state.get("input_type") == "camera_uri":
+        initial_state["_status_callback"] = update_live_status
+
     try:
         for event in graph.stream(initial_state, stream_mode="updates"):
             for node_name, update in event.items():
@@ -108,55 +214,40 @@ def _run_pipeline(job_id: str, initial_state: dict) -> None:
 
     except Exception:
         job.status = "error"
-        job.error = traceback.format_exc()
+        error = traceback.format_exc()
+        raw_uri = initial_state.get("camera_uri")
+        if raw_uri:
+            error = error.replace(raw_uri, mask_camera_uri(raw_uri))
+        job.error = error
 
 
 # ─── Endpoints ────────────────────────────────────────────────────────────────
 
+@app.get("/api/health")
+def api_health():
+    return jsonify({"status": "ok", "service": "waycon-person-creation"})
+
+
 @app.post("/api/person/start")
 def start():
     body = request.get_json(force=True)
-    name = body.get("name", "").strip()
-    video_paths = body.get("video_paths", [])
-    output_dir = body.get("output_dir", f"forensics/person_db/{name.lower()}")
-    every_n = int(body.get("every_n", 15))
-    identity_config = body.get("identity_clustering_config", {})
-    reid_config = body.get("reid", body.get("reid_config", {}))
-
-    if not name or not video_paths:
-        return jsonify({"error": "name and video_paths required"}), 400
-
-    # Pre-flight: normalize Windows-style paths and confirm each video opens.
-    # Bad paths return 400 before we spend ~90s loading models.
-    normalized: list[str] = []
-    details: list[dict] = []
-    for raw in video_paths:
-        norm = _to_wsl_path(raw)
-        reason = _validate_video_path(norm)
-        if reason is not None:
-            details.append({"input": raw, "normalized": norm, "reason": reason})
-        else:
-            normalized.append(norm)
-    if details:
-        return jsonify({
-            "error": "video_paths failed validation",
-            "details": details,
-        }), 400
+    try:
+        initial_state = build_initial_state(body)
+    except StartRequestError as exc:
+        response = {"error": str(exc)}
+        if exc.details:
+            response["details"] = exc.details
+        return jsonify(response), 400
 
     job_id = str(uuid.uuid4())
-    job = JobState(job_id=job_id)
-    _jobs[job_id] = job
-
-    initial_state = {
-        "person_name": name,
-        "video_paths": normalized,
-        "output_dir": str(Path(output_dir)),
-        "process_every_n": every_n,
-        "identity_clustering_config": identity_config,
-        "reid_config": reid_config,
-        "body_crops": [],
-        "face_crops": [],
+    safe_initial_snapshot = {
+        "source_type": initial_state.get("source_type", "video_file"),
+        "camera_id": initial_state.get("camera_id"),
+        "duration_seconds": initial_state.get("duration_seconds"),
+        "source_uri_masked": initial_state.get("source_uri_masked", ""),
     }
+    job = JobState(job_id=job_id, snapshot=safe_initial_snapshot)
+    _jobs[job_id] = job
 
     t = threading.Thread(target=_run_pipeline, args=(job_id, initial_state), daemon=True)
     t.start()
@@ -190,6 +281,12 @@ def status(job_id: str):
         "per_cluster_clothing": snap.get("per_cluster_clothing", {}),
         "profile":             snap.get("profile", {}),
         "human_feedback_path": snap.get("human_feedback_path", ""),
+        "source_type":        snap.get("source_type", "video_file"),
+        "camera_id":          snap.get("camera_id"),
+        "duration_seconds":   snap.get("duration_seconds"),
+        "source_uri_masked":  snap.get("source_uri_masked", ""),
+        "stream_stats":       snap.get("stream_stats", {}),
+        "stream_report_path": snap.get("stream_report_path", ""),
     }
     return jsonify({
         "job_id":   job_id,

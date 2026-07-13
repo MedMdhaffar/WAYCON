@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import StartForm from './components/StartForm.jsx'
 import ProgressTracker from './components/ProgressTracker.jsx'
+import LiveStreamStats from './components/LiveStreamStats.jsx'
 import CropsGrid from './components/CropsGrid.jsx'
 import AssociationsView from './components/AssociationsView.jsx'
 import ClothingPanel from './components/ClothingPanel.jsx'
@@ -104,7 +105,13 @@ export default function App() {
 
         {tab === 1 && (
           <>
-            <ProgressTracker status={jobStatus?.status} node={jobStatus?.node} error={jobStatus?.error} />
+            <ProgressTracker
+              status={jobStatus?.status}
+              node={jobStatus?.node}
+              error={jobStatus?.error}
+              sourceType={snapshot.source_type}
+            />
+            <LiveStreamStats snapshot={snapshot} />
             <CropsGrid
               jobId={jobId}
               bodyCrops={snapshot.quality_body_crops ?? []}
@@ -116,6 +123,7 @@ export default function App() {
 
         {tab === 2 && (
           <>
+            <LiveStreamStats snapshot={snapshot} />
             <AssociationsView
               jobId={jobId}
               associations={snapshot.associations ?? []}

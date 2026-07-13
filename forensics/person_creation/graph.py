@@ -3,6 +3,7 @@ from langgraph.graph import StateGraph, START, END
 from forensics.person_creation.state import PersonCreationState
 from forensics.person_creation.nodes.load_models import load_models
 from forensics.person_creation.nodes.process_video import process_video
+from forensics.person_creation.nodes.process_live_stream import process_live_stream
 from forensics.person_creation.nodes.filter_quality import filter_quality
 from forensics.person_creation.nodes.embed_all_faces import embed_all_faces
 from forensics.person_creation.nodes.cluster_identities import cluster_identities
@@ -15,11 +16,16 @@ from forensics.person_creation.nodes.build_profile import build_profile
 from forensics.person_creation.nodes.finalize import finalize
 
 
+def route_ingestion(state: PersonCreationState) -> str:
+    return "process_live_stream" if state.get("input_type") == "camera_uri" else "process_video"
+
+
 def build_graph():
     builder = StateGraph(PersonCreationState)
 
     builder.add_node("load_models",         load_models)
     builder.add_node("process_video",       process_video)
+    builder.add_node("process_live_stream", process_live_stream)
     builder.add_node("filter_quality",      filter_quality)
     builder.add_node("embed_all_faces",     embed_all_faces)
     builder.add_node("cluster_identities",  cluster_identities)
@@ -32,8 +38,16 @@ def build_graph():
     builder.add_node("finalize",            finalize)
 
     builder.add_edge(START,                 "load_models")
-    builder.add_edge("load_models",         "process_video")
+    builder.add_conditional_edges(
+        "load_models",
+        route_ingestion,
+        {
+            "process_video": "process_video",
+            "process_live_stream": "process_live_stream",
+        },
+    )
     builder.add_edge("process_video",       "filter_quality")
+    builder.add_edge("process_live_stream", "filter_quality")
     builder.add_edge("filter_quality",      "embed_all_faces")
     builder.add_edge("embed_all_faces",     "cluster_identities")
     builder.add_edge("cluster_identities",  "assign_bodies_to_clusters")

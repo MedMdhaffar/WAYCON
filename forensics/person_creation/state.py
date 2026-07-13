@@ -1,11 +1,21 @@
 import operator
-from typing import Annotated
-from typing_extensions import TypedDict
+from typing import Annotated, Any, Callable
+from typing_extensions import NotRequired, TypedDict
 
 
 class PersonCreationState(TypedDict):
     person_name: str
     video_paths: list[str]
+    input_type: NotRequired[str]
+    source_type: NotRequired[str]
+    camera_uri: NotRequired[str]
+    source_uri_masked: NotRequired[str]
+    camera_id: NotRequired[str]
+    duration_seconds: NotRequired[int]
+    live_stream_config: NotRequired[dict]
+    stream_stats: NotRequired[dict]
+    stream_report_path: NotRequired[str]
+    _status_callback: NotRequired[Callable[..., Any]]
     output_dir: str
     process_every_n: int
     identity_clustering_config: dict

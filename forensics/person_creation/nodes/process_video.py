@@ -1,6 +1,7 @@
 import cv2
 import numpy as np
 from pathlib import Path
+from typing import Any
 
 
 def _sharpness(img_bgr: np.ndarray) -> float:
@@ -18,6 +19,70 @@ def _crop(frame: np.ndarray, bbox: list[float], padding: int = 2) -> np.ndarray:
     return frame[y1:y2, x1:x2]
 
 
+def prepare_staging_dirs(output_dir: str | Path) -> tuple[Path, Path]:
+    """Create and return the crop staging directories shared by all sources."""
+    staging = Path(output_dir) / "_staging"
+    body_dir = staging / "body_crops"
+    face_dir = staging / "face_crops"
+    body_dir.mkdir(parents=True, exist_ok=True)
+    face_dir.mkdir(parents=True, exist_ok=True)
+    return body_dir, face_dir
+
+
+def detect_and_save_frame(
+    frame: np.ndarray,
+    *,
+    frame_idx: int,
+    source_stem: str,
+    source_metadata: dict[str, Any],
+    body_dir: Path,
+    face_dir: Path,
+    person_detector,
+    face_detector,
+) -> tuple[list[dict], list[dict]]:
+    """Run the shared detectors and persist crop records in the video format."""
+    body_crops: list[dict] = []
+    face_crops: list[dict] = []
+    persons = person_detector.detect(frame)
+    faces = face_detector.detect(frame)
+
+    for det_idx, det in enumerate(persons):
+        crop = _crop(frame, det["bbox"])
+        if crop.size == 0:
+            continue
+        fname = f"{source_stem}_f{frame_idx:06d}_b{det_idx:02d}.jpg"
+        path = str(body_dir / fname)
+        if not cv2.imwrite(path, crop):
+            continue
+        body_crops.append({
+            "path": path,
+            "frame_idx": frame_idx,
+            "bbox": det["bbox"],
+            "confidence": float(det.get("confidence", det.get("score", 0.0))),
+            "sharpness": _sharpness(crop),
+            **source_metadata,
+        })
+
+    for det_idx, det in enumerate(faces):
+        crop = _crop(frame, det["bbox"])
+        if crop.size == 0:
+            continue
+        fname = f"{source_stem}_face_f{frame_idx:06d}_f{det_idx:02d}.jpg"
+        path = str(face_dir / fname)
+        if not cv2.imwrite(path, crop):
+            continue
+        face_crops.append({
+            "path": path,
+            "frame_idx": frame_idx,
+            "bbox": det["bbox"],
+            "confidence": float(det.get("confidence", det.get("score", 0.0))),
+            "sharpness": _sharpness(crop),
+            **source_metadata,
+        })
+
+    return body_crops, face_crops
+
+
 def process_video(state: dict) -> dict:
     from forensics.person_creation.models.person_detector import get_person_detector
     from forensics.face_engine.client import FaceEngineClient
@@ -25,14 +90,7 @@ def process_video(state: dict) -> dict:
     person_det = get_person_detector()
     face_det = FaceEngineClient()
     every_n = state.get("process_every_n", 5)
-    output_dir = Path(state["output_dir"])
-
-    # Detection writes go to _staging/. promote_crops moves only confirmed
-    # crops to body_crops/ and face_crops/ after human-in-the-loop pairing.
-    body_dir = output_dir / "_staging" / "body_crops"
-    face_dir = output_dir / "_staging" / "face_crops"
-    body_dir.mkdir(parents=True, exist_ok=True)
-    face_dir.mkdir(parents=True, exist_ok=True)
+    body_dir, face_dir = prepare_staging_dirs(state["output_dir"])
 
     body_crops: list[dict] = []
     face_crops: list[dict] = []
@@ -51,40 +109,22 @@ def process_video(state: dict) -> dict:
                 break
 
             if frame_idx % every_n == 0:
-                persons = person_det.detect(frame)
-                faces = face_det.detect(frame)
-
-                for det_idx, det in enumerate(persons):
-                    crop = _crop(frame, det["bbox"])
-                    if crop.size == 0:
-                        continue
-                    sharp = _sharpness(crop)
-                    fname = f"{stem}_f{frame_idx:06d}_b{det_idx:02d}.jpg"
-                    path = str(body_dir / fname)
-                    cv2.imwrite(path, crop)
-                    body_crops.append({
-                        "path": path,
-                        "frame_idx": frame_idx,
+                bodies, detected_faces = detect_and_save_frame(
+                    frame,
+                    frame_idx=frame_idx,
+                    source_stem=stem,
+                    source_metadata={
+                        "source_type": "video_file",
                         "video": video_path,
-                        "bbox": det["bbox"],
-                        "sharpness": sharp,
-                    })
-
-                for det_idx, det in enumerate(faces):
-                    crop = _crop(frame, det["bbox"])
-                    if crop.size == 0:
-                        continue
-                    sharp = _sharpness(crop)
-                    fname = f"{stem}_face_f{frame_idx:06d}_f{det_idx:02d}.jpg"
-                    path = str(face_dir / fname)
-                    cv2.imwrite(path, crop)
-                    face_crops.append({
-                        "path": path,
-                        "frame_idx": frame_idx,
-                        "video": video_path,
-                        "bbox": det["bbox"],
-                        "sharpness": sharp,
-                    })
+                        "video_path": video_path,
+                    },
+                    body_dir=body_dir,
+                    face_dir=face_dir,
+                    person_detector=person_det,
+                    face_detector=face_det,
+                )
+                body_crops.extend(bodies)
+                face_crops.extend(detected_faces)
 
             frame_idx += 1
 
@@ -93,4 +133,8 @@ def process_video(state: dict) -> dict:
         if frame_idx == 0:
             raise OSError(f"cv2 opened but decoded 0 frames from {video_path!r} — codec / file may be corrupt")
 
-    return {"body_crops": body_crops, "face_crops": face_crops}
+    return {
+        "body_crops": body_crops,
+        "face_crops": face_crops,
+        "source_type": "video_file",
+    }

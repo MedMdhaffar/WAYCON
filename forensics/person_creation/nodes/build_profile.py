@@ -71,6 +71,9 @@ def _profile_for_cluster(state: dict, cluster: dict) -> dict:
         for a in associations
         if a.get("body_path")
     }
+    video_sources = list(state.get("video_paths") or [])
+    if state.get("source_type") == "live_camera" and state.get("source_uri_masked"):
+        video_sources = [state["source_uri_masked"]]
 
     return {
         "id": profile_id,
@@ -97,7 +100,9 @@ def _profile_for_cluster(state: dict, cluster: dict) -> dict:
         "body_crops": [a["body_path"] for a in associations],
         "best_body_crops": best_body_crops,
         "body_crop_sharpness": body_crop_sharpness,
-        "video_sources": state["video_paths"],
+        "video_sources": video_sources,
+        "source_type": state.get("source_type", "video_file"),
+        "camera_id": state.get("camera_id"),
         "appearance_signals": {
             "color": color_signals,
         },

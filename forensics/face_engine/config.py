@@ -7,10 +7,13 @@ from forensics.global_memory.config import SIMILARITY_THRESHOLD
 
 
 PORT: int = int(os.environ.get("FACE_ENGINE_PORT", "5010"))
+HOST: str = os.environ.get("FACE_ENGINE_HOST", "0.0.0.0")
 BASE_URL: str = os.environ.get("FACE_ENGINE_URL", f"http://localhost:{PORT}")
 MODEL_CACHE_DIR: str | None = os.environ.get("MODEL_CACHE_DIR") or None
 REQUEST_TIMEOUT: float = float(os.environ.get("FACE_ENGINE_TIMEOUT", "30"))
-DEVICE: str = os.environ.get("FACE_ENGINE_DEVICE", "auto")
+DEVICE: str = os.environ.get(
+    "FACE_ENGINE_DEVICE", os.environ.get("PERSON_CREATION_DEVICE", "auto")
+)
 
 
 def resolve_device(device: str = "auto") -> str:
