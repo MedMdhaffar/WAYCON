@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+from functools import wraps
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
@@ -10,6 +11,7 @@ from typing import Any
 import numpy as np
 
 from . import config
+from forensics.person_creation.utils.profiling import get_active_profiler, profile_measure
 
 
 class GlobalMemory:
@@ -17,108 +19,130 @@ class GlobalMemory:
         self.db_path = Path(db_path or config.DB_PATH)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
-        self._conn = sqlite3.connect(
-            str(self.db_path),
-            check_same_thread=False,
-            isolation_level=None,
-        )
+        with profile_measure("db.connect", metadata={"database": self.db_path.name}):
+            self._conn = sqlite3.connect(
+                str(self.db_path),
+                check_same_thread=False,
+                isolation_level=None,
+            )
         self._conn.row_factory = sqlite3.Row
+        profiler = get_active_profiler()
+        if profiler is not None and profiler.config.sql:
+            self._conn.set_trace_callback(profiler.add_sql_statement)
         schema_path = Path(__file__).with_name("schema.sql")
-        self._conn.executescript(schema_path.read_text(encoding="utf-8"))
-        self._ensure_schema_columns()
+        with profile_measure("db.initialize_schema"):
+            self._conn.executescript(schema_path.read_text(encoding="utf-8"))
+            self._ensure_schema_columns()
+        self._record_database_configuration()
+        if profiler is not None and profiler.config.sql:
+            self._collect_query_plans(profiler)
 
     def register(self, profile: dict) -> str:
-        new_vec = self._normalize_embedding(profile["face_embedding"])
-        new_count = len(profile.get("face_crops") or []) or 1
-        appearance = profile.get("appearance") or {}
-        appearance_date = str(appearance.get("date") or date.today().isoformat())
-        best_face_crop = self._best_face_crop(profile)
+        metadata = {"face_crop_count": len(profile.get("face_crops") or [])}
+        with profile_measure("db.register_profile.total", metadata=metadata):
+            new_vec = self._normalize_embedding(profile["face_embedding"])
+            new_count = len(profile.get("face_crops") or []) or 1
+            appearance = profile.get("appearance") or {}
+            appearance_date = str(appearance.get("date") or date.today().isoformat())
+            best_face_crop = self._best_face_crop(profile)
 
-        with self._lock:
-            self._conn.execute("BEGIN IMMEDIATE")
-            try:
-                existing = self._find_existing_person(new_vec)
-                if existing is not None:
-                    person_id = existing["person_id"]
-                    count_before = int(existing["embedding_count"])
-                    count_after = self._update_embedding(
-                        person_id=person_id,
-                        embedding=new_vec,
-                        new_count=new_count,
-                        updated_at=appearance_date,
-                        profile=profile,
-                    )
-                    self._upsert_appearance(person_id, appearance_date, profile)
-                    self.update_gallery(person_id, profile)
-                    self._log_event(
-                        person_id=person_id,
-                        event_type="recognized",
-                        similarity=existing["similarity"],
-                        embedding_count_before=count_before,
-                        embedding_count_after=count_after,
-                        video_sources=profile.get("video_sources") or [],
-                        best_face_crop=best_face_crop,
-                    )
-                else:
-                    person_id, name = self._next_person_id()
-                    self._insert_person(
-                        person_id=person_id,
-                        name=name,
-                        embedding=new_vec,
-                        embedding_count=new_count,
-                        enrolled_at=appearance_date,
-                        cameras=profile.get("cameras") or [],
-                        profile=profile,
-                    )
-                    self._upsert_appearance(person_id, appearance_date, profile)
-                    self.update_gallery(person_id, profile)
-                    self._log_event(
-                        person_id=person_id,
-                        event_type="new_enrollment",
-                        similarity=None,
-                        embedding_count_before=None,
-                        embedding_count_after=new_count,
-                        video_sources=profile.get("video_sources") or [],
-                        best_face_crop=best_face_crop,
-                    )
-                self._conn.execute("COMMIT")
-                return person_id
-            except Exception:
-                self._conn.execute("ROLLBACK")
-                raise
+            with self._lock:
+                with profile_measure("db.transaction.begin"):
+                    self._conn.execute("BEGIN IMMEDIATE")
+                try:
+                    existing = self._find_existing_person(new_vec)
+                    if existing is not None:
+                        person_id = existing["person_id"]
+                        metadata["operation"] = "update"
+                        count_before = int(existing["embedding_count"])
+                        count_after = self._update_embedding(
+                            person_id=person_id,
+                            embedding=new_vec,
+                            new_count=new_count,
+                            updated_at=appearance_date,
+                            profile=profile,
+                        )
+                        self._upsert_appearance(person_id, appearance_date, profile)
+                        self.update_gallery(person_id, profile)
+                        self._log_event(
+                            person_id=person_id,
+                            event_type="recognized",
+                            similarity=existing["similarity"],
+                            embedding_count_before=count_before,
+                            embedding_count_after=count_after,
+                            video_sources=profile.get("video_sources") or [],
+                            best_face_crop=best_face_crop,
+                        )
+                    else:
+                        person_id, name = self._next_person_id()
+                        metadata["operation"] = "insert"
+                        self._insert_person(
+                            person_id=person_id,
+                            name=name,
+                            embedding=new_vec,
+                            embedding_count=new_count,
+                            enrolled_at=appearance_date,
+                            cameras=profile.get("cameras") or [],
+                            profile=profile,
+                        )
+                        self._upsert_appearance(person_id, appearance_date, profile)
+                        self.update_gallery(person_id, profile)
+                        self._log_event(
+                            person_id=person_id,
+                            event_type="new_enrollment",
+                            similarity=None,
+                            embedding_count_before=None,
+                            embedding_count_after=new_count,
+                            video_sources=profile.get("video_sources") or [],
+                            best_face_crop=best_face_crop,
+                        )
+                    with profile_measure("db.commit"):
+                        self._conn.execute("COMMIT")
+                    return person_id
+                except Exception:
+                    with profile_measure("db.rollback"):
+                        self._conn.execute("ROLLBACK")
+                    raise
 
     def query_by_face(self, embedding, top_k: int = 5, threshold: float | None = None) -> list[dict]:
-        threshold = config.SIMILARITY_THRESHOLD if threshold is None else float(threshold)
-        query_vec = self._normalize_embedding(embedding)
+        metadata = {"top_k": int(top_k)}
+        with profile_measure("db.search_by_face.total", metadata=metadata):
+            threshold = config.SIMILARITY_THRESHOLD if threshold is None else float(threshold)
+            query_vec = self._normalize_embedding(embedding)
 
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT person_id, name, embedding FROM persons"
-            ).fetchall()
-            if not rows:
-                return []
+            with self._lock:
+                with profile_measure("db.search_by_face.fetch"):
+                    rows = self._conn.execute(
+                        "SELECT person_id, name, embedding FROM persons"
+                    ).fetchall()
+                metadata["candidate_count"] = len(rows)
+                if not rows:
+                    return []
+                with profile_measure("db.search_by_face.deserialize"):
+                    matrix = np.vstack([
+                        np.frombuffer(row["embedding"], dtype=np.float32) for row in rows
+                    ])
+                with profile_measure("db.search_by_face.cosine_similarity"):
+                    sims = matrix @ query_vec
+                with profile_measure("db.search_by_face.sort"):
+                    order = np.argsort(-sims)
 
-            matrix = np.vstack([
-                np.frombuffer(row["embedding"], dtype=np.float32) for row in rows
-            ])
-            sims = matrix @ query_vec
-            order = np.argsort(-sims)
-
-            results: list[dict] = []
-            for idx in order:
-                similarity = float(sims[int(idx)])
-                if similarity < threshold:
-                    break
-                row = rows[int(idx)]
-                results.append({
-                    "person_id": row["person_id"],
-                    "name": row["name"],
-                    "similarity": similarity,
-                    "appearance": self._latest_appearance(row["person_id"]),
-                })
-                if len(results) >= top_k:
-                    break
-            return results
+                results: list[dict] = []
+                for idx in order:
+                    similarity = float(sims[int(idx)])
+                    if similarity < threshold:
+                        break
+                    row = rows[int(idx)]
+                    results.append({
+                        "person_id": row["person_id"],
+                        "name": row["name"],
+                        "similarity": similarity,
+                        "appearance": self._latest_appearance(row["person_id"]),
+                    })
+                    if len(results) >= top_k:
+                        break
+                metadata["result_count"] = len(results)
+                return results
 
     def query_by_date(self, date: str) -> list[dict]:
         with self._lock:
@@ -399,13 +423,71 @@ class GlobalMemory:
 
     def close(self) -> None:
         with self._lock:
-            self._conn.close()
+            with profile_measure("db.close"):
+                self._conn.close()
 
     def __enter__(self) -> GlobalMemory:
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
         self.close()
+
+    def _record_database_configuration(self) -> None:
+        profiler = get_active_profiler()
+        if profiler is None:
+            return
+        with profile_measure("db.configure_pragmas"):
+            journal_mode = self._conn.execute("PRAGMA journal_mode").fetchone()[0]
+            synchronous = self._conn.execute("PRAGMA synchronous").fetchone()[0]
+            busy_timeout = self._conn.execute("PRAGMA busy_timeout").fetchone()[0]
+        wal_path = Path(f"{self.db_path}-wal")
+        shm_path = Path(f"{self.db_path}-shm")
+        profiler.update_run_metadata(
+            database={
+                "filename": self.db_path.name,
+                "journal_mode": journal_mode,
+                "synchronous": synchronous,
+                "busy_timeout_ms": busy_timeout,
+                "database_file_size_bytes": self.db_path.stat().st_size if self.db_path.exists() else 0,
+                "wal_file_size_bytes": wal_path.stat().st_size if wal_path.exists() else 0,
+                "shm_file_size_bytes": shm_path.stat().st_size if shm_path.exists() else 0,
+            }
+        )
+
+    def _collect_query_plans(self, profiler) -> None:
+        plans = {
+            "appearance_by_person_date": (
+                "SELECT * FROM appearances WHERE person_id=? ORDER BY date DESC LIMIT 1",
+                ("",),
+            ),
+            "appearance_by_date": (
+                "SELECT p.person_id, p.name, a.* FROM appearances a "
+                "JOIN persons p ON p.person_id=a.person_id WHERE a.date=? ORDER BY p.name",
+                ("",),
+            ),
+            "query_by_camera_person_scan": (
+                "SELECT person_id, name, enrolled_at, cameras FROM persons",
+                (),
+            ),
+            "gallery_by_person": (
+                "SELECT * FROM person_gallery WHERE person_id=? "
+                "ORDER BY crop_type, sharpness DESC LIMIT ?",
+                ("", 10),
+            ),
+            "recognition_by_person_time": (
+                "SELECT * FROM recognition_log WHERE person_id=? ORDER BY id DESC LIMIT ?",
+                ("", 50),
+            ),
+        }
+        for name, (sql, parameters) in plans.items():
+            try:
+                with profile_measure("db.query_plan", metadata={"query": name}):
+                    rows = self._conn.execute(
+                        f"EXPLAIN QUERY PLAN {sql}", parameters
+                    ).fetchall()
+                profiler.add_query_plan(name, [list(row) for row in rows])
+            except sqlite3.Error as exc:
+                profiler.add_query_plan(name, [["error", str(exc)]])
 
     def _ensure_schema_columns(self) -> None:
         person_columns = self._table_columns("persons")
@@ -449,17 +531,21 @@ class GlobalMemory:
 
     def _find_existing_person(self, embedding: np.ndarray, threshold: float | None = None) -> dict | None:
         threshold = config.SIMILARITY_THRESHOLD if threshold is None else float(threshold)
-        rows = self._conn.execute(
-            "SELECT person_id, name, embedding, embedding_count FROM persons"
-        ).fetchall()
+        with profile_measure("db.find_existing_person.fetch"):
+            rows = self._conn.execute(
+                "SELECT person_id, name, embedding, embedding_count FROM persons"
+            ).fetchall()
         if not rows:
             return None
 
-        matrix = np.vstack([
-            np.frombuffer(row["embedding"], dtype=np.float32).copy() for row in rows
-        ])
-        sims = matrix @ embedding
-        best_idx = int(np.argmax(sims))
+        with profile_measure("db.find_existing_person.deserialize"):
+            matrix = np.vstack([
+                np.frombuffer(row["embedding"], dtype=np.float32).copy() for row in rows
+            ])
+        with profile_measure("db.find_existing_person.cosine_similarity"):
+            sims = matrix @ embedding
+        with profile_measure("db.find_existing_person.sort"):
+            best_idx = int(np.argmax(sims))
         best_sim = float(sims[best_idx])
         if best_sim < threshold:
             return None
@@ -483,24 +569,25 @@ class GlobalMemory:
         profile: dict,
     ) -> None:
         best_face_crop = self._best_face_crop(profile)
-        self._conn.execute(
-            """
-            INSERT INTO persons (
-                person_id, name, embedding, embedding_count,
-                enrolled_at, updated_at, cameras, profile_image, profile_image_source
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'auto')
-            """,
-            (
-                person_id,
-                name,
-                embedding.astype(np.float32).tobytes(),
-                int(embedding_count),
-                enrolled_at,
-                enrolled_at,
-                json.dumps(cameras or []),
-                best_face_crop,
-            ),
-        )
+        with profile_measure("db.person.insert", metadata={"row_count": 1, "mode": "execute"}):
+            self._conn.execute(
+                """
+                INSERT INTO persons (
+                    person_id, name, embedding, embedding_count,
+                    enrolled_at, updated_at, cameras, profile_image, profile_image_source
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'auto')
+                """,
+                (
+                    person_id,
+                    name,
+                    embedding.astype(np.float32).tobytes(),
+                    int(embedding_count),
+                    enrolled_at,
+                    enrolled_at,
+                    json.dumps(cameras or []),
+                    best_face_crop,
+                ),
+            )
 
     def _update_embedding(
         self,
@@ -533,34 +620,36 @@ class GlobalMemory:
         update_image = not is_manual and new_crop is not None and (old_crop is None or new_sharp >= old_sharp)
 
         if update_image:
-            self._conn.execute(
-                """
-                UPDATE persons
-                   SET embedding=?, embedding_count=?, updated_at=?, profile_image=?
-                 WHERE person_id=?
-                """,
-                (
-                    merged.astype(np.float32).tobytes(),
-                    total_count,
-                    updated_at,
-                    new_crop,
-                    person_id,
-                ),
-            )
+            with profile_measure("db.person.update", metadata={"row_count": 1}):
+                self._conn.execute(
+                    """
+                    UPDATE persons
+                       SET embedding=?, embedding_count=?, updated_at=?, profile_image=?
+                     WHERE person_id=?
+                    """,
+                    (
+                        merged.astype(np.float32).tobytes(),
+                        total_count,
+                        updated_at,
+                        new_crop,
+                        person_id,
+                    ),
+                )
         else:
-            self._conn.execute(
-                """
-                UPDATE persons
-                   SET embedding=?, embedding_count=?, updated_at=?
-                 WHERE person_id=?
-                """,
-                (
-                    merged.astype(np.float32).tobytes(),
-                    total_count,
-                    updated_at,
-                    person_id,
-                ),
-            )
+            with profile_measure("db.person.update", metadata={"row_count": 1}):
+                self._conn.execute(
+                    """
+                    UPDATE persons
+                       SET embedding=?, embedding_count=?, updated_at=?
+                     WHERE person_id=?
+                    """,
+                    (
+                        merged.astype(np.float32).tobytes(),
+                        total_count,
+                        updated_at,
+                        person_id,
+                    ),
+                )
         return total_count
 
     def _insert_gallery_crop(
@@ -589,24 +678,27 @@ class GlobalMemory:
         except Exception:
             pass
 
-        self._conn.execute(
-            """
-            INSERT OR IGNORE INTO person_gallery (
-                person_id, crop_type, path, sharpness,
-                session_date, video_source, width, height
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                person_id,
-                crop_type,
-                str(resolved.resolve()),
-                float(sharpness or 0.0),
-                session_date,
-                video_source,
-                width,
-                height,
-            ),
-        )
+        with profile_measure(
+            "db.crop_reference.insert", metadata={"row_count": 1, "crop_type": crop_type}
+        ):
+            self._conn.execute(
+                """
+                INSERT OR IGNORE INTO person_gallery (
+                    person_id, crop_type, path, sharpness,
+                    session_date, video_source, width, height
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    person_id,
+                    crop_type,
+                    str(resolved.resolve()),
+                    float(sharpness or 0.0),
+                    session_date,
+                    video_source,
+                    width,
+                    height,
+                ),
+            )
 
     def _prune_gallery(self, person_id: str, crop_type: str, limit: int = 10) -> None:
         rows = self._conn.execute(
@@ -621,10 +713,11 @@ class GlobalMemory:
         if not prune_ids:
             return
         placeholders = ",".join("?" for _ in prune_ids)
-        self._conn.execute(
-            f"DELETE FROM person_gallery WHERE id IN ({placeholders})",
-            prune_ids,
-        )
+        with profile_measure("db.crop_reference.prune", metadata={"row_count": len(prune_ids)}):
+            self._conn.execute(
+                f"DELETE FROM person_gallery WHERE id IN ({placeholders})",
+                prune_ids,
+            )
 
     def _remove_missing_gallery_paths(self, person_id: str) -> None:
         rows = self._conn.execute(
@@ -647,26 +740,27 @@ class GlobalMemory:
             return
 
         color = ((profile.get("appearance_signals") or {}).get("color") or {})
-        self._conn.execute(
-            """
-            INSERT OR REPLACE INTO appearances (
-                person_id, date, top, bottom, shoes, full_description,
-                top_color, bottom_color, best_body_crops, video_sources
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                person_id,
-                appearance_date,
-                appearance.get("top"),
-                appearance.get("bottom"),
-                appearance.get("shoes"),
-                appearance.get("full"),
-                color.get("top"),
-                color.get("bottom"),
-                json.dumps(profile.get("best_body_crops") or []),
-                json.dumps(profile.get("video_sources") or []),
-            ),
-        )
+        with profile_measure("db.appearance.upsert", metadata={"row_count": 1}):
+            self._conn.execute(
+                """
+                INSERT OR REPLACE INTO appearances (
+                    person_id, date, top, bottom, shoes, full_description,
+                    top_color, bottom_color, best_body_crops, video_sources
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    person_id,
+                    appearance_date,
+                    appearance.get("top"),
+                    appearance.get("bottom"),
+                    appearance.get("shoes"),
+                    appearance.get("full"),
+                    color.get("top"),
+                    color.get("bottom"),
+                    json.dumps(profile.get("best_body_crops") or []),
+                    json.dumps(profile.get("video_sources") or []),
+                ),
+            )
 
     def _log_event(
         self,
@@ -679,25 +773,26 @@ class GlobalMemory:
         best_face_crop: str | None = None,
     ) -> None:
         try:
-            self._conn.execute(
-                """
-                INSERT INTO recognition_log (
-                    person_id, event_type, similarity,
-                    embedding_count_before, embedding_count_after,
-                    video_sources, best_face_crop, ts
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    person_id,
-                    event_type,
-                    similarity,
-                    embedding_count_before,
-                    embedding_count_after,
-                    json.dumps(video_sources or []),
-                    best_face_crop,
-                    datetime.now().isoformat(timespec="seconds"),
-                ),
-            )
+            with profile_measure("db.recognition_log.insert", metadata={"row_count": 1}):
+                self._conn.execute(
+                    """
+                    INSERT INTO recognition_log (
+                        person_id, event_type, similarity,
+                        embedding_count_before, embedding_count_after,
+                        video_sources, best_face_crop, ts
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        person_id,
+                        event_type,
+                        similarity,
+                        embedding_count_before,
+                        embedding_count_after,
+                        json.dumps(video_sources or []),
+                        best_face_crop,
+                        datetime.now().isoformat(timespec="seconds"),
+                    ),
+                )
         except Exception as exc:
             print(f"[WARNING] recognition_log write failed: {exc}")
 
@@ -798,3 +893,27 @@ class GlobalMemory:
             seen.add(key)
             merged.append(item)
         return merged
+
+
+def _profile_public_method(method):
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        with profile_measure(f"db.{method.__name__}.total"):
+            return method(self, *args, **kwargs)
+    return wrapped
+
+
+for _method_name in (
+    "query_by_date",
+    "query_by_camera",
+    "get_person",
+    "list_all",
+    "get_recognition_history",
+    "rename_person",
+    "update_crop_paths",
+    "set_profile_image",
+    "get_best_face_crop",
+    "update_gallery",
+    "get_gallery",
+):
+    setattr(GlobalMemory, _method_name, _profile_public_method(getattr(GlobalMemory, _method_name)))

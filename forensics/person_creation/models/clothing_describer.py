@@ -3,6 +3,7 @@ import numpy as np
 from pathlib import Path
 
 from forensics.person_creation.models.device import resolve_device
+from forensics.person_creation.utils.profiling import cuda_event_measure, profile_measure
 
 _PROMPTS_PATH = Path(__file__).parent.parent / "prompts" / "clothing.yaml"
 _INPUT_SIZE = 448
@@ -84,26 +85,36 @@ class ClothingDescriber:
         import torch
 
         n = len(crops_bgr)
-        pixel_values = torch.cat([self._preprocess(c) for c in crops_bgr], dim=0)
+        metadata = {
+            "device": self._device,
+            "batch_size": n,
+            "precision": str(self._dtype),
+        }
+        with profile_measure("model.clothing_vlm.total", metadata=metadata, synchronize_cuda=True):
+            with profile_measure("model.clothing_vlm.preprocess", metadata=metadata, synchronize_cuda=True):
+                pixel_values = torch.cat([self._preprocess(c) for c in crops_bgr], dim=0)
+                metadata["tensor_shape"] = list(pixel_values.shape)
 
-        base_prompt = _load_prompt()
-        if n == 1:
-            question = f"<image>\n{base_prompt}"
-        else:
-            img_tags = "".join(f"Image-{i+1}: <image>\n" for i in range(n))
-            question = f"{img_tags}{base_prompt}"
+            base_prompt = _load_prompt()
+            if n == 1:
+                question = f"<image>\n{base_prompt}"
+            else:
+                img_tags = "".join(f"Image-{i+1}: <image>\n" for i in range(n))
+                question = f"{img_tags}{base_prompt}"
 
-        gen_cfg = {"max_new_tokens": 150, "do_sample": False}
-        if n == 1:
-            response = self._model.chat(self._tokenizer, pixel_values, question, gen_cfg)
-        else:
-            response = self._model.chat(
-                self._tokenizer, pixel_values, question, gen_cfg,
-                num_patches_list=[1] * n,
-            )
-
-        structured = self._parse(response)
-        return response, structured
+            gen_cfg = {"max_new_tokens": 150, "do_sample": False}
+            with profile_measure("model.clothing_vlm.inference", metadata=metadata, synchronize_cuda=True):
+                with cuda_event_measure("model.clothing_vlm.inference.cuda", metadata=metadata):
+                    if n == 1:
+                        response = self._model.chat(self._tokenizer, pixel_values, question, gen_cfg)
+                    else:
+                        response = self._model.chat(
+                            self._tokenizer, pixel_values, question, gen_cfg,
+                            num_patches_list=[1] * n,
+                        )
+            with profile_measure("model.clothing_vlm.postprocess", metadata=metadata):
+                structured = self._parse(response)
+                return response, structured
 
     @staticmethod
     def _parse(response: str) -> dict:

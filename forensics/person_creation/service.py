@@ -14,6 +14,7 @@ import cv2 as _cv2
 
 from forensics.person_identifier.config import Config as _PIConfig
 from forensics.person_creation.path_utils import to_wsl_path as _to_wsl_path
+from forensics.person_creation.utils.profiling import ProfilingRun
 from forensics.person_creation.tools.cleanup_orphan_crops import (
     cleanup as _cleanup_orphan_crops,
     CleanupError as _CleanupError,
@@ -94,21 +95,42 @@ _NODE_TO_STATUS = {
 def _run_pipeline(job_id: str, initial_state: dict) -> None:
     """Run the graph start to end with no human interrupts."""
     job = _jobs[job_id]
-    graph = _get_graph()
+    profiling_run = ProfilingRun(
+        initial_state.get("output_dir", "."),
+        metadata={
+            "job_id": job_id,
+            "person_name": initial_state.get("person_name", ""),
+            "video_basenames": [Path(p).name for p in initial_state.get("video_paths", [])],
+            "number_of_videos": len(initial_state.get("video_paths", [])),
+            "process_every_n": initial_state.get("process_every_n"),
+            "device_requested": "auto",
+        },
+    )
 
     try:
-        for event in graph.stream(initial_state, stream_mode="updates"):
-            for node_name, update in event.items():
-                job.node = node_name
-                job.status = _NODE_TO_STATUS.get(node_name, node_name)
-                if isinstance(update, dict):
-                    job.snapshot.update(update)
+        with profiling_run:
+            with profiling_run.profiler.measure(
+                "person_creation_pipeline", synchronize_cuda=True
+            ):
+                graph = _get_graph()
+                for event in graph.stream(initial_state, stream_mode="updates"):
+                    for node_name, update in event.items():
+                        job.node = node_name
+                        job.status = _NODE_TO_STATUS.get(node_name, node_name)
+                        if isinstance(update, dict):
+                            job.snapshot.update(update)
 
         job.status = "done"
 
     except Exception:
         job.status = "error"
         job.error = traceback.format_exc()
+    finally:
+        job.snapshot["profiling_enabled"] = profiling_run.profiler.enabled
+        job.snapshot["profiling_reports"] = profiling_run.paths
+        job.snapshot["profiling_report"] = profiling_run.paths.get("pipeline_profile", "")
+        if profiling_run.report_error:
+            job.snapshot["profiling_error"] = profiling_run.report_error
 
 
 # ─── Endpoints ────────────────────────────────────────────────────────────────
@@ -190,6 +212,10 @@ def status(job_id: str):
         "per_cluster_clothing": snap.get("per_cluster_clothing", {}),
         "profile":             snap.get("profile", {}),
         "human_feedback_path": snap.get("human_feedback_path", ""),
+        "profiling_report":    snap.get("profiling_report", ""),
+        "profiling_reports":   snap.get("profiling_reports", {}),
+        "profiling_enabled":   snap.get("profiling_enabled", False),
+        "profiling_error":     snap.get("profiling_error", ""),
     }
     return jsonify({
         "job_id":   job_id,

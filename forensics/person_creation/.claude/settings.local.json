@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//d/summer intership/second year/WAYCON/WAYCON/**)",
+      "Bash(py -3.14 -m forensics.person_creation.tools.test_tracking_identity_guard)"
+    ]
+  }
+}

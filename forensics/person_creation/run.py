@@ -1,5 +1,8 @@
 import argparse
+from pathlib import Path
+
 from forensics.person_creation.graph import build_graph
+from forensics.person_creation.utils.profiling import ProfilingRun
 
 
 def main():
@@ -38,10 +41,25 @@ def main():
     # update the same way the Flask service does, so the final dict below
     # is the complete end-of-run state without needing a checkpointer.
     state: dict = {}
-    for event in graph.stream(initial_state, stream_mode="updates"):
-        for node, update in event.items():
-            print(f"  [{node}] done")
-            state.update(update)
+    profiling_run = ProfilingRun(
+        args.output,
+        metadata={
+            "job_id": f"cli-{Path(args.output).name}",
+            "person_name": args.name,
+            "video_basenames": [Path(path).name for path in args.videos],
+            "number_of_videos": len(args.videos),
+            "process_every_n": args.every,
+            "device_requested": "auto",
+        },
+    )
+    with profiling_run:
+        with profiling_run.profiler.measure("person_creation_pipeline", synchronize_cuda=True):
+            for event in graph.stream(initial_state, stream_mode="updates"):
+                for node, update in event.items():
+                    print(f"  [{node}] done")
+                    state.update(update)
+    if profiling_run.paths:
+        print(f"Profiling: {profiling_run.paths['pipeline_profile']}")
 
     profiles = state.get("per_cluster_profiles", {})
     profile = state.get("profile", {})

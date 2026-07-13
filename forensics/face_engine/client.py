@@ -7,6 +7,7 @@ import cv2
 import numpy as np
 
 from forensics.face_engine.config import BASE_URL, REQUEST_TIMEOUT
+from forensics.person_creation.utils.profiling import profile_measure
 
 
 class FaceEngineConnectionError(ConnectionError):
@@ -29,23 +30,37 @@ class FaceEngineClient:
             )
 
     def detect(self, image_bgr: np.ndarray) -> list[dict]:
-        data = self._request("POST", "/detect", files=self._image_files(image_bgr))
-        faces = data.get("faces", [])
-        return [
-            {
-                "bbox": face.get("bbox", []),
-                "score": float(face.get("confidence", face.get("score", 0.0))),
-                "confidence": float(face.get("confidence", face.get("score", 0.0))),
-            }
-            for face in faces
-        ]
+        metadata = {"input_shape": list(image_bgr.shape), "endpoint": "/detect"}
+        with profile_measure("model.face_detector.total", metadata=metadata):
+            with profile_measure("model.face_detector.jpeg_encode", metadata=metadata):
+                files = self._image_files(image_bgr)
+            with profile_measure("model.face_detector.remote_request", metadata=metadata):
+                data = self._request("POST", "/detect", files=files)
+            with profile_measure("model.face_detector.postprocess", metadata=metadata):
+                faces = data.get("faces", [])
+                result = [
+                    {
+                        "bbox": face.get("bbox", []),
+                        "score": float(face.get("confidence", face.get("score", 0.0))),
+                        "confidence": float(face.get("confidence", face.get("score", 0.0))),
+                    }
+                    for face in faces
+                ]
+                metadata["output_detection_count"] = len(result)
+                return result
 
     def embed(self, crop_bgr: np.ndarray) -> np.ndarray:
-        data = self._request("POST", "/embed", files=self._image_files(crop_bgr))
-        vec = np.asarray(data.get("embedding"), dtype=np.float32).reshape(-1)
-        if vec.shape[0] != 512:
-            raise ValueError(f"face engine returned {vec.shape[0]}-d embedding, expected 512")
-        return vec
+        metadata = {"input_shape": list(crop_bgr.shape), "endpoint": "/embed"}
+        with profile_measure("model.face_embedder.total", metadata=metadata):
+            with profile_measure("model.face_embedder.jpeg_encode", metadata=metadata):
+                files = self._image_files(crop_bgr)
+            with profile_measure("model.face_embedder.remote_request", metadata=metadata):
+                data = self._request("POST", "/embed", files=files)
+            with profile_measure("model.face_embedder.postprocess", metadata=metadata):
+                vec = np.asarray(data.get("embedding"), dtype=np.float32).reshape(-1)
+                if vec.shape[0] != 512:
+                    raise ValueError(f"face engine returned {vec.shape[0]}-d embedding, expected 512")
+                return vec
 
     def recognize(self, embedding: list[float] | np.ndarray, top_k: int = 5, threshold: float | None = None) -> dict:
         payload: dict[str, Any] = {

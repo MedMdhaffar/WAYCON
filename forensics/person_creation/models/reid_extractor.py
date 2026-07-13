@@ -7,6 +7,7 @@ methods return None/empty results so enrollment can still complete.
 from __future__ import annotations
 
 import threading
+import warnings
 from pathlib import Path
 from typing import Iterable
 
@@ -14,6 +15,7 @@ import cv2
 import numpy as np
 
 from forensics.person_creation.models.device import resolve_device
+from forensics.person_creation.utils.profiling import cuda_event_measure, profile_measure
 
 DEFAULT_REID_CONFIG = {
     "model": "osnet_x0_25",
@@ -62,7 +64,14 @@ class ReidExtractor:
             self._load_attempted = True
 
             try:
-                import torchreid
+                with warnings.catch_warnings():
+                    warnings.filterwarnings(
+                        "ignore",
+                        message=r"Cython evaluation .* is unavailable.*",
+                        category=UserWarning,
+                        module=r"torchreid\.reid\.metrics\.rank",
+                    )
+                    import torchreid
                 from torchvision import transforms
 
                 self._device = resolve_device(device)
@@ -96,12 +105,24 @@ class ReidExtractor:
 
         try:
             import torch
-
-            tensor = self._transform(image_rgb).unsqueeze(0).to(self._device)
-            with torch.no_grad():
-                feat = self._model(tensor)
-                feat = torch.nn.functional.normalize(feat, p=2, dim=1)
-            return feat.squeeze(0).cpu().numpy().astype(np.float32)
+            metadata = {
+                "device": self._device,
+                "model": self.config["model"],
+                "batch_size": 1,
+            }
+            with profile_measure("model.reid.total", metadata=metadata, synchronize_cuda=True):
+                with profile_measure("model.reid.preprocess", metadata=metadata):
+                    tensor = self._transform(image_rgb).unsqueeze(0)
+                    metadata["tensor_shape"] = list(tensor.shape)
+                with profile_measure("model.reid.host_to_device", metadata=metadata, synchronize_cuda=True):
+                    tensor = tensor.to(self._device)
+                with profile_measure("model.reid.inference", metadata=metadata, synchronize_cuda=True):
+                    with cuda_event_measure("model.reid.inference.cuda", metadata=metadata):
+                        with torch.no_grad():
+                            feat = self._model(tensor)
+                with profile_measure("model.reid.postprocess", metadata=metadata, synchronize_cuda=True):
+                    feat = torch.nn.functional.normalize(feat, p=2, dim=1)
+                    return feat.squeeze(0).cpu().numpy().astype(np.float32)
         except Exception as exc:
             print(f"[ReidExtractor] embedding failed: {exc}")
             return None

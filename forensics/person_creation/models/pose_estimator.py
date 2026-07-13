@@ -16,6 +16,7 @@ import threading
 import numpy as np
 
 from forensics.person_creation.models.device import resolve_device
+from forensics.person_creation.utils.profiling import profile_measure
 
 # COCO-17 keypoint indices that describe the head.
 _HEAD_KEYPOINTS = (0, 1, 2, 3, 4)  # nose, left/right eye, left/right ear
@@ -38,15 +39,19 @@ class PoseEstimator:
                 return
             self._load_attempted = True
             try:
-                from rtmlib import RTMPose
+                from rtmlib import Body
 
                 device_str = resolve_device(device)
-                self._model = RTMPose(
-                    model_input_size=(192, 256),
+                # Body is rtmlib's high-level image -> (keypoints, scores)
+                # API. The low-level RTMPose class requires an explicit
+                # onnx_model and bounding boxes.
+                self._model = Body(
+                    mode="lightweight",
+                    to_openpose=False,
                     backend="onnxruntime",
                     device="cuda" if device_str == "cuda" else "cpu",
                 )
-                print(f"[PoseEstimator] RTMPose loaded on {device_str}")
+                print(f"[PoseEstimator] RTMPose Body loaded on {device_str}")
             except Exception as exc:  # pragma: no cover - optional dependency
                 self._model = None
                 self.unavailable_reason = str(exc)
@@ -60,7 +65,12 @@ class PoseEstimator:
         if self._model is None or body_crop_bgr is None or body_crop_bgr.size == 0:
             return None
         try:
-            keypoints, scores = self._model(body_crop_bgr)
+            with profile_measure(
+                "model.pose_estimator.total",
+                metadata={"input_shape": list(body_crop_bgr.shape)},
+                synchronize_cuda=True,
+            ):
+                keypoints, scores = self._model(body_crop_bgr)
             if keypoints is None or len(keypoints) == 0:
                 return None
             kp = keypoints[0]
