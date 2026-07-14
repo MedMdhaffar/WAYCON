@@ -20,3 +20,9 @@ scipy
 # remaining cues. Install to enable body-ReID / pose cues:
 #   torchreid   (OSNet-x0.25 body ReID embedder)
 #   rtmlib      (RTMPose keypoints, onnxruntime-only, no mmcv/mmdet needed)
+
+# Optional — GPU-first video pipeline (PERSON_CREATION_GPU_PIPELINE=1).
+# NVDEC hardware decode; capability-probed at runtime with a logged CPU
+# fallback, so the base pipeline works without it:
+#   PyNvVideoCodec  (NVIDIA's official pip wheel; needs libnvcuvid — present
+#                    in WSL2 with driver >= 545 and any native Linux driver)

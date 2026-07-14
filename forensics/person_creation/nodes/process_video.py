@@ -23,6 +23,17 @@ def _crop(frame: np.ndarray, bbox: list[float], padding: int = 2) -> np.ndarray:
 
 
 def process_video(state: dict) -> dict:
+    # GPU-first path (NVDEC decode, CUDA-resident frames, in-process face
+    # detection). Opt-in via env flag; this CPU implementation is the fallback
+    # and stays byte-for-byte unchanged. See docs/gpu_pipeline_architecture_analysis.md.
+    from forensics.person_creation.gpu import env_flag
+
+    if env_flag("PERSON_CREATION_GPU_PIPELINE"):
+        from forensics.person_creation.nodes.process_video_gpu import process_video_gpu
+
+        print("[process_video] PERSON_CREATION_GPU_PIPELINE=1 — using GPU pipeline")
+        return process_video_gpu(state)
+
     from forensics.person_creation.models.person_detector import get_person_detector
     from forensics.face_engine.client import FaceEngineClient
 

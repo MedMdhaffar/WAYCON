@@ -30,6 +30,26 @@ def load_models(state: dict) -> dict:
     with profile_measure("model.pose_estimator.load"):
         get_pose_estimator().load(device="auto")
 
+    # GPU pipeline (flagged): load the in-process face detector and warm both
+    # detectors here so the job's first frame doesn't pay cuDNN autotune cost
+    # and readiness genuinely means "warmed". Failure falls back to the HTTP
+    # Face Engine and is logged, never silent.
+    from forensics.person_creation.gpu import env_flag
+
+    if env_flag("PERSON_CREATION_GPU_PIPELINE"):
+        with profile_measure("model.gpu_pipeline.warmup"):
+            get_person_detector().warmup()
+            if env_flag("PERSON_CREATION_LOCAL_FACE", default=True):
+                try:
+                    from forensics.person_creation.gpu.face_local import load_local_face_detector
+
+                    load_local_face_detector(device="auto").warmup()
+                except Exception as exc:
+                    print(
+                        f"[load_models] local face detector unavailable ({exc!r}) — "
+                        "process_video_gpu will fall back to the HTTP Face Engine"
+                    )
+
     reid_config = normalize_reid_config(state.get("reid_config"))
     with profile_measure(
         "model.reid.load", metadata={"model": reid_config.get("model")}
