@@ -68,3 +68,7 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+
+# Frontend dependencies
+node_modules/
+**/node_modules/
