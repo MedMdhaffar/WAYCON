@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import asdict
+import hashlib
 import json
 from pathlib import Path
 import threading
@@ -320,3 +321,86 @@ def test_forbidden_stages_are_not_referenced_and_graph_is_unchanged():
     nodes = set(build_graph().get_graph().nodes)
     assert "process_live_chunk_result" not in nodes
     assert {"process_video", "process_live_stream", "finalize"} <= nodes
+
+
+def test_preprocessing_only_runs_quality_then_embedding(monkeypatch, tmp_path):
+    calls = []
+    _install_success_stages(monkeypatch, calls)
+
+    result = processing.preprocess_live_chunk(
+        chunk=_chunk(tmp_path),
+        base_state={"person_name": "Test"},
+    )
+
+    assert calls == ["quality", "embedding"]
+    assert result.chunk_index == 4
+    assert len(result.quality_body_crops) == 1
+    assert len(result.quality_face_crops) == 1
+    assert len(result.face_embeddings) == 1
+
+
+def test_preprocessing_only_has_no_permanent_or_identity_stages():
+    names = set(processing.preprocess_live_chunk.__code__.co_names)
+    assert names.isdisjoint({
+        "cluster_identities",
+        "compute_body_cluster_assignments",
+        "promote_crops",
+        "select_best",
+        "compute_reid",
+        "describe_clothing",
+        "build_profile",
+        "finalize",
+        "GlobalMemory",
+    })
+
+
+def test_preview_outputs_match_existing_quality_and_embedding_nodes(
+    monkeypatch, tmp_path
+):
+    import cv2
+    import numpy as np
+
+    face_path = tmp_path / "face.jpg"
+    assert cv2.imwrite(str(face_path), np.full((120, 120, 3), 127, dtype=np.uint8))
+    chunk = _chunk(tmp_path)
+    chunk.face_crops[0]["path"] = str(face_path)
+
+    class FakeFaceEngineClient:
+        def embed(self, _image):
+            return np.asarray([1.0, 0.0], dtype=np.float32)
+
+    import forensics.face_engine.client as face_client
+
+    monkeypatch.setattr(face_client, "FaceEngineClient", FakeFaceEngineClient)
+    canonical_state = {
+        "body_crops": deepcopy(chunk.body_crops),
+        "face_crops": deepcopy(chunk.face_crops),
+    }
+    quality_update = processing.filter_quality(canonical_state)
+    canonical_state.update(quality_update)
+    embedding_update = processing.embed_all_faces(canonical_state)
+
+    preview = processing.preprocess_live_chunk(chunk=chunk, base_state={})
+
+    assert preview.quality_body_crops == quality_update["quality_body_crops"]
+    assert preview.quality_face_crops == quality_update["quality_face_crops"]
+    assert preview.face_embeddings == embedding_update["all_face_embeddings"]
+    assert preview.failed_face_embeddings == embedding_update[
+        "failed_face_embeddings"
+    ]
+
+
+def test_quality_and_embedding_algorithm_source_hashes_are_unchanged():
+    expected = {
+        "filter_quality.py": (
+            "A44E3A260E74FDC46A10CC9F6B7B041A20A9F29C347F900A466C922245FA02CE"
+        ),
+        "embed_all_faces.py": (
+            "976F2DBFF099E7A7EB65FD8227D39BFD6A86AFE5ECA039E2E2C85A76412CE138"
+        ),
+    }
+    nodes_dir = Path(processing.__file__).parent / "nodes"
+
+    for filename, expected_hash in expected.items():
+        actual = hashlib.sha256((nodes_dir / filename).read_bytes()).hexdigest()
+        assert actual.upper() == expected_hash

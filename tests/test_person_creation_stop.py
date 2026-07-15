@@ -129,6 +129,42 @@ def test_status_exposes_safe_continuous_capture_progress(client):
     assert snapshot["duration_seconds_per_chunk"] == 10
 
 
+def test_status_exposes_json_safe_embedding_free_preprocessing_progress(client):
+    job_id = _start_camera(client)
+    preview = {
+        "enabled": True,
+        "queue_capacity": 2,
+        "capture_completed_chunks": 3,
+        "preprocessing_completed_chunks": 2,
+        "preprocessing_pending_chunks": 1,
+        "preprocessing_active_chunk": 2,
+        "quality_body_crops": 8,
+        "quality_face_crops": 4,
+        "embedded_faces": 4,
+        "failed_face_embeddings": 0,
+    }
+    with service._jobs_lock:
+        service._jobs[job_id].snapshot.update({
+            "live_preprocessing": preview,
+            "stream_stats": {
+                "frames_read": 100,
+                "live_preprocessing": preview,
+            },
+        })
+
+    snapshot = client.get(f"/api/person/status/{job_id}").get_json()["snapshot"]
+    serialized = json.dumps(snapshot)
+
+    assert snapshot["stream_stats"]["frames_read"] == 100
+    assert snapshot["stream_stats"]["live_preprocessing"] == preview
+    assert snapshot["live_preprocessing"] == preview
+    assert "face_embeddings" not in snapshot["live_preprocessing"]
+    assert "[0.25, 0.75]" not in serialized
+    assert snapshot["source_uri_masked"] == "rtsp://****@camera.local/live"
+    assert "supervisor" not in serialized
+    assert "secret" not in serialized
+
+
 def test_video_job_remains_finite_and_has_no_stop_runtime(client, monkeypatch):
     monkeypatch.setattr(service, "build_initial_state", lambda _body: {
         "person_name": "Video Test",

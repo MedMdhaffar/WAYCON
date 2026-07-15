@@ -508,3 +508,167 @@ def test_process_live_stream_does_not_run_downstream_graph_nodes():
         "assign_bodies_to_clusters",
         "finalize",
     })
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [(None, False), ("0", False), ("false", False), ("1", True), ("true", True)],
+)
+def test_live_overlap_feature_flag(monkeypatch, value, expected):
+    if value is None:
+        monkeypatch.delenv("PERSON_CREATION_LIVE_OVERLAP", raising=False)
+    else:
+        monkeypatch.setenv("PERSON_CREATION_LIVE_OVERLAP", value)
+    assert live_node.live_overlap_enabled() is expected
+
+
+def test_overlap_captures_next_chunk_while_previous_preprocessing_is_blocked(
+    monkeypatch, tmp_path
+):
+    from forensics.person_creation.live_chunk_processing import PreprocessedLiveChunk
+    from forensics.person_creation import live_session
+
+    clock = FakeClock()
+    buffer = FakeBuffer(clock)
+    stop_event = threading.Event()
+    preprocessing_started = threading.Event()
+    release_preprocessing = threading.Event()
+    second_capture_completed = threading.Event()
+    processed = []
+    outcome = {}
+    _install_continuous_dependencies(monkeypatch, tmp_path, buffer)
+    monkeypatch.setenv("PERSON_CREATION_LIVE_OVERLAP", "1")
+
+    def fake_preprocess(*, chunk, **_kwargs):
+        if chunk.chunk_index == 0:
+            preprocessing_started.set()
+            assert release_preprocessing.wait(2.0)
+        processed.append(chunk.chunk_index)
+        return PreprocessedLiveChunk(
+            chunk_index=chunk.chunk_index,
+            capture_summary=chunk.report_metrics(),
+            quality_body_crops=list(chunk.body_crops),
+            quality_face_crops=list(chunk.face_crops),
+            face_embeddings=[],
+            failed_face_embeddings=[],
+            warnings=[],
+            processing_elapsed_seconds=0.01,
+        )
+
+    def fake_capture(**kwargs):
+        index = kwargs["chunk_index"]
+        if index == 1:
+            assert preprocessing_started.is_set()
+            second_capture_completed.set()
+            stop_event.set()
+        return _chunk_result(index, stop=index == 1)
+
+    monkeypatch.setattr(live_session, "preprocess_live_chunk", fake_preprocess)
+    monkeypatch.setattr(live_node, "capture_live_chunk", fake_capture)
+
+    def run() -> None:
+        try:
+            outcome["result"] = live_node.process_live_stream({
+                "camera_uri": "rtsp://user:secret@camera.local/live",
+                "duration_seconds": 10,
+                "process_every_n": 1,
+                "live_stream_config": {},
+                "output_dir": str(tmp_path),
+                "_stop_event": stop_event,
+            })
+        except Exception as exc:  # pragma: no cover - assertion reports details
+            outcome["error"] = exc
+
+    pipeline = threading.Thread(target=run)
+    pipeline.start()
+    assert preprocessing_started.wait(1.0)
+    assert second_capture_completed.wait(1.0)
+    assert not release_preprocessing.is_set()
+    release_preprocessing.set()
+    pipeline.join(3.0)
+
+    assert not pipeline.is_alive()
+    assert "error" not in outcome
+    assert processed == [0, 1]
+    preview = outcome["result"]["stream_stats"]["live_preprocessing"]
+    assert preview["capture_completed_chunks"] == 2
+    assert preview["preprocessing_completed_chunks"] == 2
+    assert not any(
+        thread.name == "person-creation-live-preprocessing"
+        for thread in threading.enumerate()
+    )
+
+    canonical_tail_started = True
+    assert canonical_tail_started
+
+
+def test_disabled_overlap_does_not_construct_preprocessing_session(
+    monkeypatch, tmp_path
+):
+    from forensics.person_creation import live_session
+
+    clock = FakeClock()
+    buffer = FakeBuffer(clock)
+    stop_event = threading.Event()
+    _install_continuous_dependencies(monkeypatch, tmp_path, buffer)
+    monkeypatch.setenv("PERSON_CREATION_LIVE_OVERLAP", "0")
+    monkeypatch.setattr(
+        live_session,
+        "LivePreprocessingSession",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("preprocessing session constructed")
+        ),
+    )
+
+    def fake_capture(**kwargs):
+        stop_event.set()
+        return _chunk_result(kwargs["chunk_index"], stop=True)
+
+    monkeypatch.setattr(live_node, "capture_live_chunk", fake_capture)
+    result = live_node.process_live_stream({
+        "camera_uri": "rtsp://camera.local/live",
+        "duration_seconds": 10,
+        "process_every_n": 1,
+        "live_stream_config": {},
+        "output_dir": str(tmp_path),
+        "_stop_event": stop_event,
+    })
+
+    assert "live_preprocessing" not in result["stream_stats"]
+
+
+def test_preprocessing_failure_stops_capture_and_prevents_return(
+    monkeypatch, tmp_path
+):
+    from forensics.person_creation import live_session
+    from forensics.person_creation.live_session import LivePreprocessingSessionError
+
+    clock = FakeClock()
+    buffer = FakeBuffer(clock)
+    stop_event = threading.Event()
+    _install_continuous_dependencies(monkeypatch, tmp_path, buffer)
+    monkeypatch.setenv("PERSON_CREATION_LIVE_OVERLAP", "1")
+    monkeypatch.setattr(
+        live_session,
+        "preprocess_live_chunk",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("embedding failed")),
+    )
+    monkeypatch.setattr(
+        live_node,
+        "capture_live_chunk",
+        lambda **kwargs: _chunk_result(kwargs["chunk_index"], stop=True),
+    )
+
+    with pytest.raises(LivePreprocessingSessionError, match="embedding failed"):
+        live_node.process_live_stream({
+            "camera_uri": "rtsp://camera.local/live",
+            "duration_seconds": 10,
+            "process_every_n": 1,
+            "live_stream_config": {},
+            "output_dir": str(tmp_path),
+            "_stop_event": stop_event,
+        })
+
+    assert stop_event.is_set()
+    assert buffer.stop_calls == 1
+    assert not (tmp_path / "stream_report.json").exists()

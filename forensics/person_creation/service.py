@@ -363,6 +363,7 @@ def status(job_id: str):
         "stop_requested":     snap.get("stop_requested", False),
         "continuous":         snap.get("continuous", False),
         "duration_seconds_per_chunk": snap.get("duration_seconds_per_chunk"),
+        "live_preprocessing": snap.get("live_preprocessing", {}),
     }
     return jsonify({
         "job_id":   job_id,

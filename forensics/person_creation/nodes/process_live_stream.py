@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 import re
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -64,6 +66,15 @@ def _stop_requested(stop_event: Any | None) -> bool:
 
 def _safe_stream_message(message: str) -> str:
     return re.sub(r"rtsps?://\S+", "<camera-source>", str(message), flags=re.IGNORECASE)
+
+
+def live_overlap_enabled() -> bool:
+    return os.getenv("PERSON_CREATION_LIVE_OVERLAP", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 def capture_live_chunk(
@@ -198,6 +209,7 @@ def process_live_stream(state: PersonCreationState) -> dict:
     duration_seconds = int(state.get("duration_seconds", 30))
     every_n = max(1, int(state.get("process_every_n", 5)))
     config = dict(state.get("live_stream_config") or {})
+    overlap_enabled = live_overlap_enabled()
     buffer_max_size = max(1, min(int(config.get("buffer_max_size", 30)), 300))
     frame_timeout_seconds = max(1.0, float(config.get("frame_timeout_seconds", 5.0)))
     masked_uri = mask_camera_uri(camera_uri)
@@ -214,6 +226,35 @@ def process_live_stream(state: PersonCreationState) -> dict:
         shutdown_timeout_seconds=config.get("shutdown_timeout_seconds"),
     )
     stop_event = state.get("_stop_event")
+    if overlap_enabled and stop_event is None:
+        stop_event = threading.Event()
+    preprocessing_session = None
+    preprocessing_started = False
+    final_preprocessing_snapshot = None
+    if overlap_enabled:
+        from forensics.person_creation.live_session import LivePreprocessingSession
+
+        queue_capacity = max(
+            1,
+            int(config.get("preprocessing_queue_capacity", 2)),
+        )
+        join_timeout = max(
+            0.01,
+            float(config.get("preprocessing_join_timeout_seconds", 120.0)),
+        )
+
+        def publish_preprocessing(snapshot: dict) -> None:
+            _notify(state, "processing_live_frames", {
+                "live_preprocessing": snapshot,
+            })
+
+        preprocessing_session = LivePreprocessingSession(
+            base_state=state,
+            queue_capacity=queue_capacity,
+            join_timeout_seconds=join_timeout,
+            notify=publish_preprocessing,
+            request_stop=stop_event.set,
+        )
     # Evidence is intentionally not pruned here; long sessions can create many
     # crop files in _staging before the unchanged downstream graph runs once.
     body_crops: list[dict] = []
@@ -232,11 +273,20 @@ def process_live_stream(state: PersonCreationState) -> dict:
     try:
         _notify(state, "connecting_camera")
         buffer.start()
+        if preprocessing_session is not None:
+            preprocessing_session.start()
+            preprocessing_started = True
         _notify(state, "buffering_stream", {
             "stream_stats": {
                 **buffer.stats(0),
                 "duration_seconds": duration_seconds,
+                **({
+                    "live_preprocessing": preprocessing_session.public_snapshot(),
+                } if preprocessing_session is not None else {}),
             },
+            **({
+                "live_preprocessing": preprocessing_session.public_snapshot(),
+            } if preprocessing_session is not None else {}),
         })
         chunk_index = 0
         while not _stop_requested(stop_event):
@@ -281,6 +331,8 @@ def process_live_stream(state: PersonCreationState) -> dict:
             totals["body_detections"] += chunk.body_detection_count
             totals["face_detections"] += chunk.face_detection_count
             warnings.extend(_safe_stream_message(item) for item in chunk.warnings)
+            if preprocessing_session is not None:
+                preprocessing_session.submit_chunk(chunk)
 
             summary = chunk.report_metrics()
             summary["warnings"] = [
@@ -306,6 +358,10 @@ def process_live_stream(state: PersonCreationState) -> dict:
                 "session_totals": session_totals,
                 "stop_requested": _stop_requested(stop_event),
             }
+            if preprocessing_session is not None:
+                progress_stats["live_preprocessing"] = (
+                    preprocessing_session.public_snapshot()
+                )
             _notify(state, "processing_live_frames", {
                 "chunk_index": chunk.chunk_index,
                 "completed_chunks": completed_chunks,
@@ -315,6 +371,9 @@ def process_live_stream(state: PersonCreationState) -> dict:
                 "continuous": True,
                 "duration_seconds_per_chunk": duration_seconds,
                 "stream_stats": progress_stats,
+                **({
+                    "live_preprocessing": preprocessing_session.public_snapshot(),
+                } if preprocessing_session is not None else {}),
             })
             print(
                 f"[process_live_stream] chunk={chunk.chunk_index} "
@@ -338,8 +397,23 @@ def process_live_stream(state: PersonCreationState) -> dict:
                 break
     finally:
         print("[process_live_stream] before buffer.stop", flush=True)
-        buffer.stop()
-        print("[process_live_stream] after buffer.stop", flush=True)
+        try:
+            buffer.stop()
+            print("[process_live_stream] after buffer.stop", flush=True)
+        finally:
+            if preprocessing_session is not None and preprocessing_started:
+                print(
+                    "[process_live_stream] before preprocessing drain",
+                    flush=True,
+                )
+                preprocessing_session.finish()
+                final_preprocessing_snapshot = (
+                    preprocessing_session.public_snapshot()
+                )
+                print(
+                    "[process_live_stream] after preprocessing drain",
+                    flush=True,
+                )
 
     session_totals = dict(totals)
     completed_chunks = len(chunk_summaries)
@@ -353,6 +427,8 @@ def process_live_stream(state: PersonCreationState) -> dict:
     stats["stop_requested"] = _stop_requested(stop_event)
     stats["session_totals"] = session_totals
     stats["chunks"] = chunk_summaries
+    if final_preprocessing_snapshot is not None:
+        stats["live_preprocessing"] = final_preprocessing_snapshot
     _notify(state, "stopping", {
         "chunk_index": last_chunk["chunk_index"] if last_chunk else None,
         "completed_chunks": completed_chunks,
@@ -362,6 +438,9 @@ def process_live_stream(state: PersonCreationState) -> dict:
         "continuous": True,
         "duration_seconds_per_chunk": duration_seconds,
         "stream_stats": stats,
+        **({
+            "live_preprocessing": final_preprocessing_snapshot,
+        } if final_preprocessing_snapshot is not None else {}),
     })
     print("[process_live_stream] before report write", flush=True)
     report_path = write_stream_report(
