@@ -1,4 +1,5 @@
 import operator
+from threading import Event
 from typing import Annotated, Any, Callable
 from typing_extensions import NotRequired, TypedDict
 
@@ -16,6 +17,7 @@ class PersonCreationState(TypedDict):
     stream_stats: NotRequired[dict]
     stream_report_path: NotRequired[str]
     _status_callback: NotRequired[Callable[..., Any]]
+    _stop_event: NotRequired[Event]
     output_dir: str
     process_every_n: int
     identity_clustering_config: dict
@@ -31,6 +33,7 @@ class PersonCreationState(TypedDict):
     quality_face_crops: list[dict]
     total_quality_body_crops: int
     total_quality_face_crops: int
+    face_rejection_counts: NotRequired[dict[str, int]]
 
     face_embeddings: list[list[float]]
     mean_face_embedding: list[float]

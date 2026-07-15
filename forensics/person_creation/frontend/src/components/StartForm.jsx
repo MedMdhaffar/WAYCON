@@ -1,8 +1,9 @@
 import { useState } from 'react'
+import { safeErrorMessage } from '../liveJob.js'
 
 const DEFAULT_VIDEOS = ['']
 
-export default function StartForm({ onStart }) {
+export default function StartForm({ onStart, activeJob = false }) {
   const [name, setName] = useState('Malek')
   const [inputType, setInputType] = useState('video_file')
   const [videos, setVideos] = useState(DEFAULT_VIDEOS)
@@ -21,6 +22,7 @@ export default function StartForm({ onStart }) {
 
   const handleSubmit = async (e) => {
     e.preventDefault()
+    if (activeJob) return
     setError('')
     setPathErrors([])
     setLoading(true)
@@ -48,12 +50,13 @@ export default function StartForm({ onStart }) {
       })
       const data = await res.json()
       if (!res.ok || data.error) {
-        if (Array.isArray(data.details)) setPathErrors(data.details)
+        if (inputType === 'video_file' && Array.isArray(data.details)) setPathErrors(data.details)
         throw new Error(data.error || `HTTP ${res.status}`)
       }
-      onStart(data.job_id)
+      if (inputType === 'camera_uri') setCameraUri('')
+      onStart(data.job_id, inputType === 'camera_uri' ? 'live_camera' : 'video_file')
     } catch (err) {
-      setError(err.message)
+      setError(safeErrorMessage(err, 'Unable to start the job.'))
     } finally {
       setLoading(false)
     }
@@ -117,7 +120,7 @@ export default function StartForm({ onStart }) {
                 required
               />
               <div style={{ color: '#64748b', fontSize: 12, marginTop: 6 }}>
-                RTSP/HTTP camera URI. Passwords are masked in backend logs.
+                Used only to connect. The URI is cleared from this form after submission.
               </div>
             </div>
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
@@ -126,7 +129,7 @@ export default function StartForm({ onStart }) {
                 <input style={inputStyle} value={cameraId} onChange={e => setCameraId(e.target.value)} placeholder="103" />
               </div>
               <div>
-                <label style={labelStyle}>Duration (seconds)</label>
+                <label style={labelStyle}>Processing window duration (seconds)</label>
                 <input
                   style={inputStyle}
                   type="number"
@@ -136,6 +139,9 @@ export default function StartForm({ onStart }) {
                   onChange={e => setDurationSeconds(Number(e.target.value))}
                   required
                 />
+                <div style={{ color: '#64748b', fontSize: 12, marginTop: 6 }}>
+                  The camera continues running until Stop is pressed.
+                </div>
               </div>
             </div>
           </>
@@ -170,7 +176,12 @@ export default function StartForm({ onStart }) {
           </ul>
         )}
 
-        <button type="submit" className="btn btn-primary" disabled={loading} style={{ alignSelf: 'flex-start', padding: '10px 24px' }}>
+        {activeJob && (
+          <div style={{ color: '#f59e0b', fontSize: 13 }}>
+            Finish the active job before starting another one.
+          </div>
+        )}
+        <button type="submit" className="btn btn-primary" disabled={loading || activeJob} style={{ alignSelf: 'flex-start', padding: '10px 24px' }}>
           {loading ? 'Starting…' : '▶ Start Pipeline'}
         </button>
       </form>

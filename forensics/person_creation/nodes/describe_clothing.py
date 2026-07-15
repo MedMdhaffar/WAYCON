@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import threading
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from pathlib import Path
 
@@ -31,11 +32,60 @@ def _read_crops(paths: list[str]) -> list:
 
 def _describe_paths(describer, paths: list[str]) -> tuple[str, dict]:
     crops = _read_crops(paths)
+    return _describe_crops(describer, crops)
+
+
+def _describe_crops(describer, crops: list) -> tuple[str, dict]:
     if not crops:
         return "", dict(_FALLBACK)
     # Trust the ClothingDescriber/InternVL result directly. This node does not
     # normalize colors or rewrite the returned clothing fields.
     return describer.describe(crops)
+
+
+def _prepare_async_crops(
+    per_cluster_best: dict,
+    best_body_crops: list[str],
+) -> tuple[dict[int, list], list]:
+    per_cluster_crops = {
+        int(cid): _read_crops(paths)
+        for cid, paths in per_cluster_best.items()
+    }
+    best_crops = [] if per_cluster_best else _read_crops(best_body_crops)
+    return per_cluster_crops, best_crops
+
+
+def _describe_preloaded(
+    describer,
+    per_cluster_crops: dict[int, list],
+    best_crops: list,
+    start_event: threading.Event,
+) -> dict:
+    start_event.wait()
+    print("[describe_clothing] worker entered", flush=True)
+    try:
+        if per_cluster_crops:
+            per_cluster_clothing: dict[int, dict] = {}
+            first_raw = ""
+            first_structured = dict(_FALLBACK)
+            first = True
+            for cid, crops in per_cluster_crops.items():
+                raw, structured = _describe_crops(describer, crops)
+                per_cluster_clothing[cid] = {"raw": raw, "structured": structured}
+                if first:
+                    first_raw = raw
+                    first_structured = structured
+                    first = False
+            return {
+                "per_cluster_clothing": per_cluster_clothing,
+                "clothing_raw": first_raw,
+                "clothing_structured": first_structured,
+            }
+
+        raw, structured = _describe_crops(describer, best_crops)
+        return {"clothing_raw": raw, "clothing_structured": structured}
+    finally:
+        print("[describe_clothing] worker exited", flush=True)
 
 
 def _describe_all(describer, per_cluster_best: dict, best_body_crops: list[str]) -> dict:
@@ -107,20 +157,43 @@ def describe_clothing(state: dict) -> dict:
             print(f"[describe_clothing] VLM failed; using fallback ({type(exc).__name__})")
             return _fallback_result(per_cluster_best)
 
+    # Decode selected paths before submission. A timed-out worker may finish
+    # inference later, but it never retains or reopens cleanup-sensitive paths.
+    per_cluster_crops, best_crops = _prepare_async_crops(
+        per_cluster_best,
+        best_body_crops,
+    )
     executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="person-creation-vlm")
-    future = executor.submit(_describe_all, describer, per_cluster_best, best_body_crops)
+    worker_start = threading.Event()
+    future = executor.submit(
+        _describe_preloaded,
+        describer,
+        per_cluster_crops,
+        best_crops,
+        worker_start,
+    )
+    try:
+        print("[describe_clothing] VLM task submitted", flush=True)
+    finally:
+        worker_start.set()
     try:
         result = future.result(timeout=timeout)
         print("[describe_clothing] async VLM completed")
         return result
     except FutureTimeoutError:
-        future.cancel()
+        print("[describe_clothing] VLM timeout reached", flush=True)
+        print("[describe_clothing] future cancel requested", flush=True)
+        cancelled = future.cancel()
+        print(
+            f"[describe_clothing] future cancel result={str(cancelled).lower()}",
+            flush=True,
+        )
         print(f"[describe_clothing] async VLM timed out after {timeout:g}s; using fallback")
         return _fallback_result(per_cluster_best)
     except Exception as exc:
         print(f"[describe_clothing] async VLM failed; using fallback ({type(exc).__name__})")
         return _fallback_result(per_cluster_best)
     finally:
-        # A Python thread cannot safely interrupt model inference. Do not wait
-        # for an overdue worker here; the graph must be able to finalize.
+        print("[describe_clothing] executor shutdown entered", flush=True)
         executor.shutdown(wait=False, cancel_futures=True)
+        print("[describe_clothing] executor shutdown completed", flush=True)

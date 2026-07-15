@@ -1,0 +1,215 @@
+from __future__ import annotations
+
+import json
+
+import pytest
+
+from forensics.person_creation import service
+
+
+@pytest.fixture(autouse=True)
+def isolated_jobs(monkeypatch):
+    with service._jobs_lock:
+        service._jobs.clear()
+        service._job_runtimes.clear()
+    monkeypatch.setattr(service, "_start_pipeline_thread", lambda *_args: None)
+    yield
+    with service._jobs_lock:
+        service._jobs.clear()
+        service._job_runtimes.clear()
+
+
+@pytest.fixture
+def client():
+    return service.app.test_client()
+
+
+def _start_camera(client, uri: str = "rtsp://supervisor:secret@camera.local/live") -> str:
+    response = client.post("/api/person/start", json={
+        "name": "Camera Test",
+        "input_type": "camera_uri",
+        "camera_uri": uri,
+        "duration_seconds": 10,
+    })
+    assert response.status_code == 200
+    return response.get_json()["job_id"]
+
+
+def test_starting_camera_job_creates_unique_stop_event(client):
+    first_id = _start_camera(client)
+    second_id = _start_camera(client, "rtsp://camera.local/second")
+
+    with service._jobs_lock:
+        first = service._job_runtimes[first_id].stop_event
+        second = service._job_runtimes[second_id].stop_event
+
+    assert first is not second
+    assert not first.is_set()
+    assert not second.is_set()
+
+
+def test_stop_sets_only_targeted_job_event(client):
+    first_id = _start_camera(client)
+    second_id = _start_camera(client, "rtsp://camera.local/second")
+    with service._jobs_lock:
+        first = service._job_runtimes[first_id].stop_event
+        second = service._job_runtimes[second_id].stop_event
+
+    response = client.post(f"/api/person/stop/{first_id}")
+
+    assert response.get_json() == {"job_id": first_id, "status": "stop_requested"}
+    assert first.is_set()
+    assert not second.is_set()
+
+
+def test_stop_unknown_job_returns_not_found(client):
+    response = client.post("/api/person/stop/missing-job")
+
+    assert response.status_code == 404
+    assert response.get_json() == {"error": "job not found"}
+
+
+def test_repeated_stop_requests_are_idempotent(client):
+    job_id = _start_camera(client)
+
+    first = client.post(f"/api/person/stop/{job_id}")
+    second = client.post(f"/api/person/stop/{job_id}")
+
+    assert first.status_code == second.status_code == 200
+    assert first.get_json() == second.get_json() == {
+        "job_id": job_id,
+        "status": "stop_requested",
+    }
+
+
+def test_completed_job_returns_already_finished(client):
+    job_id = _start_camera(client)
+    with service._jobs_lock:
+        service._jobs[job_id].status = "done"
+        service._job_runtimes.pop(job_id)
+
+    response = client.post(f"/api/person/stop/{job_id}")
+
+    assert response.status_code == 200
+    assert response.get_json() == {"job_id": job_id, "status": "already_finished"}
+
+
+def test_status_exposes_stop_requested_without_runtime_objects(client):
+    job_id = _start_camera(client)
+    client.post(f"/api/person/stop/{job_id}")
+
+    payload = client.get(f"/api/person/status/{job_id}").get_json()
+    serialized = json.dumps(payload)
+
+    assert payload["status"] == "stop_requested"
+    assert "_stop_event" not in serialized
+    assert "Event" not in serialized
+
+
+def test_status_exposes_safe_continuous_capture_progress(client):
+    job_id = _start_camera(client)
+    with service._jobs_lock:
+        service._jobs[job_id].snapshot.update({
+            "chunk_index": 4,
+            "completed_chunks": 5,
+            "last_chunk": {"frames_read": 320, "body_detections": 2},
+            "session_totals": {"frames_read": 1580, "body_detections": 8},
+            "stop_requested": False,
+            "continuous": True,
+            "duration_seconds_per_chunk": 10,
+        })
+
+    snapshot = client.get(f"/api/person/status/{job_id}").get_json()["snapshot"]
+
+    assert snapshot["chunk_index"] == 4
+    assert snapshot["completed_chunks"] == 5
+    assert snapshot["last_chunk"]["body_detections"] == 2
+    assert snapshot["session_totals"]["frames_read"] == 1580
+    assert snapshot["continuous"] is True
+    assert snapshot["duration_seconds_per_chunk"] == 10
+
+
+def test_video_job_remains_finite_and_has_no_stop_runtime(client, monkeypatch):
+    monkeypatch.setattr(service, "build_initial_state", lambda _body: {
+        "person_name": "Video Test",
+        "input_type": "video_file",
+        "source_type": "video_file",
+        "video_paths": ["video.mp4"],
+        "output_dir": "output",
+        "process_every_n": 15,
+        "identity_clustering_config": {},
+        "reid_config": {},
+        "body_crops": [],
+        "face_crops": [],
+    })
+
+    start_response = client.post("/api/person/start", json={"name": "Video Test"})
+    job_id = start_response.get_json()["job_id"]
+    stop_response = client.post(f"/api/person/stop/{job_id}")
+
+    assert start_response.status_code == 200
+    with service._jobs_lock:
+        assert job_id not in service._job_runtimes
+    assert stop_response.status_code == 409
+    assert stop_response.get_json()["status"] == "not_live_camera"
+
+
+def test_runtime_cleanup_keeps_public_job_and_passes_event_to_graph(monkeypatch):
+    job_id = "cleanup-job"
+    runtime = service.JobRuntime()
+    captured = {}
+
+    class FakeGraph:
+        def stream(self, state, stream_mode):
+            captured.update(state)
+            assert stream_mode == "updates"
+            return iter(())
+
+    with service._jobs_lock:
+        service._jobs[job_id] = service.JobState(job_id, input_type="camera_uri")
+        service._job_runtimes[job_id] = runtime
+    monkeypatch.setattr(service, "_get_graph", lambda: FakeGraph())
+
+    service._run_pipeline(job_id, {"input_type": "camera_uri"})
+
+    assert captured["_stop_event"] is runtime.stop_event
+    with service._jobs_lock:
+        assert job_id in service._jobs
+        assert service._jobs[job_id].status == "done"
+        assert job_id not in service._job_runtimes
+
+
+def test_failed_pipeline_also_cleans_runtime(monkeypatch):
+    job_id = "failed-job"
+
+    class FailingGraph:
+        def stream(self, _state, stream_mode):
+            assert stream_mode == "updates"
+            raise RuntimeError("mock pipeline failure")
+
+    with service._jobs_lock:
+        service._jobs[job_id] = service.JobState(job_id, input_type="camera_uri")
+        service._job_runtimes[job_id] = service.JobRuntime()
+    monkeypatch.setattr(service, "_get_graph", lambda: FailingGraph())
+
+    service._run_pipeline(job_id, {"input_type": "camera_uri"})
+
+    with service._jobs_lock:
+        assert service._jobs[job_id].status == "error"
+        assert job_id not in service._job_runtimes
+
+
+def test_stop_response_and_log_do_not_expose_camera_uri(client, capsys):
+    camera_uri = "rtsp://supervisor:very-secret@camera.local/private/live"
+    job_id = _start_camera(client, camera_uri)
+    capsys.readouterr()
+
+    response = client.post(f"/api/person/stop/{job_id}")
+    output = capsys.readouterr().out
+    serialized = json.dumps(response.get_json())
+
+    assert camera_uri not in output
+    assert "very-secret" not in output
+    assert camera_uri not in serialized
+    assert "very-secret" not in serialized
+    assert job_id in output

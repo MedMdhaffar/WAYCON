@@ -13,7 +13,7 @@ from forensics.person_creation.service import build_initial_state
 
 
 RAW_URI = "rtsp://admin:secret@192.168.1.64:554/Streaming/Channels/101"
-MASKED_URI = "rtsp://admin:****@192.168.1.64:554/Streaming/Channels/101"
+MASKED_URI = "rtsp://****@192.168.1.64:554/Streaming/Channels/101"
 
 
 def main() -> None:

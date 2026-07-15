@@ -2,7 +2,11 @@ import json
 import numpy as np
 from pathlib import Path
 
-from forensics.person_creation.models.device import resolve_device
+from forensics.person_creation.models.device import (
+    is_cuda_device,
+    model_parameter_device,
+    resolve_device,
+)
 
 _PROMPTS_PATH = Path(__file__).parent.parent / "prompts" / "clothing.yaml"
 _INPUT_SIZE = 448
@@ -39,16 +43,24 @@ class ClothingDescriber:
         self._tokenizer = None
         self._device = "cpu"
         self._dtype = None
+        self._load_attempted = False
+
+    @property
+    def device(self) -> str:
+        if self._model is None:
+            return "unavailable" if self._load_attempted else "not_loaded"
+        return model_parameter_device(self._model, fallback=self._device)
 
     def load(self, model_id: str = "OpenGVLab/InternVL3_5-2B", device: str = "auto") -> None:
+        self._load_attempted = True
         import torch
         from transformers import AutoTokenizer, AutoModel
 
         self._device = resolve_device(device)
-        self._dtype = torch.bfloat16 if self._device == "cuda" else torch.float32
+        self._dtype = torch.bfloat16 if is_cuda_device(self._device) else torch.float32
         try:
             import flash_attn
-            use_flash = self._device == "cuda"
+            use_flash = is_cuda_device(self._device)
         except ImportError:
             use_flash = False
 
@@ -62,7 +74,7 @@ class ClothingDescriber:
             device_map=self._device,
             trust_remote_code=True,
         ).eval()
-        print(f"[ClothingDescriber] loaded {model_id} on {self._device}")
+        print(f"[ClothingDescriber] loaded {model_id} on {self.device}")
 
     def _preprocess(self, crop_bgr: np.ndarray):
         import torch

@@ -1,13 +1,18 @@
 import threading
 import numpy as np
 
-from forensics.person_creation.models.device import resolve_device
+from forensics.person_creation.models.device import model_parameter_device, resolve_device
 
 
 class PersonDetector:
     def __init__(self) -> None:
         self._model = None
+        self._device = "not_loaded"
         self._lock = threading.Lock()
+
+    @property
+    def device(self) -> str:
+        return model_parameter_device(self._model, fallback=self._device)
 
     def load(self, model_path: str, device: str = "auto") -> None:
         from ultralytics import YOLO
@@ -15,7 +20,7 @@ class PersonDetector:
         self._model = YOLO(model_path)
         self._model.to(device)
         self._device = device
-        print(f"[PersonDetector] loaded {model_path} on {device}")
+        print(f"[PersonDetector] loaded {model_path} on {self.device}")
 
     def detect(self, frame_bgr: np.ndarray) -> list[dict]:
         if self._model is None:

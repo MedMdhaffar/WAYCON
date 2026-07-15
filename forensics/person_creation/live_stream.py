@@ -28,10 +28,8 @@ def mask_camera_uri(uri: str) -> str:
         return "<invalid-camera-uri>"
     masked_netloc = parts.netloc
     if "@" in parts.netloc:
-        userinfo, hostinfo = parts.netloc.rsplit("@", 1)
-        if ":" in userinfo:
-            username = userinfo.split(":", 1)[0]
-            masked_netloc = f"{username}:****@{hostinfo}"
+        _userinfo, hostinfo = parts.netloc.rsplit("@", 1)
+        masked_netloc = f"****@{hostinfo}"
 
     query = parts.query
     pairs = parse_qsl(query, keep_blank_values=True)
@@ -70,11 +68,21 @@ class LiveFrameBuffer:
         max_size: int = 30,
         open_timeout_ms: int = 10_000,
         read_timeout_ms: int = 5_000,
+        shutdown_timeout_seconds: float | None = None,
     ) -> None:
         self.uri = uri
         self.max_size = max(1, int(max_size))
         self.open_timeout_ms = max(1, int(open_timeout_ms))
         self.read_timeout_ms = max(1, int(read_timeout_ms))
+        default_shutdown_timeout = (self.read_timeout_ms / 1000.0) + 1.0
+        self.shutdown_timeout_seconds = max(
+            0.01,
+            float(
+                default_shutdown_timeout
+                if shutdown_timeout_seconds is None
+                else shutdown_timeout_seconds
+            ),
+        )
         self.frames_read = 0
         self.frames_dropped = 0
         self.first_frame_time: str | None = None
@@ -84,8 +92,13 @@ class LiveFrameBuffer:
         self.ended = False
         self._queue: queue.Queue[BufferedFrame] = queue.Queue(maxsize=self.max_size)
         self._stop_event = threading.Event()
+        self._open_complete = threading.Event()
+        self._reader_stopped = threading.Event()
+        self._state_lock = threading.Lock()
+        self._stop_lock = threading.Lock()
         self._thread: threading.Thread | None = None
         self._cap = None
+        self._started = False
 
     def _open_capture(self):
         source = capture_source_from_uri(self.uri)
@@ -102,28 +115,50 @@ class LiveFrameBuffer:
         return cv2.VideoCapture(source)
 
     def start(self) -> None:
-        self._cap = self._open_capture()
-        if not self._cap.isOpened():
-            self._cap.release()
-            self._cap = None
-            raise OSError(
-                "Could not open camera stream. Check URI, network, credentials, "
-                "or FFmpeg/OpenCV support."
+        with self._state_lock:
+            if self._started:
+                raise RuntimeError("Live frame buffer has already been started.")
+            if self._stop_event.is_set():
+                return
+            self._started = True
+            self._thread = threading.Thread(
+                target=self._reader_loop,
+                name="person-creation-live-reader",
+                daemon=True,
             )
-        self.stream_opened = True
-        self._thread = threading.Thread(
-            target=self._reader_loop,
-            name="person-creation-live-reader",
-            daemon=True,
-        )
-        self._thread.start()
+            thread = self._thread
+        thread.start()
+
+        # Opening belongs to the reader, but preserve the previous synchronous
+        # startup error when the backend completes within its configured bound.
+        self._open_complete.wait(timeout=(self.open_timeout_ms / 1000.0) + 1.0)
+        if self.error and not self.stream_opened:
+            raise OSError(self.error)
 
     def _reader_loop(self) -> None:
+        capture = None
         try:
+            if self._stop_event.is_set():
+                return
+            capture = self._open_capture()
+            with self._state_lock:
+                self._cap = capture
+            if self._stop_event.is_set():
+                return
+            if not capture.isOpened():
+                self.error = (
+                    "Could not open camera stream. Check URI, network, credentials, "
+                    "or FFmpeg/OpenCV support."
+                )
+                return
+            self.stream_opened = True
+            self._open_complete.set()
+
             while not self._stop_event.is_set():
-                ok, frame = self._cap.read()
+                ok, frame = capture.read()
+                if self._stop_event.is_set():
+                    break
                 if not ok:
-                    self.ended = True
                     break
                 timestamp = utc_now_iso()
                 frame_idx = self.frames_read
@@ -144,10 +179,23 @@ class LiveFrameBuffer:
                     self.frames_dropped += 1
         except Exception:
             self.error = "Camera stream stopped while reading frames."
-            self.ended = True
         finally:
-            if self._cap is not None:
-                self._cap.release()
+            self._open_complete.set()
+            print("[LiveFrameBuffer] reader loop exiting", flush=True)
+            if capture is not None:
+                print("[LiveFrameBuffer] releasing capture", flush=True)
+                try:
+                    capture.release()
+                except Exception:
+                    self.error = self.error or "Camera stream cleanup failed."
+                    print("[LiveFrameBuffer] capture release failed", flush=True)
+                else:
+                    print("[LiveFrameBuffer] capture released", flush=True)
+            with self._state_lock:
+                if self._cap is capture:
+                    self._cap = None
+            self.ended = True
+            self._reader_stopped.set()
 
     def get(self, timeout: float = 1.0) -> BufferedFrame | None:
         try:
@@ -160,11 +208,30 @@ class LiveFrameBuffer:
         return self._queue.empty()
 
     def stop(self) -> None:
-        self._stop_event.set()
-        if self._cap is not None:
-            self._cap.release()
-        if self._thread is not None:
-            self._thread.join(timeout=2.0)
+        with self._stop_lock:
+            print("[LiveFrameBuffer] stop requested", flush=True)
+            self._stop_event.set()
+            with self._state_lock:
+                thread = self._thread
+
+            if thread is None or thread is threading.current_thread():
+                return
+
+            print("[LiveFrameBuffer] waiting for reader thread", flush=True)
+            thread.join(timeout=self.shutdown_timeout_seconds)
+            if thread.is_alive():
+                print(
+                    "[LiveFrameBuffer] warning: reader thread did not stop within "
+                    f"{self.shutdown_timeout_seconds:.2f}s; capture remains owned "
+                    "by the reader",
+                    flush=True,
+                )
+                return
+
+            print("[LiveFrameBuffer] reader joined", flush=True)
+            with self._state_lock:
+                if self._thread is thread:
+                    self._thread = None
 
     def stats(self, frames_processed: int, warnings: list[str] | None = None) -> dict:
         return {

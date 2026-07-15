@@ -13,7 +13,7 @@ from typing import Iterable
 import cv2
 import numpy as np
 
-from forensics.person_creation.models.device import resolve_device
+from forensics.person_creation.models.device import model_parameter_device, resolve_device
 
 DEFAULT_REID_CONFIG = {
     "model": "osnet_x0_25",
@@ -55,6 +55,12 @@ class ReidExtractor:
     def is_available(self) -> bool:
         return self._model is not None and self._transform is not None
 
+    @property
+    def device(self) -> str:
+        if not self.is_available():
+            return "unavailable" if self._load_attempted else "not_loaded"
+        return model_parameter_device(self._model, fallback=self._device)
+
     def load(self, device: str = "auto") -> None:
         with self._lock:
             if self._load_attempted:
@@ -81,7 +87,7 @@ class ReidExtractor:
                     transforms.Normalize(mean=_IMAGENET_MEAN, std=_IMAGENET_STD),
                 ])
                 print(
-                    f"[ReidExtractor] {self.config['model']} loaded on {self._device} "
+                    f"[ReidExtractor] {self.config['model']} loaded on {self.device} "
                     f"({self.config['weights']})"
                 )
             except Exception as exc:  # pragma: no cover - optional dependency

@@ -1,4 +1,5 @@
 import json
+import os
 import shutil
 from pathlib import Path
 
@@ -124,6 +125,7 @@ def _session_report(state: dict, profiles_written: int) -> dict:
         "profiles_written": profiles_written,
         "total_face_crops": state.get("total_quality_face_crops", len(state.get("quality_face_crops", []))),
         "total_body_crops": state.get("total_quality_body_crops", len(state.get("quality_body_crops", []))),
+        "face_rejection_counts": state.get("face_rejection_counts", {}),
         "identity_clusters_found": len(clusters),
         "low_confidence_clusters": len(low_confidence),
         "unresolved_faces": len(state.get("unresolved_faces", [])),
@@ -140,6 +142,32 @@ def _session_report(state: dict, profiles_written: int) -> dict:
             "stream_report_path": state.get("stream_report_path", ""),
         })
     return report
+
+
+def _keep_staging_on_empty_faces(state: dict) -> bool:
+    return (
+        os.environ.get("PERSON_CREATION_KEEP_STAGING_ON_EMPTY_FACES") == "1"
+        and len(state.get("face_crops") or []) > 0
+        and state.get(
+            "total_quality_face_crops",
+            len(state.get("quality_face_crops") or []),
+        ) == 0
+    )
+
+
+def _cleanup_staging(state: dict, staging: Path) -> None:
+    print("[finalize] cleanup entered", flush=True)
+    try:
+        if staging.exists() and _keep_staging_on_empty_faces(state):
+            print(
+                "[finalize] preserving staging tree because detected faces were "
+                "all rejected by quality filtering"
+            )
+        elif staging.exists():
+            shutil.rmtree(staging, ignore_errors=True)
+            print(f"[finalize] removed staging tree: {staging}")
+    finally:
+        print("[finalize] cleanup completed", flush=True)
 
 
 def finalize(state: dict) -> dict:
@@ -235,9 +263,7 @@ def finalize(state: dict) -> dict:
     print(f"[finalize] session report saved")
 
     staging = output_dir / "_staging"
-    if staging.exists():
-        shutil.rmtree(staging, ignore_errors=True)
-        print(f"[finalize] removed staging tree: {staging}")
+    _cleanup_staging(state, staging)
 
     gm.close()
 

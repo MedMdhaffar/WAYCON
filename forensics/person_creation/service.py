@@ -3,6 +3,7 @@ import re
 import threading
 import traceback
 import uuid
+from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -148,16 +149,24 @@ def _allowed_profile_image(filename: str) -> bool:
 @dataclass
 class JobState:
     job_id: str
+    input_type: str = "video_file"
     status: str = "idle"
     # idle | loading_models | processing_video | filtering | embedding | clustering
     # | auto_pairing | selecting | computing_reid | describing | building_profile
-    # | finalizing | done | error
+    # | finalizing | stop_requested | stopping | done | error
     node: str = ""
     error: str | None = None
     snapshot: dict = field(default_factory=dict)
 
 
+@dataclass
+class JobRuntime:
+    stop_event: threading.Event = field(default_factory=threading.Event)
+
+
 _jobs: dict[str, JobState] = {}
+_job_runtimes: dict[str, JobRuntime] = {}
+_jobs_lock = threading.RLock()
 _graph = None
 _graph_lock = threading.Lock()
 
@@ -190,42 +199,70 @@ _NODE_TO_STATUS = {
 
 def _run_pipeline(job_id: str, initial_state: dict) -> None:
     """Run the graph start to end with no human interrupts."""
-    job = _jobs[job_id]
-    graph = _get_graph()
+    with _jobs_lock:
+        job = _jobs[job_id]
+        runtime = _job_runtimes.get(job_id)
 
     def update_live_status(status: str, snapshot_update: dict | None = None) -> None:
-        job.node = "process_live_stream"
-        job.status = status
-        if snapshot_update:
-            job.snapshot.update(snapshot_update)
+        with _jobs_lock:
+            job.node = "process_live_stream"
+            if runtime is None or not runtime.stop_event.is_set() or status == "stopping":
+                job.status = status
+            if snapshot_update:
+                job.snapshot.update(snapshot_update)
 
     if initial_state.get("input_type") == "camera_uri":
         initial_state["_status_callback"] = update_live_status
+        if runtime is not None:
+            initial_state["_stop_event"] = runtime.stop_event
 
     try:
+        graph = _get_graph()
         for event in graph.stream(initial_state, stream_mode="updates"):
             for node_name, update in event.items():
-                job.node = node_name
-                job.status = _NODE_TO_STATUS.get(node_name, node_name)
-                if isinstance(update, dict):
-                    job.snapshot.update(update)
+                with _jobs_lock:
+                    job.node = node_name
+                    if runtime is None or not runtime.stop_event.is_set():
+                        job.status = _NODE_TO_STATUS.get(node_name, node_name)
+                    if isinstance(update, dict):
+                        job.snapshot.update(update)
 
-        job.status = "done"
+        with _jobs_lock:
+            job.status = "done"
 
     except Exception:
-        job.status = "error"
         error = traceback.format_exc()
         raw_uri = initial_state.get("camera_uri")
         if raw_uri:
             error = error.replace(raw_uri, mask_camera_uri(raw_uri))
-        job.error = error
+        with _jobs_lock:
+            job.status = "error"
+            job.error = error
+    finally:
+        with _jobs_lock:
+            _job_runtimes.pop(job_id, None)
+
+
+def _start_pipeline_thread(job_id: str, initial_state: dict) -> None:
+    thread = threading.Thread(
+        target=_run_pipeline,
+        args=(job_id, initial_state),
+        daemon=True,
+    )
+    thread.start()
 
 
 # ─── Endpoints ────────────────────────────────────────────────────────────────
 
 @app.get("/api/health")
 def api_health():
-    return jsonify({"status": "ok", "service": "waycon-person-creation"})
+    from forensics.person_creation.models.device import get_device_status
+
+    return jsonify({
+        "status": "ok",
+        "service": "waycon-person-creation",
+        **get_device_status(),
+    })
 
 
 @app.post("/api/person/start")
@@ -246,21 +283,53 @@ def start():
         "duration_seconds": initial_state.get("duration_seconds"),
         "source_uri_masked": initial_state.get("source_uri_masked", ""),
     }
-    job = JobState(job_id=job_id, snapshot=safe_initial_snapshot)
-    _jobs[job_id] = job
+    job = JobState(
+        job_id=job_id,
+        input_type=initial_state.get("input_type", "video_file"),
+        snapshot=safe_initial_snapshot,
+    )
+    with _jobs_lock:
+        _jobs[job_id] = job
+        if job.input_type == "camera_uri":
+            _job_runtimes[job_id] = JobRuntime()
 
-    t = threading.Thread(target=_run_pipeline, args=(job_id, initial_state), daemon=True)
-    t.start()
+    _start_pipeline_thread(job_id, initial_state)
     return jsonify({"job_id": job_id})
+
+
+@app.post("/api/person/stop/<job_id>")
+def stop(job_id: str):
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if job is None:
+            return jsonify({"error": "job not found"}), 404
+        if job.status in {"done", "error"}:
+            return jsonify({"job_id": job_id, "status": "already_finished"})
+        if job.input_type != "camera_uri":
+            return jsonify({"job_id": job_id, "status": "not_live_camera"}), 409
+
+        runtime = _job_runtimes.get(job_id)
+        if runtime is None:
+            return jsonify({"job_id": job_id, "status": "stop_unavailable"}), 409
+        first_request = not runtime.stop_event.is_set()
+        runtime.stop_event.set()
+        job.status = "stop_requested"
+
+    if first_request:
+        print(f"[person_creation] stop requested job={job_id}")
+    return jsonify({"job_id": job_id, "status": "stop_requested"})
 
 
 @app.get("/api/person/status/<job_id>")
 def status(job_id: str):
-    job = _jobs.get(job_id)
-    if not job:
-        return jsonify({"error": "job not found"}), 404
-
-    snap = job.snapshot
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if not job:
+            return jsonify({"error": "job not found"}), 404
+        job_status = job.status
+        job_node = job.node
+        job_error = job.error
+        snap = deepcopy(job.snapshot)
     safe_snap = {
         "quality_body_crops":  snap.get("quality_body_crops", []),
         "quality_face_crops":  snap.get("quality_face_crops", []),
@@ -287,19 +356,27 @@ def status(job_id: str):
         "source_uri_masked":  snap.get("source_uri_masked", ""),
         "stream_stats":       snap.get("stream_stats", {}),
         "stream_report_path": snap.get("stream_report_path", ""),
+        "chunk_index":        snap.get("chunk_index"),
+        "completed_chunks":   snap.get("completed_chunks", 0),
+        "last_chunk":         snap.get("last_chunk"),
+        "session_totals":     snap.get("session_totals", {}),
+        "stop_requested":     snap.get("stop_requested", False),
+        "continuous":         snap.get("continuous", False),
+        "duration_seconds_per_chunk": snap.get("duration_seconds_per_chunk"),
     }
     return jsonify({
         "job_id":   job_id,
-        "status":   job.status,
-        "node":     job.node,
-        "error":    job.error,
+        "status":   job_status,
+        "node":     job_node,
+        "error":    job_error,
         "snapshot": safe_snap,
     })
 
 
 @app.delete("/api/person/crop/<job_id>")
 def delete_crop(job_id: str):
-    job = _jobs.get(job_id)
+    with _jobs_lock:
+        job = _jobs.get(job_id)
     if not job:
         return jsonify({"error": "job not found"}), 404
 
@@ -309,29 +386,31 @@ def delete_crop(job_id: str):
 
     Path(path_str).resolve().unlink(missing_ok=True)
 
-    snap = job.snapshot
-    if crop_type == "body":
-        snap["quality_body_crops"] = [c for c in snap.get("quality_body_crops", []) if c["path"] != path_str]
-        snap["associations"]       = [a for a in snap.get("associations", []) if a.get("body_path") != path_str]
-        snap["best_body_crops"]    = [p for p in snap.get("best_body_crops", []) if p != path_str]
-        # Remove from frame_groups
-        for fg in snap.get("frame_groups", []):
-            fg["bodies"] = [b for b in fg.get("bodies", []) if b["path"] != path_str]
-    else:
-        snap["quality_face_crops"] = [c for c in snap.get("quality_face_crops", []) if c["path"] != path_str]
-        snap["associations"]       = [a for a in snap.get("associations", []) if a.get("face_path") != path_str]
-        for fg in snap.get("frame_groups", []):
-            fg["faces"] = [f for f in fg.get("faces", []) if f["path"] != path_str]
+    with _jobs_lock:
+        snap = job.snapshot
+        if crop_type == "body":
+            snap["quality_body_crops"] = [c for c in snap.get("quality_body_crops", []) if c["path"] != path_str]
+            snap["associations"]       = [a for a in snap.get("associations", []) if a.get("body_path") != path_str]
+            snap["best_body_crops"]    = [p for p in snap.get("best_body_crops", []) if p != path_str]
+            # Remove from frame_groups
+            for fg in snap.get("frame_groups", []):
+                fg["bodies"] = [b for b in fg.get("bodies", []) if b["path"] != path_str]
+        else:
+            snap["quality_face_crops"] = [c for c in snap.get("quality_face_crops", []) if c["path"] != path_str]
+            snap["associations"]       = [a for a in snap.get("associations", []) if a.get("face_path") != path_str]
+            for fg in snap.get("frame_groups", []):
+                fg["faces"] = [f for f in fg.get("faces", []) if f["path"] != path_str]
 
     return jsonify({"ok": True})
 
 
 @app.get("/api/person/crops/<job_id>")
 def crops(job_id: str):
-    job = _jobs.get(job_id)
-    if not job:
-        return jsonify({"error": "job not found"}), 404
-    snap = job.snapshot
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if not job:
+            return jsonify({"error": "job not found"}), 404
+        snap = deepcopy(job.snapshot)
     return jsonify({
         "body_crops": snap.get("quality_body_crops", []),
         "face_crops": snap.get("quality_face_crops", []),
