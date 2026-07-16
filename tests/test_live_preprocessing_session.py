@@ -209,6 +209,25 @@ def test_empty_chunk_is_processed_once():
     assert session.public_snapshot()["preprocessing_completed_chunks"] == 1
 
 
+def test_phase_one_only_mode_creates_no_rolling_frozen_evidence():
+    session = LivePreprocessingSession(
+        base_state={}, preprocess=lambda *, chunk, **_kwargs: _result(chunk)
+    )
+    session.start()
+    session.submit_chunk(_chunk(0))
+    session.finish()
+
+    assert session.rolling_analysis_enabled is False
+    assert session._frozen_identity_config is None
+    assert session._analysis_quality_body_chunks == ()
+    assert session._analysis_quality_face_chunks == ()
+    assert session._analysis_embedding_chunks == ()
+    assert session._analysis_membership_chunks == ()
+    assert session._analysis_membership_paths == set()
+    with pytest.raises(LivePreprocessingSessionError, match="evidence is disabled"):
+        session.analysis_snapshot()
+
+
 def test_worker_failure_unblocks_full_queue_and_requests_stop():
     entered = threading.Event()
     fail_now = threading.Event()

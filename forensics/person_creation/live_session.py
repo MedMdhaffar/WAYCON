@@ -7,7 +7,10 @@ import re
 import threading
 import time
 from copy import deepcopy
+from dataclasses import dataclass
 from typing import Any, Callable, Mapping, TYPE_CHECKING
+
+import numpy as np
 
 from forensics.person_creation.live_chunk_processing import (
     PreprocessedLiveChunk,
@@ -20,6 +23,7 @@ if TYPE_CHECKING:
 
 PreviewCallback = Callable[[dict], Any]
 StopCallback = Callable[[], Any]
+VersionCallback = Callable[[int], Any]
 _CAMERA_URI_RE = re.compile(r"rtsps?://\S+", re.IGNORECASE)
 _SENTINEL = object()
 
@@ -30,6 +34,74 @@ class LivePreprocessingSessionError(RuntimeError):
 
 def _safe_message(value: Any) -> str:
     return _CAMERA_URI_RE.sub("<camera-source>", str(value))
+
+
+def _freeze_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return FrozenRecord.from_mapping(value)
+    if isinstance(value, np.ndarray):
+        return tuple(_freeze_value(item) for item in value.tolist())
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_value(item) for item in value)
+    if isinstance(value, str):
+        return _safe_message(value)
+    return value
+
+
+def _thaw_value(value: Any) -> Any:
+    if isinstance(value, FrozenRecord):
+        return value.to_dict()
+    if isinstance(value, tuple):
+        return [_thaw_value(item) for item in value]
+    return value
+
+
+@dataclass(frozen=True)
+class FrozenRecord:
+    """Recursively immutable analysis record frozen once at accumulation."""
+
+    items: tuple[tuple[str, Any], ...]
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> FrozenRecord:
+        return cls(tuple(
+            (str(key), _freeze_value(item))
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+        ))
+
+    def to_dict(self) -> dict:
+        return {key: _thaw_value(value) for key, value in self.items}
+
+    def get(self, key: str, default: Any = None) -> Any:
+        for item_key, value in self.items:
+            if item_key == key:
+                return value
+        return default
+
+
+@dataclass(frozen=True)
+class FrozenAnalysisSnapshot:
+    version: int
+    last_completed_preprocessing_chunk: int | None
+    person_name: str
+    video_paths: tuple[str, ...]
+    identity_clustering_config: FrozenRecord
+    quality_body_crops: tuple[FrozenRecord, ...]
+    quality_face_crops: tuple[FrozenRecord, ...]
+    face_embeddings: tuple[FrozenRecord, ...]
+    face_chunk_membership: tuple[tuple[str, int], ...]
+
+    def mutable_node_state(self) -> dict:
+        return {
+            "person_name": self.person_name,
+            "video_paths": list(self.video_paths),
+            "identity_clustering_config": self.identity_clustering_config.to_dict(),
+            "quality_body_crops": [item.to_dict() for item in self.quality_body_crops],
+            "quality_face_crops": [item.to_dict() for item in self.quality_face_crops],
+            "all_face_embeddings": [item.to_dict() for item in self.face_embeddings],
+        }
 
 
 class LivePreprocessingSession:
@@ -43,6 +115,8 @@ class LivePreprocessingSession:
         join_timeout_seconds: float = 120.0,
         notify: PreviewCallback | None = None,
         request_stop: StopCallback | None = None,
+        on_accumulator_advanced: VersionCallback | None = None,
+        rolling_analysis: bool = False,
         preprocess: Callable[..., PreprocessedLiveChunk] | None = None,
         queue_retry_seconds: float = 0.05,
     ) -> None:
@@ -50,9 +124,17 @@ class LivePreprocessingSession:
         self.join_timeout_seconds = max(0.01, float(join_timeout_seconds))
         self._base_state = {
             "person_name": str(base_state.get("person_name") or ""),
+            "video_paths": tuple(
+                _safe_message(item) for item in base_state.get("video_paths", [])
+            ),
+            "identity_clustering_config": dict(
+                base_state.get("identity_clustering_config") or {}
+            ),
         }
         self._notify_callback = notify
         self._request_stop = request_stop
+        self._on_accumulator_advanced = on_accumulator_advanced
+        self._rolling_analysis = bool(rolling_analysis)
         self._preprocess = preprocess or preprocess_live_chunk
         self._queue_retry_seconds = max(0.01, float(queue_retry_seconds))
         self._queue: queue.Queue[Any] = queue.Queue(maxsize=self.queue_capacity)
@@ -70,6 +152,17 @@ class LivePreprocessingSession:
         self._quality_face_crops: list[dict] = []
         self._face_embeddings: list[dict] = []
         self._failed_face_embeddings: list[dict] = []
+        self._frozen_identity_config = (
+            FrozenRecord.from_mapping(self._base_state["identity_clustering_config"])
+            if self._rolling_analysis
+            else None
+        )
+        self._analysis_quality_body_chunks: tuple[tuple[FrozenRecord, ...], ...] = ()
+        self._analysis_quality_face_chunks: tuple[tuple[FrozenRecord, ...], ...] = ()
+        self._analysis_embedding_chunks: tuple[tuple[FrozenRecord, ...], ...] = ()
+        self._analysis_membership_chunks: tuple[tuple[tuple[str, int], ...], ...] = ()
+        self._analysis_membership_paths: set[str] = set()
+        self._accumulator_version = 0
         self._capture_completed_chunk_indices: list[int] = []
         self._preprocessing_completed_chunk_indices: list[int] = []
         self._active_preprocessing_chunk: int | None = None
@@ -176,6 +269,7 @@ class LivePreprocessingSession:
                 "quality_face_crops": len(self._quality_face_crops),
                 "embedded_faces": len(self._face_embeddings),
                 "failed_face_embeddings": len(self._failed_face_embeddings),
+                "accumulator_version": self._accumulator_version,
                 "warnings": list(self._warnings),
                 "worker_failed": self._failure_event.is_set(),
                 "worker_error": deepcopy(self._worker_error),
@@ -200,7 +294,54 @@ class LivePreprocessingSession:
                 "warnings": list(self._warnings),
                 "worker_error": deepcopy(self._worker_error),
                 "embedded_face_count": len(self._face_embeddings),
+                "accumulator_version": self._accumulator_version,
             }
+
+    @property
+    def accumulator_version(self) -> int:
+        with self._lock:
+            return self._accumulator_version
+
+    @property
+    def rolling_analysis_enabled(self) -> bool:
+        return self._rolling_analysis
+
+    def analysis_snapshot(self) -> FrozenAnalysisSnapshot:
+        """Capture immutable chunk references, then flatten outside the lock."""
+        if not self._rolling_analysis:
+            raise LivePreprocessingSessionError(
+                "Rolling analysis evidence is disabled for this preprocessing session."
+            )
+        with self._lock:
+            last_chunk = (
+                self._preprocessing_completed_chunk_indices[-1]
+                if self._preprocessing_completed_chunk_indices
+                else None
+            )
+            version = self._accumulator_version
+            body_chunks = self._analysis_quality_body_chunks
+            face_chunks = self._analysis_quality_face_chunks
+            embedding_chunks = self._analysis_embedding_chunks
+            membership_chunks = self._analysis_membership_chunks
+        return FrozenAnalysisSnapshot(
+            version=version,
+            last_completed_preprocessing_chunk=last_chunk,
+            person_name=self._base_state["person_name"],
+            video_paths=self._base_state["video_paths"],
+            identity_clustering_config=self._frozen_identity_config,
+            quality_body_crops=tuple(
+                record for chunk in body_chunks for record in chunk
+            ),
+            quality_face_crops=tuple(
+                record for chunk in face_chunks for record in chunk
+            ),
+            face_embeddings=tuple(
+                record for chunk in embedding_chunks for record in chunk
+            ),
+            face_chunk_membership=tuple(
+                membership for chunk in membership_chunks for membership in chunk
+            ),
+        )
 
     def _worker_loop(self) -> None:
         while True:
@@ -220,6 +361,22 @@ class LivePreprocessingSession:
                     base_state=self._base_state,
                     notify=None,
                 )
+                frozen_body: tuple[FrozenRecord, ...] = ()
+                frozen_face: tuple[FrozenRecord, ...] = ()
+                frozen_embeddings: tuple[FrozenRecord, ...] = ()
+                if self._rolling_analysis:
+                    frozen_body = tuple(
+                        FrozenRecord.from_mapping(record)
+                        for record in result.quality_body_crops
+                    )
+                    frozen_face = tuple(
+                        FrozenRecord.from_mapping(record)
+                        for record in result.quality_face_crops
+                    )
+                    frozen_embeddings = tuple(
+                        FrozenRecord.from_mapping(record)
+                        for record in result.face_embeddings
+                    )
                 with self._lock:
                     if chunk_index in self._preprocessing_completed_chunk_indices:
                         raise ValueError(
@@ -235,11 +392,34 @@ class LivePreprocessingSession:
                     self._failed_face_embeddings.extend(
                         deepcopy(result.failed_face_embeddings)
                     )
+                    if self._rolling_analysis:
+                        self._analysis_quality_body_chunks += (frozen_body,)
+                        self._analysis_quality_face_chunks += (frozen_face,)
+                        self._analysis_embedding_chunks += (frozen_embeddings,)
+                        membership_chunk = []
+                        for record in frozen_embeddings:
+                            crop_path = record.get("crop_path")
+                            path = str(crop_path) if crop_path else ""
+                            if path and path not in self._analysis_membership_paths:
+                                self._analysis_membership_paths.add(path)
+                                membership_chunk.append((path, chunk_index))
+                        self._analysis_membership_chunks += (tuple(membership_chunk),)
                     self._warnings.extend(
                         _safe_message(warning) for warning in result.warnings
                     )
                     self._preprocessing_completed_chunk_indices.append(chunk_index)
+                    self._accumulator_version += 1
+                    accumulator_version = self._accumulator_version
                     self._active_preprocessing_chunk = None
+                if self._on_accumulator_advanced is not None:
+                    try:
+                        self._on_accumulator_advanced(accumulator_version)
+                    except Exception as exc:
+                        warning = _safe_message(
+                            f"Rolling analysis request failed: {exc}"
+                        )
+                        with self._lock:
+                            self._warnings.append(warning)
                 self._publish()
             except Exception as exc:
                 chunk_index = (

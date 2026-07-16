@@ -68,3 +68,148 @@ body {
 .btn-ghost { background: #1e2330; color: #e2e8f0; }
 .btn-ghost:hover:not(:disabled) { background: #252b3b; }
 .btn-danger { background: #ef4444; color: #fff; }
+
+.live-identity-panel { overflow: hidden; }
+.live-identity-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 14px;
+}
+.live-identity-heading .card-title { margin-bottom: 4px; }
+.live-identity-heading p { color: #64748b; font-size: 13px; }
+.live-analysis-indicator,
+.live-identity-status {
+  display: inline-flex;
+  align-items: center;
+  width: fit-content;
+  border: 1px solid #31568a;
+  border-radius: 999px;
+  padding: 3px 8px;
+  color: #9dbbf4;
+  background: #14233a;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: capitalize;
+}
+.live-analysis-notice {
+  margin-bottom: 12px;
+  border: 1px solid #31568a;
+  border-radius: 6px;
+  padding: 9px 11px;
+  background: #14233a;
+  color: #b8cdf5;
+  font-size: 13px;
+}
+.live-analysis-notice.is-warning { border-color: #8a641c; background: #2a2111; color: #f6c96c; }
+.live-analysis-notice.is-error,
+.job-error-banner { border-color: #8b2f3c; background: #2a151a; color: #f7a8b2; }
+.job-error-banner { white-space: pre-wrap; font-size: 13px; }
+.live-identity-summary {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(125px, 1fr));
+  gap: 8px;
+  margin-bottom: 16px;
+}
+.live-identity-summary-metric {
+  min-width: 0;
+  border: 1px solid #1e2330;
+  border-radius: 6px;
+  padding: 9px 10px;
+  background: #0f1117;
+}
+.live-identity-summary-metric span {
+  display: block;
+  color: #64748b;
+  font-size: 11px;
+  margin-bottom: 3px;
+}
+.live-identity-summary-metric strong {
+  display: block;
+  color: #e2e8f0;
+  font-size: 15px;
+  overflow-wrap: anywhere;
+}
+.live-identity-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 290px), 1fr));
+  gap: 12px;
+}
+.live-identity-card {
+  display: grid;
+  grid-template-columns: 112px minmax(0, 1fr);
+  min-width: 0;
+  min-height: 150px;
+  overflow: hidden;
+  border: 1px solid #2a6047;
+  border-radius: 8px;
+  background: #101821;
+}
+.live-identity-card.is-unknown { border-color: #596273; border-style: dashed; }
+.live-identity-image,
+.live-identity-image-placeholder {
+  width: 112px;
+  height: 100%;
+  min-height: 150px;
+  display: block;
+}
+.live-identity-image { object-fit: cover; background: #0b0d12; }
+.live-identity-image-placeholder {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 12px;
+  background: #181c25;
+  color: #64748b;
+  font-size: 11px;
+  text-align: center;
+}
+.live-identity-card-body { min-width: 0; padding: 12px; }
+.live-identity-kind { color: #73d6a3; font-size: 11px; font-weight: 700; text-transform: uppercase; }
+.is-unknown .live-identity-kind { color: #bac2cf; }
+.live-identity-card h3 {
+  margin: 3px 0 2px;
+  color: #f1f5f9;
+  font-size: 17px;
+  overflow-wrap: anywhere;
+}
+.live-identity-similarity { color: #73d6a3; font-size: 12px; font-weight: 600; }
+.live-identity-id { margin-top: 5px; color: #8792a5; font: 12px ui-monospace, SFMono-Regular, Consolas, monospace; }
+.live-identity-evidence { display: grid; gap: 2px; margin: 9px 0; color: #a6b0bf; font-size: 12px; }
+.live-identity-empty {
+  padding: 22px 12px;
+  border: 1px dashed #303747;
+  border-radius: 6px;
+  color: #7b8799;
+  text-align: center;
+  font-size: 13px;
+}
+.live-events { margin-top: 18px; border-top: 1px solid #252b38; padding-top: 14px; }
+.live-events h3 { margin-bottom: 8px; color: #94a3b8; font-size: 12px; text-transform: uppercase; }
+.live-events ol { display: grid; gap: 5px; list-style: none; }
+.live-events li {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+  border-bottom: 1px solid #1b202b;
+  padding: 6px 0;
+  color: #cbd5e1;
+  font-size: 13px;
+}
+.live-events small { color: #6f7b8f; overflow-wrap: anywhere; text-align: right; }
+
+@media (max-width: 640px) {
+  .header { align-items: flex-start; flex-wrap: wrap; padding: 14px 16px; }
+  .tabs { padding: 0 8px; overflow-x: auto; }
+  .tab-btn { flex: 0 0 auto; padding: 11px 12px; }
+  .tab-content { padding: 14px; }
+  .card { padding: 14px; }
+  .live-identity-card { grid-template-columns: 88px minmax(0, 1fr); }
+  .live-identity-image,
+  .live-identity-image-placeholder { width: 88px; min-height: 160px; }
+  .live-events li { align-items: flex-start; flex-direction: column; gap: 2px; }
+  .live-events small { text-align: left; }
+}

@@ -22,6 +22,10 @@ from forensics.person_creation.nodes.process_video import (
 from forensics.person_creation.state import PersonCreationState
 
 
+_FRAME_GAP_WARNING_PREFIX = "No camera frames arrived for "
+_EMPTY_CHUNK_WARNING = "Chunk captured no frames; continuing."
+
+
 @dataclass
 class LiveChunkResult:
     chunk_index: int
@@ -37,6 +41,7 @@ class LiveChunkResult:
     body_detection_count: int
     face_detection_count: int
     warnings: list[str]
+    frame_gap_active: bool = False
 
     def report_metrics(self) -> dict:
         return {
@@ -50,6 +55,7 @@ class LiveChunkResult:
             "frames_dropped": self.frames_dropped,
             "body_detections": self.body_detection_count,
             "face_detections": self.face_detection_count,
+            "frame_gap_active": self.frame_gap_active,
             "warnings": list(self.warnings),
         }
 
@@ -75,6 +81,13 @@ def live_overlap_enabled() -> bool:
         "yes",
         "on",
     }
+
+
+def live_rolling_analysis_enabled() -> bool:
+    return os.getenv(
+        "PERSON_CREATION_LIVE_ROLLING_ANALYSIS",
+        "0",
+    ).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def capture_live_chunk(
@@ -111,6 +124,7 @@ def capture_live_chunk(
     body_crops: list[dict] = []
     face_crops: list[dict] = []
     warnings: list[str] = []
+    frame_gap_active = False
 
     while not _stop_requested(stop_event):
         now = monotonic()
@@ -123,26 +137,43 @@ def capture_live_chunk(
         if item is not None and now - started_at >= duration_seconds:
             break
         if item is None:
+            if notify is not None:
+                notify("processing_live_frames", {
+                    "stream_stats": {
+                        **buffer.stats(frames_processed, warnings=warnings),
+                        "duration_seconds": duration_seconds,
+                    },
+                })
             if buffer.error:
                 raise OSError(buffer.error)
             if _stop_requested(stop_event):
                 break
             if buffer.ended and buffer.empty:
-                if buffer.frames_read == 0:
-                    raise OSError(
-                        "Camera stream opened but no frames arrived. Check the stream codec and permissions."
-                    )
-                break
-            if now - last_frame_at >= frame_timeout_seconds:
+                raise OSError("Live camera reader stopped unexpectedly.")
+            if (
+                now - last_frame_at >= frame_timeout_seconds
+                and not frame_gap_active
+            ):
                 message = (
                     f"No camera frames arrived for {frame_timeout_seconds:g} seconds; "
-                    "ending capture early."
+                    "the live reader remains active."
                 )
+                warnings = [
+                    warning
+                    for warning in warnings
+                    if not warning.startswith(_FRAME_GAP_WARNING_PREFIX)
+                ]
                 warnings.append(message)
-                break
+                frame_gap_active = True
             continue
 
         last_frame_at = now
+        frame_gap_active = False
+        warnings = [
+            warning
+            for warning in warnings
+            if not warning.startswith(_FRAME_GAP_WARNING_PREFIX)
+        ]
         if _stop_requested(stop_event):
             break
         if item.frame_idx % every_n != 0:
@@ -197,6 +228,7 @@ def capture_live_chunk(
         body_detection_count=len(body_crops),
         face_detection_count=len(face_crops),
         warnings=warnings,
+        frame_gap_active=frame_gap_active,
     )
 
 
@@ -210,6 +242,12 @@ def process_live_stream(state: PersonCreationState) -> dict:
     every_n = max(1, int(state.get("process_every_n", 5)))
     config = dict(state.get("live_stream_config") or {})
     overlap_enabled = live_overlap_enabled()
+    rolling_enabled = live_rolling_analysis_enabled()
+    if rolling_enabled and not overlap_enabled:
+        raise ValueError(
+            "PERSON_CREATION_LIVE_ROLLING_ANALYSIS requires "
+            "PERSON_CREATION_LIVE_OVERLAP=1."
+        )
     buffer_max_size = max(1, min(int(config.get("buffer_max_size", 30)), 300))
     frame_timeout_seconds = max(1.0, float(config.get("frame_timeout_seconds", 5.0)))
     masked_uri = mask_camera_uri(camera_uri)
@@ -224,6 +262,18 @@ def process_live_stream(state: PersonCreationState) -> dict:
         open_timeout_ms=int(config.get("open_timeout_ms", 10_000)),
         read_timeout_ms=int(config.get("read_timeout_ms", 5_000)),
         shutdown_timeout_seconds=config.get("shutdown_timeout_seconds"),
+        reconnect_initial_delay_seconds=float(
+            config.get("reconnect_initial_delay_seconds", 0.5)
+        ),
+        reconnect_max_delay_seconds=float(
+            config.get("reconnect_max_delay_seconds", 5.0)
+        ),
+        reconnect_backoff_multiplier=float(
+            config.get("reconnect_backoff_multiplier", 2.0)
+        ),
+        startup_max_attempts=int(config.get("startup_max_attempts", 3)),
+        startup_timeout_seconds=config.get("startup_timeout_seconds"),
+        maximum_outage_seconds=config.get("maximum_outage_seconds"),
     )
     stop_event = state.get("_stop_event")
     if overlap_enabled and stop_event is None:
@@ -231,6 +281,9 @@ def process_live_stream(state: PersonCreationState) -> dict:
     preprocessing_session = None
     preprocessing_started = False
     final_preprocessing_snapshot = None
+    analysis_session = None
+    analysis_started = False
+    final_analysis_snapshot = None
     if overlap_enabled:
         from forensics.person_creation.live_session import LivePreprocessingSession
 
@@ -248,19 +301,47 @@ def process_live_stream(state: PersonCreationState) -> dict:
                 "live_preprocessing": snapshot,
             })
 
+        def request_analysis(version: int) -> None:
+            if analysis_session is not None:
+                analysis_session.request_version(version)
+
         preprocessing_session = LivePreprocessingSession(
             base_state=state,
             queue_capacity=queue_capacity,
             join_timeout_seconds=join_timeout,
             notify=publish_preprocessing,
             request_stop=stop_event.set,
+            on_accumulator_advanced=request_analysis if rolling_enabled else None,
+            rolling_analysis=rolling_enabled,
         )
+        if rolling_enabled:
+            from forensics.person_creation.live_analysis import (
+                LiveRollingAnalysisSession,
+            )
+
+            analysis_join_timeout = max(
+                0.01,
+                float(config.get("analysis_join_timeout_seconds", 120.0)),
+            )
+
+            def publish_analysis(snapshot: dict) -> None:
+                _notify(state, "processing_live_frames", {
+                    "rolling_analysis": snapshot,
+                })
+
+            analysis_session = LiveRollingAnalysisSession(
+                snapshot_provider=preprocessing_session.analysis_snapshot,
+                notify=publish_analysis,
+                join_timeout_seconds=analysis_join_timeout,
+            )
     # Evidence is intentionally not pruned here; long sessions can create many
     # crop files in _staging before the unchanged downstream graph runs once.
     body_crops: list[dict] = []
     face_crops: list[dict] = []
     chunk_summaries: list[dict] = []
     warnings: list[str] = []
+    active_frame_gap_warning: str | None = None
+    consecutive_empty_chunks = 0
     totals = {
         "frames_read": 0,
         "frames_processed": 0,
@@ -273,6 +354,9 @@ def process_live_stream(state: PersonCreationState) -> dict:
     try:
         _notify(state, "connecting_camera")
         buffer.start()
+        if analysis_session is not None:
+            analysis_session.start()
+            analysis_started = True
         if preprocessing_session is not None:
             preprocessing_session.start()
             preprocessing_started = True
@@ -283,10 +367,16 @@ def process_live_stream(state: PersonCreationState) -> dict:
                 **({
                     "live_preprocessing": preprocessing_session.public_snapshot(),
                 } if preprocessing_session is not None else {}),
+                **({
+                    "rolling_analysis": analysis_session.public_snapshot(),
+                } if analysis_session is not None else {}),
             },
             **({
                 "live_preprocessing": preprocessing_session.public_snapshot(),
             } if preprocessing_session is not None else {}),
+            **({
+                "rolling_analysis": analysis_session.public_snapshot(),
+            } if analysis_session is not None else {}),
         })
         chunk_index = 0
         while not _stop_requested(stop_event):
@@ -313,14 +403,12 @@ def process_live_stream(state: PersonCreationState) -> dict:
                     notify=lambda status, update=None: _notify(state, status, update),
                 )
             except OSError as exc:
-                if not chunk_summaries:
-                    raise
                 warning = _safe_stream_message(
-                    f"Live stream failed after partial capture: {exc}"
+                    f"Live camera reader failed: {exc}"
                 )
                 warnings.append(warning)
-                print(f"[process_live_stream] warning: {warning}")
-                break
+                print(f"[process_live_stream] error: {warning}")
+                raise OSError(warning) from exc
 
             body_crops.extend(chunk.body_crops)
             face_crops.extend(chunk.face_crops)
@@ -330,7 +418,6 @@ def process_live_stream(state: PersonCreationState) -> dict:
             totals["frames_dropped"] += chunk.frames_dropped
             totals["body_detections"] += chunk.body_detection_count
             totals["face_detections"] += chunk.face_detection_count
-            warnings.extend(_safe_stream_message(item) for item in chunk.warnings)
             if preprocessing_session is not None:
                 preprocessing_session.submit_chunk(chunk)
 
@@ -338,10 +425,66 @@ def process_live_stream(state: PersonCreationState) -> dict:
             summary["warnings"] = [
                 _safe_stream_message(item) for item in summary.get("warnings", [])
             ]
+            frame_gap_warnings = [
+                warning
+                for warning in summary["warnings"]
+                if warning.startswith(_FRAME_GAP_WARNING_PREFIX)
+            ]
+            continuing_frame_gap = bool(
+                active_frame_gap_warning is not None
+                and chunk.frame_gap_active
+                and chunk.frames_read == 0
+            )
+            if continuing_frame_gap:
+                summary["warnings"] = [
+                    warning
+                    for warning in summary["warnings"]
+                    if not warning.startswith(_FRAME_GAP_WARNING_PREFIX)
+                ]
+            for warning in summary["warnings"]:
+                if (
+                    not warning.startswith(_FRAME_GAP_WARNING_PREFIX)
+                    and warning not in warnings
+                ):
+                    warnings.append(warning)
+
+            if chunk.frame_gap_active and not continuing_frame_gap:
+                active_frame_gap_warning = (
+                    frame_gap_warnings[-1]
+                    if frame_gap_warnings
+                    else (
+                        f"No camera frames arrived for {frame_timeout_seconds:g} seconds; "
+                        "the live reader remains active."
+                    )
+                )
+            elif chunk.frames_read > 0:
+                active_frame_gap_warning = None
+
+            warnings = [
+                warning
+                for warning in warnings
+                if not warning.startswith(_FRAME_GAP_WARNING_PREFIX)
+            ]
+            if active_frame_gap_warning is not None:
+                warnings.append(active_frame_gap_warning)
+
             if chunk.frames_read == 0:
-                warning = f"Chunk {chunk.chunk_index} captured no frames; continuing."
-                summary["warnings"].append(warning)
-                warnings.append(warning)
+                consecutive_empty_chunks += 1
+                if (
+                    consecutive_empty_chunks == 1
+                    and _EMPTY_CHUNK_WARNING not in summary["warnings"]
+                ):
+                    summary["warnings"].append(_EMPTY_CHUNK_WARNING)
+                if _EMPTY_CHUNK_WARNING not in warnings:
+                    warnings.append(_EMPTY_CHUNK_WARNING)
+            else:
+                consecutive_empty_chunks = 0
+                warnings = [
+                    warning
+                    for warning in warnings
+                    if warning != _EMPTY_CHUNK_WARNING
+                ]
+            summary["consecutive_empty_chunks"] = consecutive_empty_chunks
             chunk_summaries.append(summary)
 
             completed_chunks = len(chunk_summaries)
@@ -357,6 +500,7 @@ def process_live_stream(state: PersonCreationState) -> dict:
                 "last_chunk": summary,
                 "session_totals": session_totals,
                 "stop_requested": _stop_requested(stop_event),
+                "consecutive_empty_chunks": consecutive_empty_chunks,
             }
             if preprocessing_session is not None:
                 progress_stats["live_preprocessing"] = (
@@ -374,6 +518,9 @@ def process_live_stream(state: PersonCreationState) -> dict:
                 **({
                     "live_preprocessing": preprocessing_session.public_snapshot(),
                 } if preprocessing_session is not None else {}),
+                **({
+                    "rolling_analysis": analysis_session.public_snapshot(),
+                } if analysis_session is not None else {}),
             })
             print(
                 f"[process_live_stream] chunk={chunk.chunk_index} "
@@ -387,20 +534,45 @@ def process_live_stream(state: PersonCreationState) -> dict:
             if chunk.stop_requested or _stop_requested(stop_event):
                 break
             if buffer.error:
-                warning = _safe_stream_message(
-                    f"Live stream failed after partial capture: {buffer.error}"
-                )
-                warnings.append(warning)
-                break
+                raise OSError(_safe_stream_message(
+                    f"Live camera reader failed: {buffer.error}"
+                ))
             if buffer.ended and buffer.empty:
-                warnings.append("Live stream ended; using the captured partial evidence.")
-                break
+                raise OSError(
+                    "Live camera reader stopped before an explicit Stop request."
+                )
     finally:
         print("[process_live_stream] before buffer.stop", flush=True)
+        reader_lifecycle_error: Exception | None = None
         try:
             buffer.stop()
             print("[process_live_stream] after buffer.stop", flush=True)
-        finally:
+        except Exception as exc:
+            reader_lifecycle_error = exc
+
+        if reader_lifecycle_error is not None:
+            # The reader may still own native capture state. Shut down the other
+            # lanes without running a final preview pass, then fail closed.
+            cleanup_errors: list[str] = []
+            try:
+                if preprocessing_session is not None and preprocessing_started:
+                    preprocessing_session.finish()
+            except Exception as exc:
+                cleanup_errors.append(type(exc).__name__)
+            try:
+                if analysis_session is not None and analysis_started:
+                    analysis_session.abort()
+            except Exception as exc:
+                cleanup_errors.append(type(exc).__name__)
+            if cleanup_errors:
+                reader_lifecycle_error.add_note(
+                    "Additional live worker cleanup failed: "
+                    + ", ".join(cleanup_errors)
+                    + "."
+                )
+            raise reader_lifecycle_error
+
+        try:
             if preprocessing_session is not None and preprocessing_started:
                 print(
                     "[process_live_stream] before preprocessing drain",
@@ -414,6 +586,27 @@ def process_live_stream(state: PersonCreationState) -> dict:
                     "[process_live_stream] after preprocessing drain",
                     flush=True,
                 )
+        except Exception:
+            if analysis_session is not None and analysis_started:
+                analysis_session.abort()
+            raise
+        else:
+            if analysis_session is not None and analysis_started:
+                print(
+                    "[process_live_stream] before rolling analysis drain",
+                    flush=True,
+                )
+                analysis_session.finish(preprocessing_session.accumulator_version)
+                final_analysis_snapshot = analysis_session.public_snapshot()
+                print(
+                    "[process_live_stream] after rolling analysis drain",
+                    flush=True,
+                )
+
+    if not _stop_requested(stop_event):
+        raise RuntimeError(
+            "Live camera capture ended without an explicit Stop request."
+        )
 
     session_totals = dict(totals)
     completed_chunks = len(chunk_summaries)
@@ -429,6 +622,9 @@ def process_live_stream(state: PersonCreationState) -> dict:
     stats["chunks"] = chunk_summaries
     if final_preprocessing_snapshot is not None:
         stats["live_preprocessing"] = final_preprocessing_snapshot
+    if final_analysis_snapshot is not None:
+        stats["rolling_analysis"] = final_analysis_snapshot
+    stats["consecutive_empty_chunks"] = consecutive_empty_chunks
     _notify(state, "stopping", {
         "chunk_index": last_chunk["chunk_index"] if last_chunk else None,
         "completed_chunks": completed_chunks,
@@ -441,6 +637,9 @@ def process_live_stream(state: PersonCreationState) -> dict:
         **({
             "live_preprocessing": final_preprocessing_snapshot,
         } if final_preprocessing_snapshot is not None else {}),
+        **({
+            "rolling_analysis": final_analysis_snapshot,
+        } if final_analysis_snapshot is not None else {}),
     })
     print("[process_live_stream] before report write", flush=True)
     report_path = write_stream_report(

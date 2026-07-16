@@ -3,6 +3,7 @@ import StartForm from './components/StartForm.jsx'
 import ProgressTracker from './components/ProgressTracker.jsx'
 import LiveStreamStats from './components/LiveStreamStats.jsx'
 import LiveJobControls from './components/LiveJobControls.jsx'
+import LiveIdentityPanel from './components/LiveIdentityPanel.jsx'
 import CropsGrid from './components/CropsGrid.jsx'
 import AssociationsView from './components/AssociationsView.jsx'
 import ClothingPanel from './components/ClothingPanel.jsx'
@@ -11,11 +12,15 @@ import ProfileManager from './components/ProfileManager.jsx'
 import MemoryTab from './components/MemoryTab.jsx'
 import {
   isJobActive,
+  isCanonicalFinalizing,
   isStopPending,
+  createStatusRequestGuard,
+  mergeJobStatus,
   normalizeSnapshot,
   postStopRequest,
   runSingleFlight,
   safeErrorMessage,
+  shouldShowRollingIdentityPanel,
   shouldShowStop,
   startStatusPolling,
   statusLabel,
@@ -33,18 +38,28 @@ export default function App() {
   const [stopError, setStopError] = useState('')
   const [stopRequestPending, setStopRequestPending] = useState(false)
   const stopRequestRef = useRef(null)
+  const statusRequestGuardRef = useRef(null)
+  if (statusRequestGuardRef.current === null) {
+    statusRequestGuardRef.current = createStatusRequestGuard()
+  }
 
   const fetchStatus = useCallback(async (id) => {
+    const guard = statusRequestGuardRef.current
+    const request = guard.start(id)
     try {
-      const res = await fetch(`/api/person/status/${id}`)
+      const res = await fetch(`/api/person/status/${encodeURIComponent(id)}`, {
+        signal: request.signal,
+      })
       const data = await res.json().catch(() => ({}))
       if (!res.ok || data.error) {
         throw new Error(data.error || `Status request failed (HTTP ${res.status})`)
       }
-      setJobStatus(data)
+      if (!guard.isCurrent(request)) return null
+      setJobStatus(current => mergeJobStatus(current, data))
       setPollingError('')
       return data
     } catch (error) {
+      if (error?.name === 'AbortError' || !guard.isCurrent(request)) return null
       setPollingError(safeErrorMessage(error, 'Unable to refresh job status. Retrying...'))
       return null
     }
@@ -60,10 +75,14 @@ export default function App() {
         setStopRequestPending(false)
       },
     })
-    return stopPolling
+    return () => {
+      stopPolling()
+      statusRequestGuardRef.current.cancel()
+    }
   }, [jobId, fetchStatus])
 
   const handleStart = (id, sourceType) => {
+    statusRequestGuardRef.current.cancel()
     setJobId(id)
     setJobSourceType(sourceType)
     setJobStatus(null)
@@ -107,6 +126,13 @@ export default function App() {
   const activeJob = isJobActive(jobId, jobStatus?.status)
   const showStop = shouldShowStop(jobId, sourceType, jobStatus?.status, jobStatus?.node, snapshot)
   const stopping = isStopPending(jobStatus?.status, snapshot, stopRequestPending)
+  const finalizingCanonical = isCanonicalFinalizing(
+    sourceType,
+    jobStatus?.status,
+    jobStatus?.node,
+    snapshot,
+    stopRequestPending,
+  )
   const clusterProfiles = Object.fromEntries(
     Object.values(snapshot.per_cluster_profiles ?? {}).map(profile => [String(profile.cluster_id), profile])
   )
@@ -175,6 +201,12 @@ export default function App() {
               sourceType={sourceType}
             />
             <LiveStreamStats snapshot={snapshot} status={jobStatus?.status} node={jobStatus?.node} sourceType={sourceType} />
+            {shouldShowRollingIdentityPanel(jobStatus?.status) && (
+              <LiveIdentityPanel
+                rollingAnalysis={snapshot.rolling_analysis}
+                finalizing={finalizingCanonical}
+              />
+            )}
             <CropsGrid
               jobId={jobId}
               bodyCrops={snapshot.quality_body_crops ?? []}
@@ -186,6 +218,14 @@ export default function App() {
 
         {tab === 2 && (
           <>
+            {jobStatus?.status === 'error' && jobStatus.error && (
+              <div className="card job-error-banner">
+                {safeErrorMessage(jobStatus.error, 'Pipeline failed.')}
+              </div>
+            )}
+            {jobStatus?.status === 'error' && (
+              <LiveIdentityPanel rollingAnalysis={snapshot.rolling_analysis} />
+            )}
             <LiveStreamStats snapshot={snapshot} status={jobStatus?.status} node={jobStatus?.node} sourceType={sourceType} />
             <AssociationsView
               jobId={jobId}

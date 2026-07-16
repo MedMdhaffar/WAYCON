@@ -14,11 +14,21 @@ function Metric({ label, value }) {
   )
 }
 
+const STREAM_STATE_LABELS = {
+  connected: 'Connected',
+  reconnecting: 'Reconnecting',
+  stopped: 'Stopped',
+  error: 'Connection error',
+}
+
 export default function LiveStreamStats({ snapshot, status, node, sourceType }) {
   if ((snapshot?.source_type ?? sourceType) !== 'live_camera') return null
   const progress = liveProgress(snapshot)
   const currentValues = [
     ['Camera', cameraPhase(status, node, snapshot)],
+    ['Connection', STREAM_STATE_LABELS[progress.streamState] ?? '-'],
+    ['Reconnects', displayMetric(progress.streamReconnectCount)],
+    ['Last frame age', displayMetric(progress.lastFrameAgeSeconds, ' s')],
     ['Completed windows', displayMetric(progress.completedWindows)],
     ['Current / last window', displayMetric(progress.windowIndex)],
     ['Window duration', displayMetric(progress.windowDuration, ' s')],
@@ -37,6 +47,27 @@ export default function LiveStreamStats({ snapshot, status, node, sourceType }) 
   return (
     <div className="card">
       <div className="card-title">Live Camera Configured</div>
+      {progress.streamState === 'reconnecting' && (
+        <div
+          role="status"
+          style={{
+            marginBottom: 14,
+            padding: '10px 12px',
+            border: '1px solid #92400e',
+            borderRadius: 6,
+            background: '#24170d',
+            color: '#fbbf24',
+            fontSize: 12,
+          }}
+        >
+          <strong>Camera connection interrupted. Reconnecting...</strong>
+          {progress.streamWarning && (
+            <div style={{ marginTop: 3 }}>
+              {safeErrorMessage(progress.streamWarning, 'Temporary camera interruption.')}
+            </div>
+          )}
+        </div>
+      )}
       <div style={{ color: '#64748b', fontSize: 11, marginBottom: 8, textTransform: 'uppercase' }}>Latest window</div>
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(130px, 1fr))', gap: 10 }}>
         {currentValues.map(([label, value]) => <Metric key={label} label={label} value={value} />)}

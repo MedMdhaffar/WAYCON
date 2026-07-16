@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 
 import pytest
 
@@ -129,6 +130,36 @@ def test_status_exposes_safe_continuous_capture_progress(client):
     assert snapshot["duration_seconds_per_chunk"] == 10
 
 
+def test_reconnect_status_is_public_and_preserves_rolling_identities(client):
+    job_id = _start_camera(client)
+    rolling = _rolling_publication(4, 3, 3, 2)
+    rolling["live_identities"] = [{
+        "session_person_id": "live_0001",
+        "status": "provisional",
+        "face_count": 5,
+        "associated_body_count": 3,
+        "memory_match": None,
+    }]
+    reconnect_stats = {
+        "stream_state": "reconnecting",
+        "stream_reconnect_count": 2,
+        "stream_warning": "Temporary camera interruption; reconnecting.",
+        "last_frame_age_seconds": 3.2,
+    }
+    with service._jobs_lock:
+        job = service._jobs[job_id]
+        service._merge_job_snapshot(job, {"rolling_analysis": rolling})
+        service._merge_job_snapshot(job, {"stream_stats": reconnect_stats})
+
+    snapshot = client.get(f"/api/person/status/{job_id}").get_json()["snapshot"]
+    serialized = json.dumps(snapshot)
+
+    assert snapshot["stream_stats"] == reconnect_stats
+    assert snapshot["rolling_analysis"]["live_identities"] == rolling["live_identities"]
+    assert "supervisor" not in serialized
+    assert "secret" not in serialized
+
+
 def test_status_exposes_json_safe_embedding_free_preprocessing_progress(client):
     job_id = _start_camera(client)
     preview = {
@@ -163,6 +194,108 @@ def test_status_exposes_json_safe_embedding_free_preprocessing_progress(client):
     assert snapshot["source_uri_masked"] == "rtsp://****@camera.local/live"
     assert "supervisor" not in serialized
     assert "secret" not in serialized
+
+
+def test_status_exposes_only_compact_rolling_analysis(client):
+    job_id = _start_camera(client)
+    rolling = {
+        "enabled": True,
+        "requested_version": 4,
+        "analysis_version": 3,
+        "analysis_state": "ready",
+        "analysis_in_progress": False,
+        "analyzed_embedding_count": 7,
+        "last_completed_preprocessing_chunk": 2,
+        "analysis_warning": None,
+        "live_identities": [{
+            "session_person_id": "live_0001",
+            "cluster_label": 0,
+            "status": "provisional",
+            "face_count": 7,
+            "associated_body_count": 3,
+            "representative_face_path": "face.jpg",
+            "memory_match": None,
+        }],
+        "live_recognition_events": [],
+    }
+    with service._jobs_lock:
+        service._jobs[job_id].snapshot.update({
+            "rolling_analysis": rolling,
+            "all_face_embeddings": [[0.5, 0.5]],
+            "analysis_thread": "must-not-escape",
+            "database_path": "/private/memory.db",
+        })
+
+    snapshot = client.get(f"/api/person/status/{job_id}").get_json()["snapshot"]
+    serialized = json.dumps(snapshot)
+
+    assert snapshot["rolling_analysis"] == rolling
+    assert "all_face_embeddings" not in serialized
+    assert "analysis_thread" not in serialized
+    assert "database_path" not in serialized
+
+
+def _rolling_publication(sequence: int, requested: int, analyzed: int, chunk: int):
+    return {
+        "enabled": True,
+        "publication_sequence": sequence,
+        "requested_version": requested,
+        "analysis_version": analyzed,
+        "analysis_state": "ready",
+        "analysis_in_progress": False,
+        "analyzed_embedding_count": analyzed,
+        "last_completed_preprocessing_chunk": chunk,
+        "analysis_warning": None,
+        "live_identities": [],
+        "live_recognition_events": [],
+    }
+
+
+def test_older_rolling_publication_cannot_overwrite_newer_status():
+    job = service.JobState("publication-order")
+    with service._jobs_lock:
+        service._merge_job_snapshot(job, {
+            "rolling_analysis": _rolling_publication(2, 3, 2, 1),
+        })
+        service._merge_job_snapshot(job, {
+            "rolling_analysis": _rolling_publication(1, 1, 1, 0),
+        })
+
+    rolling = job.snapshot["rolling_analysis"]
+    assert rolling["publication_sequence"] == 2
+    assert rolling["requested_version"] == 3
+    assert rolling["analysis_version"] == 2
+
+
+def test_concurrent_callback_completion_cannot_regress_status():
+    job = service.JobState("concurrent-publication")
+    old_started = threading.Event()
+    allow_old = threading.Event()
+
+    def apply_old():
+        old_started.set()
+        assert allow_old.wait(2.0)
+        with service._jobs_lock:
+            service._merge_job_snapshot(job, {
+                "rolling_analysis": _rolling_publication(1, 1, 1, 0),
+            })
+
+    thread = threading.Thread(target=apply_old)
+    thread.start()
+    assert old_started.wait(1.0)
+    with service._jobs_lock:
+        service._merge_job_snapshot(job, {
+            "rolling_analysis": _rolling_publication(2, 4, 3, 2),
+        })
+    allow_old.set()
+    thread.join(2.0)
+
+    assert not thread.is_alive()
+    rolling = job.snapshot["rolling_analysis"]
+    assert rolling["publication_sequence"] == 2
+    assert rolling["requested_version"] == 4
+    assert rolling["analysis_version"] == 3
+    assert rolling["last_completed_preprocessing_chunk"] == 2
 
 
 def test_video_job_remains_finite_and_has_no_stop_runtime(client, monkeypatch):

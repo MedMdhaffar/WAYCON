@@ -3,11 +3,13 @@ from __future__ import annotations
 import sqlite3
 import threading
 from datetime import date, timedelta
+from pathlib import Path
 
 import numpy as np
 import pytest
 
 from forensics.global_memory import GlobalMemory
+from forensics.global_memory.store import ReadOnlyGlobalMemoryError
 
 
 def _unit(values) -> list[float]:
@@ -217,6 +219,100 @@ def test_thread_safety(memory):
         thread.join()
 
     assert len(memory.list_all()) == 3
+
+
+def _database_contents(path: Path) -> dict[str, list[tuple]]:
+    connection = sqlite3.connect(str(path))
+    try:
+        tables = [
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+            )
+        ]
+        return {
+            table: connection.execute(
+                f'SELECT * FROM "{table}" ORDER BY rowid'
+            ).fetchall()
+            for table in tables
+        }
+    finally:
+        connection.close()
+
+
+def test_read_only_query_preserves_complete_database_contents(tmp_path):
+    database = tmp_path / "memory.db"
+    writer = GlobalMemory(str(database))
+    embedding = _unit([1.0, 0.0, 0.0])
+    writer.register(_profile(embedding=embedding))
+    writer.close()
+    before = _database_contents(database)
+    bytes_before = database.read_bytes()
+
+    reader = GlobalMemory(str(database), read_only=True)
+    try:
+        assert reader.query_by_face(embedding)[0]["person_id"] == "person_001"
+    finally:
+        reader.close()
+
+    assert _database_contents(database) == before
+    assert database.read_bytes() == bytes_before
+
+
+def test_read_only_initialization_runs_no_schema_or_migration_writes(tmp_path):
+    database = tmp_path / "memory.db"
+    writer = GlobalMemory(str(database))
+    writer.close()
+    before = _database_contents(database)
+    bytes_before = database.read_bytes()
+
+    reader = GlobalMemory(str(database), read_only=True)
+    reader.close()
+
+    assert _database_contents(database) == before
+    assert database.read_bytes() == bytes_before
+
+
+def test_missing_read_only_database_creates_nothing(tmp_path):
+    database = tmp_path / "absent" / "memory.db"
+
+    with pytest.raises(sqlite3.OperationalError):
+        GlobalMemory(str(database), read_only=True)
+
+    assert not database.parent.exists()
+    assert not database.exists()
+
+
+@pytest.mark.parametrize(
+    ("method_name", "args"),
+    [
+        ("register", (_profile(),)),
+        ("rename_person", ("person_001", "Renamed")),
+        ("update_crop_paths", ("person_001", _profile())),
+        ("set_profile_image", ("person_001", "face.jpg")),
+        ("update_gallery", ("person_001", _profile())),
+    ],
+)
+def test_all_public_mutations_are_rejected_in_read_only_mode(
+    tmp_path,
+    method_name,
+    args,
+):
+    database = tmp_path / "memory.db"
+    writer = GlobalMemory(str(database))
+    writer.register(_profile())
+    writer.close()
+    before = _database_contents(database)
+
+    reader = GlobalMemory(str(database), read_only=True)
+    try:
+        with pytest.raises(ReadOnlyGlobalMemoryError, match="read-only mode"):
+            getattr(reader, method_name)(*args)
+    finally:
+        reader.close()
+
+    assert _database_contents(database) == before
 
 
 def test_register_logs_new_and_recognized_events(memory):

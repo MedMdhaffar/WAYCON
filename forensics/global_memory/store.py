@@ -12,22 +12,40 @@ import numpy as np
 from . import config
 
 
+class ReadOnlyGlobalMemoryError(RuntimeError):
+    """A mutating operation was attempted through a read-only memory handle."""
+
+
 class GlobalMemory:
-    def __init__(self, db_path: str | None = None):
+    def __init__(self, db_path: str | None = None, *, read_only: bool = False):
         self.db_path = Path(db_path or config.DB_PATH)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self.read_only = bool(read_only)
         self._lock = threading.RLock()
-        self._conn = sqlite3.connect(
-            str(self.db_path),
-            check_same_thread=False,
-            isolation_level=None,
-        )
+        if self.read_only:
+            uri = f"{self.db_path.resolve().as_uri()}?mode=ro"
+            self._conn = sqlite3.connect(
+                uri,
+                uri=True,
+                check_same_thread=False,
+                isolation_level=None,
+            )
+        else:
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
+            self._conn = sqlite3.connect(
+                str(self.db_path),
+                check_same_thread=False,
+                isolation_level=None,
+            )
         self._conn.row_factory = sqlite3.Row
-        schema_path = Path(__file__).with_name("schema.sql")
-        self._conn.executescript(schema_path.read_text(encoding="utf-8"))
-        self._ensure_schema_columns()
+        if self.read_only:
+            self._conn.execute("PRAGMA query_only=ON")
+        else:
+            schema_path = Path(__file__).with_name("schema.sql")
+            self._conn.executescript(schema_path.read_text(encoding="utf-8"))
+            self._ensure_schema_columns()
 
     def register(self, profile: dict) -> str:
+        self._require_writable("register")
         new_vec = self._normalize_embedding(profile["face_embedding"])
         new_count = len(profile.get("face_crops") or []) or 1
         appearance = profile.get("appearance") or {}
@@ -243,6 +261,7 @@ class GlobalMemory:
             ]
 
     def rename_person(self, person_id: str, new_name: str) -> None:
+        self._require_writable("rename_person")
         with self._lock:
             self._conn.execute(
                 "UPDATE persons SET name=? WHERE person_id=?",
@@ -250,6 +269,7 @@ class GlobalMemory:
             )
 
     def update_crop_paths(self, person_id: str, profile: dict) -> None:
+        self._require_writable("update_crop_paths")
         appearance = profile.get("appearance") or {}
         appearance_date = str(appearance.get("date") or date.today().isoformat())
         profile_image = self._best_face_crop(profile)
@@ -289,6 +309,7 @@ class GlobalMemory:
             self.update_gallery(person_id, profile)
 
     def set_profile_image(self, person_id: str, image_path: str, source: str = "auto") -> None:
+        self._require_writable("set_profile_image")
         source = source if source in {"auto", "manual"} else "auto"
         with self._lock:
             self._conn.execute(
@@ -328,6 +349,7 @@ class GlobalMemory:
             return None
 
     def update_gallery(self, person_id: str, profile: dict) -> None:
+        self._require_writable("update_gallery")
         session_date = str((profile.get("appearance") or {}).get("date") or date.today().isoformat())
         video_sources = profile.get("video_sources") or []
         video_source = video_sources[0] if video_sources else None
@@ -400,6 +422,12 @@ class GlobalMemory:
     def close(self) -> None:
         with self._lock:
             self._conn.close()
+
+    def _require_writable(self, operation: str) -> None:
+        if self.read_only:
+            raise ReadOnlyGlobalMemoryError(
+                f"Global Memory operation '{operation}' is unavailable in read-only mode."
+            )
 
     def __enter__(self) -> GlobalMemory:
         return self

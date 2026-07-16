@@ -6,6 +6,7 @@ import uuid
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlsplit
 
 from flask import Flask, jsonify, request, send_file
@@ -171,6 +172,41 @@ _graph = None
 _graph_lock = threading.Lock()
 
 
+def _rolling_counter(value: Any) -> int:
+    try:
+        return int(value) if value is not None else -1
+    except (TypeError, ValueError):
+        return -1
+
+
+def _merge_job_snapshot(job: JobState, snapshot_update: dict) -> None:
+    """Merge a status callback while rejecting stale rolling publications."""
+    update = dict(snapshot_update)
+    incoming = update.pop("rolling_analysis", None)
+    job.snapshot.update(update)
+    if not isinstance(incoming, dict):
+        return
+    current = job.snapshot.get("rolling_analysis")
+    if not isinstance(current, dict):
+        job.snapshot["rolling_analysis"] = deepcopy(incoming)
+        return
+    incoming_sequence = _rolling_counter(incoming.get("publication_sequence"))
+    current_sequence = _rolling_counter(current.get("publication_sequence"))
+    if incoming_sequence < current_sequence:
+        return
+    monotonic_fields = (
+        "requested_version",
+        "analysis_version",
+        "last_completed_preprocessing_chunk",
+    )
+    if any(
+        _rolling_counter(incoming.get(field)) < _rolling_counter(current.get(field))
+        for field in monotonic_fields
+    ):
+        return
+    job.snapshot["rolling_analysis"] = deepcopy(incoming)
+
+
 def _get_graph():
     global _graph
     with _graph_lock:
@@ -209,7 +245,7 @@ def _run_pipeline(job_id: str, initial_state: dict) -> None:
             if runtime is None or not runtime.stop_event.is_set() or status == "stopping":
                 job.status = status
             if snapshot_update:
-                job.snapshot.update(snapshot_update)
+                _merge_job_snapshot(job, snapshot_update)
 
     if initial_state.get("input_type") == "camera_uri":
         initial_state["_status_callback"] = update_live_status
@@ -225,7 +261,7 @@ def _run_pipeline(job_id: str, initial_state: dict) -> None:
                     if runtime is None or not runtime.stop_event.is_set():
                         job.status = _NODE_TO_STATUS.get(node_name, node_name)
                     if isinstance(update, dict):
-                        job.snapshot.update(update)
+                        _merge_job_snapshot(job, update)
 
         with _jobs_lock:
             job.status = "done"
@@ -364,6 +400,7 @@ def status(job_id: str):
         "continuous":         snap.get("continuous", False),
         "duration_seconds_per_chunk": snap.get("duration_seconds_per_chunk"),
         "live_preprocessing": snap.get("live_preprocessing", {}),
+        "rolling_analysis": snap.get("rolling_analysis", {}),
     }
     return jsonify({
         "job_id":   job_id,

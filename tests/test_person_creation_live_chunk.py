@@ -6,7 +6,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from forensics.person_creation.live_stream import BufferedFrame, mask_camera_uri
+from forensics.person_creation.live_stream import (
+    BufferedFrame,
+    LiveFrameBufferLifecycleError,
+    mask_camera_uri,
+)
 from forensics.person_creation.nodes import process_live_stream as live_node
 
 
@@ -35,6 +39,9 @@ class FakeBuffer:
         self.error = None
         self.ended = False
         self.stream_opened = False
+        self.stream_state = "connected"
+        self.stream_reconnect_count = 0
+        self.stream_warning = None
 
     @property
     def empty(self) -> bool:
@@ -68,6 +75,10 @@ class FakeBuffer:
             "buffer_max_size": 30,
             "first_frame_time": None,
             "last_frame_time": None,
+            "stream_state": self.stream_state,
+            "stream_reconnect_count": self.stream_reconnect_count,
+            "stream_warning": self.stream_warning,
+            "last_frame_age_seconds": None,
             "warnings": list(warnings or []),
         }
 
@@ -115,6 +126,30 @@ def test_normal_chunk_exits_after_duration_without_busy_spin():
     assert all(0 < timeout <= 1.0 for timeout in buffer.get_timeouts)
 
 
+def test_reconnecting_empty_window_is_nonterminal_and_publishes_status():
+    clock = FakeClock()
+    notifications = []
+    buffer = FakeBuffer(clock)
+    buffer.stream_state = "reconnecting"
+    buffer.stream_reconnect_count = 2
+    buffer.stream_warning = "Temporary camera interruption; reconnecting."
+
+    result = _capture(
+        buffer,
+        clock,
+        duration_seconds=2.0,
+        frame_timeout_seconds=0.5,
+        notify=lambda status, update=None: notifications.append((status, update)),
+    )
+
+    assert result.stop_requested is False
+    assert result.frames_read == 0
+    assert buffer.ended is False
+    assert "reader remains active" in " ".join(result.warnings)
+    assert notifications[-1][1]["stream_stats"]["stream_state"] == "reconnecting"
+    assert notifications[-1][1]["stream_stats"]["stream_reconnect_count"] == 2
+
+
 def test_pre_set_stop_returns_immediate_empty_result():
     clock = FakeClock()
     buffer = FakeBuffer(clock)
@@ -153,8 +188,6 @@ def test_crops_and_counters_are_returned(monkeypatch):
         return ([{"path": f"body-{index}"}], [{"path": f"face-{index}"}])
 
     monkeypatch.setattr(live_node, "detect_and_save_frame", fake_detect)
-    buffer.ended = True
-
     result = _capture(buffer, clock, every_n=2)
 
     assert result.frames_read == 3
@@ -176,7 +209,6 @@ def test_nonzero_chunk_uses_collision_safe_source_stem(monkeypatch):
     for chunk_index in (0, 1):
         clock = FakeClock()
         buffer = FakeBuffer(clock, [_frame(0)])
-        buffer.ended = True
         _capture(buffer, clock, chunk_index=chunk_index)
 
     assert stems == ["live", "live_chunk_0001"]
@@ -186,8 +218,12 @@ def test_process_live_stream_owns_buffer_and_preserves_output(
     monkeypatch, tmp_path, capsys
 ):
     clock = FakeClock()
-    buffer = FakeBuffer(clock, [_frame(0)])
-    buffer.ended = True
+    stop_event = threading.Event()
+    buffer = FakeBuffer(
+        clock,
+        [_frame(0)],
+        on_get=lambda current: stop_event.set() if not current.items else None,
+    )
     monkeypatch.setattr(live_node, "LiveFrameBuffer", lambda *_args, **_kwargs: buffer)
     monkeypatch.setattr(
         live_node,
@@ -214,6 +250,7 @@ def test_process_live_stream_owns_buffer_and_preserves_output(
         "process_every_n": 1,
         "live_stream_config": {},
         "output_dir": str(tmp_path),
+        "_stop_event": stop_event,
     })
     report = json.loads((tmp_path / "stream_report.json").read_text(encoding="utf-8"))
     output = capsys.readouterr().out
@@ -292,7 +329,12 @@ def _install_continuous_dependencies(monkeypatch, tmp_path, buffer):
     monkeypatch.setattr(person_detector, "get_person_detector", lambda: object())
 
 
-def _chunk_result(index, *, stop=False, empty=False):
+def _chunk_result(index, *, stop=False, empty=False, frame_gap_active=False):
+    warnings = (
+        ["No camera frames arrived for 5 seconds; the live reader remains active."]
+        if frame_gap_active
+        else []
+    )
     return live_node.LiveChunkResult(
         chunk_index=index,
         started_at=float(index),
@@ -306,7 +348,8 @@ def _chunk_result(index, *, stop=False, empty=False):
         face_crops=[] if empty else [{"path": f"face-{index}.jpg"}],
         body_detection_count=0 if empty else 1,
         face_detection_count=0 if empty else 1,
-        warnings=[],
+        warnings=warnings,
+        frame_gap_active=frame_gap_active,
     )
 
 
@@ -441,8 +484,156 @@ def test_empty_window_continues_to_next_chunk(monkeypatch, tmp_path):
     assert indices == [0, 1]
     assert result["stream_stats"]["completed_chunks"] == 2
     assert "captured no frames; continuing" in " ".join(
-        result["stream_stats"]["warnings"]
+        result["stream_stats"]["chunks"][0]["warnings"]
     )
+    assert result["stream_stats"]["warnings"] == []
+
+
+def test_long_outage_keeps_warning_storage_bounded(monkeypatch, tmp_path):
+    clock = FakeClock()
+    buffer = FakeBuffer(clock)
+    stop_event = threading.Event()
+    _install_continuous_dependencies(monkeypatch, tmp_path, buffer)
+
+    def fake_capture(**kwargs):
+        index = kwargs["chunk_index"]
+        if index == 99:
+            stop_event.set()
+        return _chunk_result(
+            index,
+            stop=stop_event.is_set(),
+            empty=True,
+            frame_gap_active=True,
+        )
+
+    monkeypatch.setattr(live_node, "capture_live_chunk", fake_capture)
+    result = live_node.process_live_stream({
+        "camera_uri": "rtsp://camera.local/live",
+        "duration_seconds": 5,
+        "process_every_n": 1,
+        "output_dir": str(tmp_path),
+        "_stop_event": stop_event,
+    })
+
+    stats = result["stream_stats"]
+    stored_chunk_warnings = [
+        warning
+        for chunk in stats["chunks"]
+        for warning in chunk["warnings"]
+    ]
+    assert stats["completed_chunks"] == 100
+    assert stats["consecutive_empty_chunks"] == 100
+    assert len(stats["warnings"]) == 2
+    assert sum("No camera frames arrived" in item for item in stored_chunk_warnings) == 1
+    assert sum("captured no frames" in item for item in stored_chunk_warnings) == 1
+
+
+def test_outage_warnings_clear_after_frames_resume(monkeypatch, tmp_path):
+    clock = FakeClock()
+    buffer = FakeBuffer(clock)
+    stop_event = threading.Event()
+    _install_continuous_dependencies(monkeypatch, tmp_path, buffer)
+
+    def fake_capture(**kwargs):
+        index = kwargs["chunk_index"]
+        if index < 2:
+            return _chunk_result(index, empty=True, frame_gap_active=True)
+        stop_event.set()
+        return _chunk_result(index, stop=True)
+
+    monkeypatch.setattr(live_node, "capture_live_chunk", fake_capture)
+    result = live_node.process_live_stream({
+        "camera_uri": "rtsp://camera.local/live",
+        "duration_seconds": 5,
+        "process_every_n": 1,
+        "output_dir": str(tmp_path),
+        "_stop_event": stop_event,
+    })
+
+    assert result["stream_stats"]["consecutive_empty_chunks"] == 0
+    assert not any(
+        "No camera frames arrived" in warning
+        or "captured no frames" in warning
+        for warning in result["stream_stats"]["warnings"]
+    )
+
+
+def test_reconnect_window_preserves_evidence_and_cannot_finish_session(
+    monkeypatch,
+    tmp_path,
+):
+    clock = FakeClock()
+    buffer = FakeBuffer(clock)
+    stop_event = threading.Event()
+    chunk_indices = []
+    reconnect_updates = []
+    _install_continuous_dependencies(monkeypatch, tmp_path, buffer)
+
+    def fake_capture(**kwargs):
+        index = kwargs["chunk_index"]
+        chunk_indices.append(index)
+        if index == 1:
+            buffer.stream_state = "reconnecting"
+            buffer.stream_reconnect_count = 1
+            buffer.stream_warning = "Temporary camera interruption; reconnecting."
+            return _chunk_result(index, empty=True)
+        buffer.stream_state = "connected"
+        buffer.stream_warning = None
+        if index == 2:
+            stop_event.set()
+        return _chunk_result(index, stop=stop_event.is_set())
+
+    monkeypatch.setattr(live_node, "capture_live_chunk", fake_capture)
+    result = live_node.process_live_stream({
+        "camera_uri": "rtsp://camera.local/live",
+        "duration_seconds": 5,
+        "process_every_n": 1,
+        "output_dir": str(tmp_path),
+        "_stop_event": stop_event,
+        "_status_callback": lambda _status, update=None: (
+            reconnect_updates.append(update)
+            if isinstance(update, dict)
+            and update.get("stream_stats", {}).get("stream_state") == "reconnecting"
+            else None
+        ),
+    })
+
+    assert chunk_indices == [0, 1, 2]
+    assert [item["path"] for item in result["body_crops"]] == [
+        "body-0.jpg",
+        "body-2.jpg",
+    ]
+    assert [item["path"] for item in result["face_crops"]] == [
+        "face-0.jpg",
+        "face-2.jpg",
+    ]
+    assert reconnect_updates
+    assert result["stream_stats"]["stop_requested"] is True
+    assert (tmp_path / "stream_report.json").exists()
+
+
+def test_dead_reader_without_stop_is_job_error_not_normal_completion(
+    monkeypatch,
+    tmp_path,
+):
+    clock = FakeClock()
+    buffer = FakeBuffer(clock)
+    buffer.ended = True
+    stop_event = threading.Event()
+    _install_continuous_dependencies(monkeypatch, tmp_path, buffer)
+
+    with pytest.raises(OSError, match="reader stopped unexpectedly"):
+        live_node.process_live_stream({
+            "camera_uri": "rtsp://camera.local/live",
+            "duration_seconds": 5,
+            "process_every_n": 1,
+            "output_dir": str(tmp_path),
+            "_stop_event": stop_event,
+        })
+
+    assert stop_event.is_set() is False
+    assert buffer.stop_calls == 1
+    assert not (tmp_path / "stream_report.json").exists()
 
 
 def test_pre_set_stop_starts_and_stops_once_without_capturing(monkeypatch, tmp_path):
@@ -497,6 +688,48 @@ def test_chunk_exception_stops_buffer_and_propagates(monkeypatch, tmp_path):
     assert buffer.stop_calls == 1
 
 
+def test_live_reader_lifecycle_failure_blocks_node_return_and_preserves_staging(
+    monkeypatch,
+    tmp_path,
+):
+    clock = FakeClock()
+    buffer = FakeBuffer(clock)
+    stop_event = threading.Event()
+    staging = tmp_path / "_staging"
+    staging.mkdir()
+    marker = staging / "keep.txt"
+    marker.write_text("preserve", encoding="utf-8")
+    _install_continuous_dependencies(monkeypatch, tmp_path, buffer)
+
+    def fail_closed_stop():
+        buffer.stop_calls += 1
+        raise LiveFrameBufferLifecycleError(
+            "reader alive; staging must be preserved"
+        )
+
+    buffer.stop = fail_closed_stop
+    monkeypatch.setattr(
+        live_node,
+        "capture_live_chunk",
+        lambda **kwargs: (
+            stop_event.set() or _chunk_result(kwargs["chunk_index"], stop=True, empty=True)
+        ),
+    )
+
+    with pytest.raises(LiveFrameBufferLifecycleError, match="staging"):
+        live_node.process_live_stream({
+            "camera_uri": "rtsp://camera.local/live",
+            "duration_seconds": 5,
+            "process_every_n": 1,
+            "output_dir": str(tmp_path),
+            "_stop_event": stop_event,
+        })
+
+    assert buffer.stop_calls == 1
+    assert marker.exists()
+    assert not (tmp_path / "stream_report.json").exists()
+
+
 def test_process_live_stream_does_not_run_downstream_graph_nodes():
     names = set(live_node.process_live_stream.__code__.co_names)
 
@@ -538,11 +771,12 @@ def test_overlap_captures_next_chunk_while_previous_preprocessing_is_blocked(
     outcome = {}
     _install_continuous_dependencies(monkeypatch, tmp_path, buffer)
     monkeypatch.setenv("PERSON_CREATION_LIVE_OVERLAP", "1")
+    monkeypatch.setenv("PERSON_CREATION_LIVE_ROLLING_ANALYSIS", "0")
 
     def fake_preprocess(*, chunk, **_kwargs):
         if chunk.chunk_index == 0:
             preprocessing_started.set()
-            assert release_preprocessing.wait(2.0)
+            assert release_preprocessing.wait(5.0)
         processed.append(chunk.chunk_index)
         return PreprocessedLiveChunk(
             chunk_index=chunk.chunk_index,
@@ -558,7 +792,7 @@ def test_overlap_captures_next_chunk_while_previous_preprocessing_is_blocked(
     def fake_capture(**kwargs):
         index = kwargs["chunk_index"]
         if index == 1:
-            assert preprocessing_started.is_set()
+            assert preprocessing_started.wait(1.0)
             second_capture_completed.set()
             stop_event.set()
         return _chunk_result(index, stop=index == 1)
@@ -582,7 +816,7 @@ def test_overlap_captures_next_chunk_while_previous_preprocessing_is_blocked(
     pipeline = threading.Thread(target=run)
     pipeline.start()
     assert preprocessing_started.wait(1.0)
-    assert second_capture_completed.wait(1.0)
+    assert second_capture_completed.wait(2.0)
     assert not release_preprocessing.is_set()
     release_preprocessing.set()
     pipeline.join(3.0)
@@ -672,3 +906,398 @@ def test_preprocessing_failure_stops_capture_and_prevents_return(
     assert stop_event.is_set()
     assert buffer.stop_calls == 1
     assert not (tmp_path / "stream_report.json").exists()
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [(None, False), ("0", False), ("false", False), ("1", True), ("true", True)],
+)
+def test_live_rolling_analysis_feature_flag(monkeypatch, value, expected):
+    if value is None:
+        monkeypatch.delenv("PERSON_CREATION_LIVE_ROLLING_ANALYSIS", raising=False)
+    else:
+        monkeypatch.setenv("PERSON_CREATION_LIVE_ROLLING_ANALYSIS", value)
+    assert live_node.live_rolling_analysis_enabled() is expected
+
+
+def test_rolling_without_overlap_is_rejected_before_camera_or_staging(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv("PERSON_CREATION_LIVE_OVERLAP", "0")
+    monkeypatch.setenv("PERSON_CREATION_LIVE_ROLLING_ANALYSIS", "1")
+    monkeypatch.setattr(
+        live_node,
+        "prepare_staging_dirs",
+        lambda _path: (_ for _ in ()).throw(AssertionError("staging opened")),
+    )
+
+    with pytest.raises(ValueError, match="requires PERSON_CREATION_LIVE_OVERLAP=1"):
+        live_node.process_live_stream({
+            "camera_uri": "rtsp://camera.local/live",
+            "duration_seconds": 5,
+            "process_every_n": 1,
+            "output_dir": str(tmp_path),
+        })
+
+
+def test_rolling_disabled_does_not_construct_analysis_worker(monkeypatch, tmp_path):
+    from forensics.person_creation import live_analysis
+
+    clock = FakeClock()
+    buffer = FakeBuffer(clock)
+    stop_event = threading.Event()
+    _install_continuous_dependencies(monkeypatch, tmp_path, buffer)
+    monkeypatch.setenv("PERSON_CREATION_LIVE_OVERLAP", "1")
+    monkeypatch.setenv("PERSON_CREATION_LIVE_ROLLING_ANALYSIS", "0")
+    monkeypatch.setattr(
+        live_analysis,
+        "LiveRollingAnalysisSession",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("rolling worker constructed")
+        ),
+    )
+    monkeypatch.setattr(
+        live_node,
+        "capture_live_chunk",
+        lambda **kwargs: (
+            stop_event.set() or _chunk_result(kwargs["chunk_index"], stop=True, empty=True)
+        ),
+    )
+
+    result = live_node.process_live_stream({
+        "camera_uri": "rtsp://camera.local/live",
+        "duration_seconds": 5,
+        "process_every_n": 1,
+        "output_dir": str(tmp_path),
+        "_stop_event": stop_event,
+    })
+
+    assert "rolling_analysis" not in result
+
+
+def test_hung_analysis_worker_prevents_live_node_return(monkeypatch, tmp_path):
+    from forensics.person_creation import live_analysis, live_session
+
+    clock = FakeClock()
+    buffer = FakeBuffer(clock)
+    stop_event = threading.Event()
+    _install_continuous_dependencies(monkeypatch, tmp_path, buffer)
+    staging = tmp_path / "_staging"
+    staging.mkdir()
+    marker = staging / "keep.txt"
+    marker.write_text("preserve", encoding="utf-8")
+    monkeypatch.setenv("PERSON_CREATION_LIVE_OVERLAP", "1")
+    monkeypatch.setenv("PERSON_CREATION_LIVE_ROLLING_ANALYSIS", "1")
+
+    class FakePreprocessing:
+        accumulator_version = 1
+
+        def __init__(self, **kwargs):
+            self.on_advanced = kwargs["on_accumulator_advanced"]
+
+        def start(self):
+            return None
+
+        def submit_chunk(self, _chunk):
+            self.on_advanced(1)
+
+        def finish(self):
+            return None
+
+        def public_snapshot(self):
+            return {"enabled": True}
+
+        def analysis_snapshot(self):
+            raise AssertionError("fake analysis owns snapshot behavior")
+
+    class HungAnalysis:
+        def __init__(self, **_kwargs):
+            pass
+
+        def start(self):
+            return None
+
+        def request_version(self, _version):
+            return True
+
+        def public_snapshot(self):
+            return {"enabled": True}
+
+        def finish(self, _version):
+            raise live_analysis.LiveAnalysisLifecycleError(
+                "worker alive; staging must be preserved"
+            )
+
+        def abort(self):
+            return None
+
+    monkeypatch.setattr(live_session, "LivePreprocessingSession", FakePreprocessing)
+    monkeypatch.setattr(live_analysis, "LiveRollingAnalysisSession", HungAnalysis)
+    monkeypatch.setattr(
+        live_node,
+        "capture_live_chunk",
+        lambda **kwargs: (
+            stop_event.set() or _chunk_result(kwargs["chunk_index"], stop=True, empty=True)
+        ),
+    )
+
+    with pytest.raises(live_analysis.LiveAnalysisLifecycleError, match="staging"):
+        live_node.process_live_stream({
+            "camera_uri": "rtsp://camera.local/live",
+            "duration_seconds": 5,
+            "process_every_n": 1,
+            "output_dir": str(tmp_path),
+            "_stop_event": stop_event,
+        })
+
+    assert not (tmp_path / "stream_report.json").exists()
+    assert marker.exists()
+
+
+def test_dead_analysis_worker_waits_for_real_user_stop(monkeypatch, tmp_path):
+    from forensics.person_creation import live_analysis, live_session
+
+    clock = FakeClock()
+    buffer = FakeBuffer(clock)
+    stop_event = threading.Event()
+    capture_continued = threading.Event()
+    allow_user_stop = threading.Event()
+    notifications = []
+    outcome = {}
+    _install_continuous_dependencies(monkeypatch, tmp_path, buffer)
+    monkeypatch.setenv("PERSON_CREATION_LIVE_OVERLAP", "1")
+    monkeypatch.setenv("PERSON_CREATION_LIVE_ROLLING_ANALYSIS", "1")
+
+    class FakePreprocessing:
+        def __init__(self, **kwargs):
+            self.on_advanced = kwargs["on_accumulator_advanced"]
+            self.accumulator_version = 0
+
+        def start(self):
+            return None
+
+        def submit_chunk(self, _chunk):
+            self.accumulator_version += 1
+            self.on_advanced(self.accumulator_version)
+
+        def finish(self):
+            return None
+
+        def public_snapshot(self):
+            return {"enabled": True}
+
+        def analysis_snapshot(self):
+            raise AssertionError("dead worker cannot request snapshots")
+
+    class DeadAnalysis:
+        def __init__(self, **kwargs):
+            assert "request_stop" not in kwargs
+            self.requested = 0
+            self.failed = False
+            self.identity = {
+                "session_person_id": "live_0001",
+                "status": "provisional",
+                "face_count": 3,
+                "associated_body_count": 2,
+                "memory_match": None,
+            }
+
+        def start(self):
+            return None
+
+        def request_version(self, version):
+            self.requested = version
+            self.failed = True
+            return False
+
+        def public_snapshot(self):
+            return {
+                "enabled": True,
+                "publication_sequence": 2,
+                "requested_version": self.requested,
+                "analysis_version": 1,
+                "analysis_state": "worker_failed" if self.failed else "ready",
+                "analysis_in_progress": False,
+                "analyzed_embedding_count": 3,
+                "last_completed_preprocessing_chunk": 0,
+                "analysis_warning": (
+                    "Rolling analysis worker failed."
+                    if self.failed
+                    else None
+                ),
+                "live_identities": [self.identity],
+                "live_recognition_events": [],
+            }
+
+        def finish(self, _version):
+            return None
+
+        def abort(self):
+            return None
+
+    monkeypatch.setattr(live_session, "LivePreprocessingSession", FakePreprocessing)
+    monkeypatch.setattr(live_analysis, "LiveRollingAnalysisSession", DeadAnalysis)
+
+    def fake_capture(**kwargs):
+        index = kwargs["chunk_index"]
+        if index == 1:
+            capture_continued.set()
+            assert allow_user_stop.wait(2.0)
+        return _chunk_result(index, stop=stop_event.is_set(), empty=True)
+
+    monkeypatch.setattr(live_node, "capture_live_chunk", fake_capture)
+
+    def run_pipeline():
+        try:
+            outcome["result"] = live_node.process_live_stream({
+                "camera_uri": "rtsp://camera.local/live",
+                "duration_seconds": 5,
+                "process_every_n": 1,
+                "output_dir": str(tmp_path),
+                "_stop_event": stop_event,
+                "_status_callback": lambda status, update=None: notifications.append(
+                    (status, update)
+                ),
+            })
+        except Exception as exc:  # pragma: no cover - assertion reports details
+            outcome["error"] = exc
+
+    pipeline = threading.Thread(target=run_pipeline)
+    pipeline.start()
+    try:
+        assert capture_continued.wait(1.0)
+        assert not stop_event.is_set()
+        assert pipeline.is_alive()
+        assert outcome == {}
+        assert not (tmp_path / "stream_report.json").exists()
+        rolling_updates = [
+            update["rolling_analysis"]
+            for _status, update in notifications
+            if isinstance(update, dict) and "rolling_analysis" in update
+        ]
+        assert rolling_updates[-1]["analysis_state"] == "worker_failed"
+        assert rolling_updates[-1]["live_identities"] == [{
+            "session_person_id": "live_0001",
+            "status": "provisional",
+            "face_count": 3,
+            "associated_body_count": 2,
+            "memory_match": None,
+        }]
+
+        stop_event.set()
+        allow_user_stop.set()
+        pipeline.join(2.0)
+    finally:
+        stop_event.set()
+        allow_user_stop.set()
+        pipeline.join(2.0)
+
+    assert not pipeline.is_alive()
+    assert "error" not in outcome
+    result = outcome["result"]
+    assert result["stream_stats"]["completed_chunks"] == 2
+    report = json.loads((tmp_path / "stream_report.json").read_text(encoding="utf-8"))
+    assert report["rolling_analysis"]["analysis_state"] == "worker_failed"
+    assert report["rolling_analysis"]["live_identities"][0][
+        "session_person_id"
+    ] == "live_0001"
+
+
+def test_recoverable_rolling_warning_allows_live_node_to_return(
+    monkeypatch,
+    tmp_path,
+):
+    from forensics.person_creation import live_analysis, live_session
+
+    clock = FakeClock()
+    buffer = FakeBuffer(clock)
+    stop_event = threading.Event()
+    notifications = []
+    _install_continuous_dependencies(monkeypatch, tmp_path, buffer)
+    monkeypatch.setenv("PERSON_CREATION_LIVE_OVERLAP", "1")
+    monkeypatch.setenv("PERSON_CREATION_LIVE_ROLLING_ANALYSIS", "1")
+
+    class FakePreprocessing:
+        accumulator_version = 1
+
+        def __init__(self, **kwargs):
+            self.on_advanced = kwargs["on_accumulator_advanced"]
+
+        def start(self):
+            return None
+
+        def submit_chunk(self, _chunk):
+            self.on_advanced(1)
+
+        def finish(self):
+            return None
+
+        def public_snapshot(self):
+            return {"enabled": True}
+
+        def analysis_snapshot(self):
+            raise AssertionError("fake analysis owns snapshots")
+
+    class WarningAnalysis:
+        def __init__(self, **_kwargs):
+            self.dead = False
+
+        def start(self):
+            return None
+
+        def request_version(self, _version):
+            return True
+
+        def public_snapshot(self):
+            return {
+                "enabled": True,
+                "publication_sequence": 2,
+                "requested_version": 1,
+                "analysis_version": 0,
+                "analysis_state": "warning",
+                "analysis_in_progress": False,
+                "analyzed_embedding_count": 0,
+                "last_completed_preprocessing_chunk": 0,
+                "analysis_warning": "Rolling analysis failed (RuntimeError).",
+                "live_identities": [],
+                "live_recognition_events": [],
+            }
+
+        def finish(self, _version):
+            self.dead = True
+
+        def abort(self):
+            self.dead = True
+
+    monkeypatch.setattr(live_session, "LivePreprocessingSession", FakePreprocessing)
+    monkeypatch.setattr(live_analysis, "LiveRollingAnalysisSession", WarningAnalysis)
+    monkeypatch.setattr(
+        live_node,
+        "capture_live_chunk",
+        lambda **kwargs: (
+            stop_event.set() or _chunk_result(kwargs["chunk_index"], stop=True, empty=True)
+        ),
+    )
+
+    result = live_node.process_live_stream({
+        "camera_uri": "rtsp://camera.local/live",
+        "duration_seconds": 5,
+        "process_every_n": 1,
+        "output_dir": str(tmp_path),
+        "_stop_event": stop_event,
+        "_status_callback": lambda status, update=None: notifications.append(
+            (status, update)
+        ),
+    })
+
+    rolling_updates = [
+        update["rolling_analysis"]
+        for _status, update in notifications
+        if isinstance(update, dict) and "rolling_analysis" in update
+    ]
+    assert rolling_updates[-1]["analysis_state"] == "warning"
+    assert (tmp_path / "stream_report.json").exists()
+
+    assert result["stream_stats"]["completed_chunks"] == 1
+    assert (tmp_path / "stream_report.json").exists()
