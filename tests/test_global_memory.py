@@ -338,3 +338,114 @@ def test_auto_ids_ignore_cluster_names(memory):
     assert second == "person_002"
     assert memory.get_person(first)["name"] == "Person 001"
     assert memory.get_person(second)["name"] == "Person 002"
+
+
+def test_failed_clothing_preserves_good_values_and_merges_evidence(tmp_path):
+    root = tmp_path / "person_db"
+    first_body = root / "session" / "body_crops" / "first.jpg"
+    second_body = root / "session" / "body_crops" / "second.jpg"
+    first_body.parent.mkdir(parents=True)
+    first_body.write_bytes(b"first")
+    second_body.write_bytes(b"second")
+    memory = GlobalMemory(tmp_path / "memory.db", media_root=root)
+    try:
+        profile = _profile(day="2026-07-16", top="black jacket")
+        profile["appearance"]["clothing_status"] = "ok"
+        profile["best_body_crops"] = [str(first_body)]
+        profile["video_sources"] = ["first.mp4"]
+        person_id = memory.register(profile)
+
+        failed = _profile(day="2026-07-16", top="unknown")
+        failed["appearance"] = {
+            "date": "2026-07-16",
+            "clothing_status": "failed",
+            "top": None,
+            "bottom": None,
+            "shoes": None,
+            "full": None,
+        }
+        failed["best_body_crops"] = [str(second_body)]
+        failed["video_sources"] = ["second.mp4"]
+        memory.register(failed)
+
+        appearance = memory.get_person(person_id)["latest_appearance"]
+        assert appearance["top"] == "black jacket"
+        assert appearance["clothing_status"] == "failed"
+        assert appearance["best_body_crops"] == [
+            "session/body_crops/first.jpg",
+            "session/body_crops/second.jpg",
+        ]
+        assert appearance["video_sources"] == ["first.mp4", "second.mp4"]
+    finally:
+        memory.close()
+
+
+def test_successful_clothing_update_replaces_only_useful_fields(tmp_path):
+    memory = GlobalMemory(tmp_path / "memory.db", media_root=tmp_path / "person_db")
+    try:
+        person_id = memory.register(_profile(day="2026-07-16", top="white shirt"))
+        update = _profile(day="2026-07-16", top="blue coat")
+        update["appearance"]["bottom"] = None
+        update["appearance"]["clothing_status"] = "ok"
+        memory.register(update)
+
+        appearance = memory.get_person(person_id)["latest_appearance"]
+        assert appearance["top"] == "blue coat"
+        assert appearance["bottom"] == "black pants"
+        assert appearance["clothing_status"] == "ok"
+    finally:
+        memory.close()
+
+
+def test_unknown_fallback_is_never_persisted_as_valid_clothing(tmp_path):
+    memory = GlobalMemory(tmp_path / "memory.db", media_root=tmp_path / "person_db")
+    try:
+        profile = _profile(day="2026-07-16", top="unknown")
+        profile["appearance"] = {
+            "date": "2026-07-16",
+            "clothing_status": "failed",
+            "top": "unknown",
+            "bottom": "unknown",
+            "shoes": "unknown",
+            "full": "Clothing description unavailable.",
+        }
+        person_id = memory.register(profile)
+        appearance = memory.get_person(person_id)["latest_appearance"]
+
+        assert appearance["clothing_status"] == "failed"
+        assert appearance["top"] is None
+        assert appearance["bottom"] is None
+        assert appearance["shoes"] is None
+        assert appearance["full_description"] is None
+    finally:
+        memory.close()
+
+
+def test_crop_path_update_rolls_back_all_database_changes_on_boundary_failure(tmp_path):
+    root = tmp_path / "person_db"
+    old_face = root / "session" / "face_crops" / "old.jpg"
+    new_face = root / "person_001" / "face_crops" / "new.jpg"
+    old_face.parent.mkdir(parents=True)
+    new_face.parent.mkdir(parents=True)
+    old_face.write_bytes(b"old")
+    new_face.write_bytes(b"new")
+    database = tmp_path / "memory.db"
+    memory = GlobalMemory(database, media_root=root)
+    try:
+        profile = _profile(day="2026-07-16")
+        profile["face_crops"] = [str(old_face)]
+        person_id = memory.register(profile)
+        before = _database_contents(database)
+        updated = _profile(day="2026-07-16", top="new coat")
+        updated["face_crops"] = [str(new_face)]
+
+        def fail_gallery(*_args, **_kwargs):
+            raise RuntimeError("injected gallery update failure")
+
+        memory.update_gallery = fail_gallery
+        with pytest.raises(RuntimeError, match="injected gallery update failure"):
+            memory.update_crop_paths(person_id, updated)
+
+        assert _database_contents(database) == before
+    finally:
+        memory.close()

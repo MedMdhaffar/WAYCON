@@ -200,6 +200,14 @@ body {
   font-size: 13px;
 }
 .live-events small { color: #6f7b8f; overflow-wrap: anywhere; text-align: right; }
+.clothing-status-failed {
+  border: 1px solid #8a641c;
+  border-radius: 6px;
+  padding: 10px 12px;
+  background: #2a2111;
+  color: #f6c96c;
+  font-size: 13px;
+}
 
 @media (max-width: 640px) {
   .header { align-items: flex-start; flex-wrap: wrap; padding: 14px 16px; }

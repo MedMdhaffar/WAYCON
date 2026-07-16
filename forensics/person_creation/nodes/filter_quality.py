@@ -2,12 +2,18 @@ from pathlib import Path
 
 import cv2
 
+from forensics.person_creation.quality_config import (
+    DEFAULT_QUALITY_FILTER_CONFIG,
+    QualityFilterConfig,
+    load_quality_filter_config,
+)
 
-_MIN_BODY_H = 80
-_MIN_BODY_AREA = 3000
-_MIN_FACE_W = 60
-_MIN_FACE_H = 60
-_MIN_SHARPNESS = 50.0
+
+_MIN_BODY_H = DEFAULT_QUALITY_FILTER_CONFIG.body_min_height
+_MIN_BODY_AREA = DEFAULT_QUALITY_FILTER_CONFIG.body_min_area
+_MIN_FACE_W = DEFAULT_QUALITY_FILTER_CONFIG.face_min_width
+_MIN_FACE_H = DEFAULT_QUALITY_FILTER_CONFIG.face_min_height
+_MIN_SHARPNESS = DEFAULT_QUALITY_FILTER_CONFIG.face_min_sharpness
 _FACE_REJECTION_REASONS = (
     "missing_file",
     "unreadable",
@@ -19,19 +25,33 @@ _FACE_REJECTION_REASONS = (
 )
 
 
-def _body_ok(crop: dict) -> bool:
+def _body_ok(crop: dict, config: QualityFilterConfig | None = None) -> bool:
+    config = config or DEFAULT_QUALITY_FILTER_CONFIG
     x1, y1, x2, y2 = crop["bbox"]
     w, h = x2 - x1, y2 - y1
-    return h >= _MIN_BODY_H and w * h >= _MIN_BODY_AREA and crop["sharpness"] >= _MIN_SHARPNESS
+    return (
+        h >= config.body_min_height
+        and w * h >= config.body_min_area
+        and crop["sharpness"] >= config.body_min_sharpness
+    )
 
 
-def _face_ok(crop: dict) -> bool:
+def _face_ok(crop: dict, config: QualityFilterConfig | None = None) -> bool:
+    config = config or DEFAULT_QUALITY_FILTER_CONFIG
     x1, y1, x2, y2 = crop["bbox"]
     w, h = x2 - x1, y2 - y1
-    return w >= _MIN_FACE_W and h >= _MIN_FACE_H and crop["sharpness"] >= _MIN_SHARPNESS
+    return (
+        w >= config.face_min_width
+        and h >= config.face_min_height
+        and crop["sharpness"] >= config.face_min_sharpness
+    )
 
 
-def _face_diagnostic(crop: dict) -> tuple[str | None, dict]:
+def _face_diagnostic(
+    crop: dict,
+    config: QualityFilterConfig | None = None,
+) -> tuple[str | None, dict]:
+    config = config or DEFAULT_QUALITY_FILTER_CONFIG
     raw_path = str(crop.get("path") or "")
     path = Path(raw_path)
     exists = bool(raw_path) and path.is_file()
@@ -70,9 +90,9 @@ def _face_diagnostic(crop: dict) -> tuple[str | None, dict]:
     except (KeyError, TypeError, ValueError):
         return "other", diagnostic
 
-    if bbox_width < _MIN_FACE_W or bbox_height < _MIN_FACE_H:
+    if bbox_width < config.face_min_width or bbox_height < config.face_min_height:
         return "too_small", diagnostic
-    if sharpness < _MIN_SHARPNESS:
+    if sharpness < config.face_min_sharpness:
         return "low_sharpness", diagnostic
     # There is no brightness rejection threshold in the current algorithm.
     return None, diagnostic
@@ -91,12 +111,13 @@ def _print_face_rejection_sample(diagnostic: dict, reason: str) -> None:
 
 
 def filter_quality(state: dict) -> dict:
-    quality_body = [c for c in state["body_crops"] if _body_ok(c)]
+    config = load_quality_filter_config()
+    quality_body = [c for c in state["body_crops"] if _body_ok(c, config)]
     quality_face = []
     rejected_counts = {reason: 0 for reason in _FACE_REJECTION_REASONS}
     rejected_samples = 0
     for crop in state["face_crops"]:
-        reason, diagnostic = _face_diagnostic(crop)
+        reason, diagnostic = _face_diagnostic(crop, config)
         if reason is None:
             quality_face.append(crop)
             continue

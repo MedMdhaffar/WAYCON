@@ -12,6 +12,7 @@ import {
   isTerminalStatus,
   isStopPending,
   liveProgress,
+  mediaImageUrl,
   mergeJobStatus,
   normalizeRollingAnalysis,
   postStopRequest,
@@ -136,6 +137,7 @@ assert.equal(formatSimilarity(4), '100%')
 assert.equal(formatSimilarity(-1), '0%')
 assert.equal(formatSimilarity('malformed'), null)
 assert.equal(identityImageUrl('folder/face one.jpg'), '/api/images?path=folder%2Fface%20one.jpg')
+assert.equal(mediaImageUrl('folder\\face one.jpg'), '/api/images?path=folder%2Fface%20one.jpg')
 assert.equal(identityImageUrl(''), '')
 assert.deepEqual(rolling.events.map(event => event.eventId), ['event-3', 'event-2', 'event-1'])
 assert.equal(rolling.events[0].type, 'future_event')
@@ -262,6 +264,9 @@ const formSource = await readFile(new URL('../src/components/StartForm.jsx', imp
 const panelSource = await readFile(new URL('../src/components/LiveIdentityPanel.jsx', import.meta.url), 'utf8')
 const cardSource = await readFile(new URL('../src/components/LiveIdentityCard.jsx', import.meta.url), 'utf8')
 const imageSource = await readFile(new URL('../src/components/SafeIdentityImage.jsx', import.meta.url), 'utf8')
+const safeImageSource = await readFile(new URL('../src/components/SafeImage.jsx', import.meta.url), 'utf8')
+const memorySource = await readFile(new URL('../src/components/MemoryTab.jsx', import.meta.url), 'utf8')
+const clothingSource = await readFile(new URL('../src/components/ClothingPanel.jsx', import.meta.url), 'utf8')
 const streamStatsSource = await readFile(new URL('../src/components/LiveStreamStats.jsx', import.meta.url), 'utf8')
 assert.match(appSource, /LiveJobControls/)
 assert.match(appSource, /LiveIdentityPanel/)
@@ -277,8 +282,16 @@ assert.match(panelSource, /Finalizing canonical profiles/)
 assert.match(cardSource, /Known person detected/)
 assert.match(cardSource, /Unknown person detected/)
 assert.match(cardSource, /Known person'/)
-assert.match(imageSource, /onError=\{\(\) => setFailed\(true\)\}/)
 assert.match(imageSource, /No face image/)
+assert.match(imageSource, /SafeImage/)
+assert.match(safeImageSource, /onError=\{\(\) => setIndex\(current => current \+ 1\)\}/)
+assert.match(safeImageSource, /setIndex\(0\)/)
+assert.match(safeImageSource, /placeholder/)
+assert.equal(/style\.display\s*=\s*['"]none/.test(memorySource), false)
+assert.match(memorySource, /image_candidates/)
+assert.match(memorySource, /Previously verified clothing remains shown below/)
+assert.match(clothingSource, /clothing-status-failed/)
+assert.match(clothingSource, /Clothing description unavailable for this identity/)
 assert.match(streamStatsSource, /Camera connection interrupted\. Reconnecting/)
 assert.match(streamStatsSource, /streamReconnectCount/)
 assert.match(streamStatsSource, /lastFrameAgeSeconds/)

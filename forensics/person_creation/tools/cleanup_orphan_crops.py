@@ -22,6 +22,7 @@ _HERE = Path(__file__).parent
 sys.path.insert(0, str(_HERE.parents[2]))
 
 from forensics.person_identifier.config import Config
+from forensics.media_paths import MediaPathError, normalize_media_path
 
 
 class CleanupError(Exception):
@@ -57,15 +58,39 @@ def cleanup(profile_name: str, dry_run: bool = False) -> dict:
         raise CleanupError(f"profile.json not found at {profile_json_path}")
 
     profile = json.loads(profile_json_path.read_text())
-    referenced = _referenced_basenames(profile)
+    referenced: set[str] = set()
+    for key in ("face_crops", "body_crops", "best_body_crops"):
+        for raw in profile.get(key, []) or []:
+            try:
+                referenced.add(normalize_media_path(raw, require_exists=False))
+            except MediaPathError:
+                continue
+    try:
+        from forensics.global_memory import GlobalMemory
+
+        memory = GlobalMemory()
+        try:
+            referenced.update(memory.all_referenced_media_paths())
+        finally:
+            memory.close()
+    except Exception as exc:
+        raise CleanupError(
+            "persistent media references could not be verified; cleanup was not run"
+        ) from exc
 
     body_dir = profile_dir / "body_crops"
     face_dir = profile_dir / "face_crops"
     body_files = _list_jpgs(body_dir)
     face_files = _list_jpgs(face_dir)
 
-    body_orphans = [p for p in body_files if p.name not in referenced]
-    face_orphans = [p for p in face_files if p.name not in referenced]
+    def unreferenced(path: Path) -> bool:
+        try:
+            return normalize_media_path(path, require_exists=True) not in referenced
+        except (MediaPathError, FileNotFoundError, OSError):
+            return False
+
+    body_orphans = [p for p in body_files if unreferenced(p)]
+    face_orphans = [p for p in face_files if unreferenced(p)]
     body_referenced = len(body_files) - len(body_orphans)
     face_referenced = len(face_files) - len(face_orphans)
 

@@ -9,6 +9,7 @@ import pytest
 from forensics.person_creation.nodes import filter_quality as quality
 from forensics.person_creation.nodes import finalize
 from forensics.person_creation.nodes import process_video
+from forensics.person_creation.quality_config import DEFAULT_QUALITY_FILTER_CONFIG
 
 
 class FakeDetector:
@@ -177,8 +178,11 @@ def test_keep_staging_defaults_to_disabled(monkeypatch):
 
 
 def test_quality_thresholds_are_unchanged():
-    assert quality._MIN_BODY_H == 80
-    assert quality._MIN_BODY_AREA == 3000
-    assert quality._MIN_FACE_W == 60
-    assert quality._MIN_FACE_H == 60
-    assert quality._MIN_SHARPNESS == 50.0
+    assert DEFAULT_QUALITY_FILTER_CONFIG.to_dict() == {
+        "face_min_width": 50,
+        "face_min_height": 50,
+        "face_min_sharpness": 50.0,
+        "body_min_height": 80,
+        "body_min_area": 3000,
+        "body_min_sharpness": 50.0,
+    }

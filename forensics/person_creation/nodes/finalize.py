@@ -3,6 +3,8 @@ import os
 import shutil
 from pathlib import Path
 
+from forensics.media_paths import MediaPathError, get_media_root, normalize_media_path
+
 
 def _basenames(items) -> set[str]:
     out: set[str] = set()
@@ -19,7 +21,13 @@ def _prune_orphans(directory: Path, keep: set[str]) -> tuple[int, int]:
     deleted = 0
     freed = 0
     for p in directory.iterdir():
-        if not p.is_file() or p.name in keep:
+        if not p.is_file():
+            continue
+        try:
+            media_path = normalize_media_path(p, require_exists=True)
+        except (MediaPathError, FileNotFoundError, OSError):
+            continue
+        if media_path in keep:
             continue
         try:
             size = p.stat().st_size
@@ -36,7 +44,7 @@ def _write_json(path: Path, data: dict) -> None:
     path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
-def _move_or_merge_dir(src: Path, dst: Path) -> None:
+def _copy_or_merge_dir(src: Path, dst: Path) -> None:
     if not src.exists():
         dst.mkdir(parents=True, exist_ok=True)
         return
@@ -44,13 +52,17 @@ def _move_or_merge_dir(src: Path, dst: Path) -> None:
     for item in src.iterdir():
         target = dst / item.name
         if target.exists():
-            if item.is_file():
-                try:
-                    item.unlink()
-                except OSError:
-                    pass
             continue
-        shutil.move(str(item), str(target))
+        if item.is_file():
+            shutil.copy2(item, target)
+
+
+def _remove_copied_source(src: Path) -> None:
+    if not src.exists():
+        return
+    for item in src.iterdir():
+        if item.is_file():
+            item.unlink(missing_ok=True)
     try:
         src.rmdir()
     except OSError:
@@ -58,7 +70,11 @@ def _move_or_merge_dir(src: Path, dst: Path) -> None:
 
 
 def _remap_crop_paths(paths: list[str], person_dir: Path, crop_dir: str) -> list[str]:
-    return [str(person_dir / crop_dir / Path(p).name) for p in (paths or []) if p]
+    return [
+        normalize_media_path(person_dir / crop_dir / Path(p).name, require_exists=True)
+        for p in (paths or [])
+        if p and (person_dir / crop_dir / Path(p).name).is_file()
+    ]
 
 
 def _remap_sharpness_map(sharpness: dict, person_dir: Path, crop_dir: str) -> dict:
@@ -66,7 +82,10 @@ def _remap_sharpness_map(sharpness: dict, person_dir: Path, crop_dir: str) -> di
     for raw_path, value in (sharpness or {}).items():
         if not raw_path:
             continue
-        new_path = str(person_dir / crop_dir / Path(raw_path).name)
+        target = person_dir / crop_dir / Path(raw_path).name
+        if not target.is_file():
+            continue
+        new_path = normalize_media_path(target, require_exists=True)
         try:
             remapped[new_path] = float(value)
         except (TypeError, ValueError):
@@ -80,7 +99,12 @@ def _remap_color_sample_paths(color_signal: dict, person_dir: Path) -> dict:
     for sample in color_signal.get("samples", []) or []:
         item = dict(sample)
         if item.get("path"):
-            item["path"] = str(person_dir / "body_crops" / Path(item["path"]).name)
+            target = person_dir / "body_crops" / Path(item["path"]).name
+            item["path"] = (
+                normalize_media_path(target, require_exists=True)
+                if target.is_file()
+                else None
+            )
         samples.append(item)
     color_signal["samples"] = samples
     return color_signal
@@ -132,6 +156,7 @@ def _session_report(state: dict, profiles_written: int) -> dict:
         "unattached_bodies": len(state.get("unattached_bodies", [])),
         "identity_clustering_config": state.get("identity_clustering_config", {}),
         "reid_config": state.get("reid_config", {}),
+        "clothing_diagnostics": state.get("clothing_diagnostics", []),
     }
     if state.get("source_type") == "live_camera":
         report.update({
@@ -180,74 +205,88 @@ def finalize(state: dict) -> dict:
     """
     output_dir = Path(state["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
-    base_db_dir = output_dir.parent if output_dir.name else Path("forensics/person_db")
+    base_db_dir = get_media_root()
     profiles = state.get("per_cluster_profiles") or {}
     finalized_profiles: dict[int, dict] = {}
 
     # Goal 3: register completed profiles into global memory. The DB is the
     # source of truth for identity; profile.json below is only a debug export.
     from forensics.global_memory import GlobalMemory
-    gm = GlobalMemory()
+    gm = GlobalMemory(media_root=base_db_dir)
 
-    for raw_cid, profile in profiles.items():
-        cid = int(raw_cid)
-        profile = _normalize_profile_schema(profile)
-        assigned_id = gm.register(profile)
-        profile["id"] = assigned_id
-        stored_person = gm.get_person(assigned_id) or {}
-        profile["name"] = stored_person.get("name") or assigned_id.replace("_", " ").title()
-        person_dir = base_db_dir / assigned_id
-        person_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        for raw_cid, profile in profiles.items():
+            cid = int(raw_cid)
+            profile = _normalize_profile_schema(profile)
+            assigned_id = gm.register(profile)
+            profile["id"] = assigned_id
+            stored_person = gm.get_person(assigned_id) or {}
+            profile["name"] = stored_person.get("name") or assigned_id.replace("_", " ").title()
+            person_dir = base_db_dir / assigned_id
+            person_dir.mkdir(parents=True, exist_ok=True)
 
-        cluster_dir = output_dir / f"cluster_{cid}"
-        _move_or_merge_dir(cluster_dir / "body_crops", person_dir / "body_crops")
-        _move_or_merge_dir(cluster_dir / "face_crops", person_dir / "face_crops")
+            cluster_dir = output_dir / f"cluster_{cid}"
+            source_body = cluster_dir / "body_crops"
+            source_face = cluster_dir / "face_crops"
+            _copy_or_merge_dir(source_body, person_dir / "body_crops")
+            _copy_or_merge_dir(source_face, person_dir / "face_crops")
 
-        profile["body_crops"] = _remap_crop_paths(profile.get("body_crops", []), person_dir, "body_crops")
-        profile["best_body_crops"] = _remap_crop_paths(profile.get("best_body_crops", []), person_dir, "body_crops")
-        profile["face_crops"] = _remap_crop_paths(profile.get("face_crops", []), person_dir, "face_crops")
-        profile["body_crop_sharpness"] = _remap_sharpness_map(
-            profile.get("body_crop_sharpness", {}),
-            person_dir,
-            "body_crops",
-        )
-        profile["face_crop_sharpness"] = _remap_sharpness_map(
-            profile.get("face_crop_sharpness", {}),
-            person_dir,
-            "face_crops",
-        )
-        if (profile.get("appearance_signals") or {}).get("color"):
-            profile["appearance_signals"]["color"] = _remap_color_sample_paths(
-                profile["appearance_signals"]["color"],
+            profile["body_crops"] = _remap_crop_paths(profile.get("body_crops", []), person_dir, "body_crops")
+            profile["best_body_crops"] = _remap_crop_paths(profile.get("best_body_crops", []), person_dir, "body_crops")
+            profile["face_crops"] = _remap_crop_paths(profile.get("face_crops", []), person_dir, "face_crops")
+            profile["body_crop_sharpness"] = _remap_sharpness_map(
+                profile.get("body_crop_sharpness", {}),
                 person_dir,
+                "body_crops",
             )
-        if profile.get("face_crops"):
-            profile["profile_image"] = profile["face_crops"][0]
-        gm.update_crop_paths(assigned_id, profile)
+            profile["face_crop_sharpness"] = _remap_sharpness_map(
+                profile.get("face_crop_sharpness", {}),
+                person_dir,
+                "face_crops",
+            )
+            if (profile.get("appearance_signals") or {}).get("color"):
+                profile["appearance_signals"]["color"] = _remap_color_sample_paths(
+                    profile["appearance_signals"]["color"],
+                    person_dir,
+                )
+            if profile.get("face_crops"):
+                profile["profile_image"] = profile["face_crops"][0]
+            gm.update_crop_paths(assigned_id, profile)
 
-        finalized_profiles[cid] = profile
-        profile_path = person_dir / "profile.json"
+            # Old session files remain valid until the database atomically points
+            # at copied canonical files. Only then is the old copy removed.
+            _remove_copied_source(source_body)
+            _remove_copied_source(source_face)
+
+            finalized_profiles[cid] = profile
+            profile_path = person_dir / "profile.json"
         # profile.json is a debug artifact - human-readable export of the DB record.
         # Source of truth for all queries is forensics/global_memory.db.
         # Downstream modules (MTMC, Goal 4 face engine) must use GlobalMemory,
         # not read this file directly.
-        profile_for_disk = {k: v for k, v in profile.items() if k != "face_embedding"}
-        _write_json(profile_path, profile_for_disk)
-        print(f"[finalize] profile saved -> {profile_path}")
+            profile_for_disk = {k: v for k, v in profile.items() if k != "face_embedding"}
+            _write_json(profile_path, profile_for_disk)
+            print(f"[finalize] profile saved -> {profile_path}")
 
-        referenced = (
-            _basenames(profile.get("face_crops"))
-            | _basenames(profile.get("body_crops"))
-            | _basenames(profile.get("best_body_crops"))
-        )
-        body_del, body_bytes = _prune_orphans(person_dir / "body_crops", referenced)
-        face_del, face_bytes = _prune_orphans(person_dir / "face_crops", referenced)
-        total_mb = (body_bytes + face_bytes) / (1024 * 1024)
-        if body_del or face_del:
-            print(
-                f"[finalize] cluster_{cid} cleanup: deleted {body_del} orphan body / "
-                f"{face_del} orphan face crops ({total_mb:.2f} MB freed)"
-            )
+            try:
+                referenced = gm.referenced_media_paths(assigned_id)
+                referenced.update(profile.get("face_crops") or [])
+                referenced.update(profile.get("body_crops") or [])
+                referenced.update(profile.get("best_body_crops") or [])
+            except Exception:
+                referenced = None
+                print("[finalize] persistent media lookup failed; orphan pruning skipped")
+            if referenced is not None:
+                body_del, body_bytes = _prune_orphans(person_dir / "body_crops", referenced)
+                face_del, face_bytes = _prune_orphans(person_dir / "face_crops", referenced)
+                total_mb = (body_bytes + face_bytes) / (1024 * 1024)
+                if body_del or face_del:
+                    print(
+                        f"[finalize] cluster_{cid} cleanup: deleted {body_del} orphan body / "
+                        f"{face_del} orphan face crops ({total_mb:.2f} MB freed)"
+                    )
+    finally:
+        gm.close()
 
     rejected = {
         "unresolved_faces": state.get("unresolved_faces", []),
@@ -264,8 +303,6 @@ def finalize(state: dict) -> dict:
 
     staging = output_dir / "_staging"
     _cleanup_staging(state, staging)
-
-    gm.close()
 
     first_id = sorted(finalized_profiles)[0] if finalized_profiles else None
     return {

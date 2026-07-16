@@ -58,6 +58,7 @@ class PersonCreationState(TypedDict):
     clothing_raw: str
     clothing_structured: dict  # {top, bottom, shoes, full}
     per_cluster_clothing: dict[int, dict]
+    clothing_diagnostics: list[dict]
 
     profile: dict
     per_cluster_profiles: dict[int, dict]

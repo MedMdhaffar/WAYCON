@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import SafeImage from './SafeImage.jsx'
 
 function MetaRow({ label, value, highlight }) {
   return (
@@ -61,18 +62,20 @@ function AssocPair({ assoc, jobId, onDeleted }) {
       {/* Thumbnails row */}
       <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '10px' }}>
         <div style={{ textAlign: 'center', flex: '0 0 auto' }}>
-          <img
-            src={`/api/images?path=${encodeURIComponent(assoc.face_path)}`}
+          <SafeImage
+            path={assoc.face_path}
             alt="face"
+            placeholder="Unavailable"
             style={{ width: '64px', height: '64px', objectFit: 'cover', borderRadius: '6px', border: '1px solid #1e2330', display: 'block' }}
           />
           <div style={{ fontSize: '10px', color: '#475569', marginTop: '2px' }}>face</div>
         </div>
         <span style={{ color: '#334155', fontSize: '18px', flexShrink: 0 }}>→</span>
         <div style={{ textAlign: 'center', flex: '0 0 auto' }}>
-          <img
-            src={`/api/images?path=${encodeURIComponent(assoc.body_path)}`}
+          <SafeImage
+            path={assoc.body_path}
             alt="body"
+            placeholder="Unavailable"
             style={{ width: '64px', height: '84px', objectFit: 'cover', borderRadius: '6px', border: '1px solid #1e2330', display: 'block' }}
           />
           <div style={{ fontSize: '10px', color: '#475569', marginTop: '2px' }}>body</div>

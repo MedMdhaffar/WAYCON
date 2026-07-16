@@ -15,6 +15,14 @@ from werkzeug.utils import secure_filename
 
 import cv2 as _cv2
 
+from forensics.media_paths import (
+    IMAGE_EXTENSIONS,
+    MediaPathError,
+    UnsupportedMediaTypeError,
+    get_media_root,
+    normalize_media_path,
+    resolve_media_path,
+)
 from forensics.person_identifier.config import Config as _PIConfig
 from forensics.person_creation.path_utils import to_wsl_path as _to_wsl_path
 from forensics.person_creation.live_stream import mask_camera_uri
@@ -72,6 +80,15 @@ def build_initial_state(body: dict, *, validate_video_paths: bool = True) -> dic
         input_type = "video_file"
 
     output_dir = str(body.get("output_dir") or f"forensics/person_db/{name.lower()}")
+    try:
+        output_relative = normalize_media_path(
+            output_dir,
+            allow_legacy_absolute=False,
+            require_exists=False,
+        )
+        output_dir = str(get_media_root() / output_relative)
+    except MediaPathError as exc:
+        raise StartRequestError("output_dir must be inside the configured media root") from exc
     every_n = max(1, _as_int(body.get("every_n", 15), "every_n"))
     initial_state = {
         "person_name": name,
@@ -147,6 +164,53 @@ def _allowed_profile_image(filename: str) -> bool:
     return "." in filename and filename.rsplit(".", 1)[1].lower() in _ALLOWED_PROFILE_IMAGE_EXTENSIONS
 
 
+_MEDIA_VALUE_KEYS = {
+    "path",
+    "crop_path",
+    "face_path",
+    "body_path",
+    "face_crop_path",
+    "body_crop_path",
+    "representative_face_path",
+    "profile_image",
+    "best_face_crop",
+}
+_MEDIA_LIST_KEYS = {"face_crops", "body_crops", "best_body_crops"}
+
+
+def _public_media_reference(value: Any) -> str | None:
+    if not value:
+        return None
+    try:
+        return normalize_media_path(
+            str(value),
+            allow_legacy_absolute=True,
+            require_exists=False,
+        )
+    except (MediaPathError, OSError):
+        return None
+
+
+def _sanitize_media_references(value: Any, parent_key: str = "") -> Any:
+    if isinstance(value, dict):
+        sanitized = {}
+        for key, item in value.items():
+            if key in _MEDIA_VALUE_KEYS:
+                sanitized[key] = _public_media_reference(item)
+            elif key in _MEDIA_LIST_KEYS and isinstance(item, list):
+                sanitized[key] = [
+                    reference
+                    for raw in item
+                    if (reference := _public_media_reference(raw)) is not None
+                ]
+            else:
+                sanitized[key] = _sanitize_media_references(item, key)
+        return sanitized
+    if isinstance(value, list):
+        return [_sanitize_media_references(item, parent_key) for item in value]
+    return value
+
+
 @dataclass
 class JobState:
     job_id: str
@@ -158,6 +222,7 @@ class JobState:
     node: str = ""
     error: str | None = None
     snapshot: dict = field(default_factory=dict)
+    output_dir: str = ""
 
 
 @dataclass
@@ -323,6 +388,7 @@ def start():
         job_id=job_id,
         input_type=initial_state.get("input_type", "video_file"),
         snapshot=safe_initial_snapshot,
+        output_dir=initial_state["output_dir"],
     )
     with _jobs_lock:
         _jobs[job_id] = job
@@ -384,6 +450,7 @@ def status(job_id: str):
         "clothing_structured": snap.get("clothing_structured", {}),
         "clothing_raw":        snap.get("clothing_raw", ""),
         "per_cluster_clothing": snap.get("per_cluster_clothing", {}),
+        "clothing_diagnostics": snap.get("clothing_diagnostics", []),
         "profile":             snap.get("profile", {}),
         "human_feedback_path": snap.get("human_feedback_path", ""),
         "source_type":        snap.get("source_type", "video_file"),
@@ -407,7 +474,7 @@ def status(job_id: str):
         "status":   job_status,
         "node":     job_node,
         "error":    job_error,
-        "snapshot": safe_snap,
+        "snapshot": _sanitize_media_references(safe_snap),
     })
 
 
@@ -415,29 +482,53 @@ def status(job_id: str):
 def delete_crop(job_id: str):
     with _jobs_lock:
         job = _jobs.get(job_id)
-    if not job:
-        return jsonify({"error": "job not found"}), 404
+        if not job:
+            return jsonify({"error": "job not found"}), 404
+        body = request.get_json(silent=True) or {}
+        path_str = str(body.get("path") or "")
+        crop_type = str(body.get("crop_type") or "body")
+        if crop_type not in {"body", "face"}:
+            return jsonify({"error": "invalid crop type"}), 400
 
-    body = request.get_json(force=True)
-    path_str = body.get("path", "")
-    crop_type = body.get("crop_type", "body")
-
-    Path(path_str).resolve().unlink(missing_ok=True)
-
-    with _jobs_lock:
         snap = job.snapshot
+        expected = {
+            public_path: str(item.get("path"))
+            for item in snap.get(
+                "quality_body_crops" if crop_type == "body" else "quality_face_crops",
+                [],
+            )
+            if item.get("path")
+            and (public_path := _public_media_reference(item.get("path"))) is not None
+        }
+        if path_str not in expected:
+            return jsonify({"error": "crop does not belong to this job"}), 403
+        try:
+            recorded_path = expected[path_str]
+            target = Path(recorded_path).resolve(strict=True)
+            output_root = Path(job.output_dir).resolve(strict=False)
+            target.relative_to(output_root)
+            if target.parent.name != f"{crop_type}_crops":
+                raise MediaPathError("unexpected crop location")
+            if target.suffix.lower() not in IMAGE_EXTENSIONS:
+                raise UnsupportedMediaTypeError("unsupported crop type")
+            target.unlink()
+        except FileNotFoundError:
+            return jsonify({"error": "crop not found"}), 404
+        except (MediaPathError, UnsupportedMediaTypeError, ValueError, OSError):
+            return jsonify({"error": "unsafe crop path"}), 403
+
         if crop_type == "body":
-            snap["quality_body_crops"] = [c for c in snap.get("quality_body_crops", []) if c["path"] != path_str]
-            snap["associations"]       = [a for a in snap.get("associations", []) if a.get("body_path") != path_str]
-            snap["best_body_crops"]    = [p for p in snap.get("best_body_crops", []) if p != path_str]
+            snap["quality_body_crops"] = [c for c in snap.get("quality_body_crops", []) if c["path"] != recorded_path]
+            snap["associations"]       = [a for a in snap.get("associations", []) if a.get("body_path") != recorded_path]
+            snap["best_body_crops"]    = [p for p in snap.get("best_body_crops", []) if p != recorded_path]
             # Remove from frame_groups
             for fg in snap.get("frame_groups", []):
-                fg["bodies"] = [b for b in fg.get("bodies", []) if b["path"] != path_str]
+                fg["bodies"] = [b for b in fg.get("bodies", []) if b["path"] != recorded_path]
         else:
-            snap["quality_face_crops"] = [c for c in snap.get("quality_face_crops", []) if c["path"] != path_str]
-            snap["associations"]       = [a for a in snap.get("associations", []) if a.get("face_path") != path_str]
+            snap["quality_face_crops"] = [c for c in snap.get("quality_face_crops", []) if c["path"] != recorded_path]
+            snap["associations"]       = [a for a in snap.get("associations", []) if a.get("face_path") != recorded_path]
             for fg in snap.get("frame_groups", []):
-                fg["faces"] = [f for f in fg.get("faces", []) if f["path"] != path_str]
+                fg["faces"] = [f for f in fg.get("faces", []) if f["path"] != recorded_path]
 
     return jsonify({"ok": True})
 
@@ -449,18 +540,28 @@ def crops(job_id: str):
         if not job:
             return jsonify({"error": "job not found"}), 404
         snap = deepcopy(job.snapshot)
-    return jsonify({
+    return jsonify(_sanitize_media_references({
         "body_crops": snap.get("quality_body_crops", []),
         "face_crops": snap.get("quality_face_crops", []),
-    })
+    }))
 
 
 @app.get("/api/images")
 def serve_image():
     path_str = request.args.get("path", "")
-    path = Path(path_str).resolve()
-    if not path.exists() or not path.is_file():
+    try:
+        path = resolve_media_path(
+            path_str,
+            allow_legacy_absolute=False,
+            require_exists=True,
+            image_only=True,
+        )
+    except UnsupportedMediaTypeError:
+        return jsonify({"error": "unsupported image type"}), 400
+    except FileNotFoundError:
         return jsonify({"error": "file not found"}), 404
+    except (MediaPathError, OSError):
+        return jsonify({"error": "unsafe image path"}), 403
     return send_file(str(path))
 
 
@@ -470,9 +571,15 @@ def serve_image():
 def memory_persons():
     from forensics.global_memory import GlobalMemory
 
+    include_inactive = request.args.get("include_inactive", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
     gm = GlobalMemory()
     try:
-        return jsonify(gm.list_all())
+        return jsonify(gm.list_all(include_inactive=include_inactive))
     finally:
         gm.close()
 
@@ -533,22 +640,33 @@ def memory_upload_profile_image(person_id):
             if not file or not _allowed_profile_image(file.filename or ""):
                 return jsonify({"error": "Invalid file. Use JPEG or PNG."}), 400
 
-            person_dir = Path("forensics/person_db") / person_id
-            person_dir.mkdir(parents=True, exist_ok=True)
             original = secure_filename(file.filename or "profile_image.jpg")
             ext = original.rsplit(".", 1)[1].lower()
-            dest = person_dir / f"profile_image.{ext}"
+            relative = normalize_media_path(
+                f"{person_id}/profile_image.{ext}",
+                allow_legacy_absolute=False,
+            )
+            dest = resolve_media_path(relative, require_exists=False)
+            dest.parent.mkdir(parents=True, exist_ok=True)
             file.save(str(dest))
-            image_path = str(dest.resolve())
+            image_path = relative
 
         elif request.is_json and (request.get_json(silent=True) or {}).get("path"):
             data = request.get_json(silent=True) or {}
-            source = Path(str(data.get("path", "")).strip())
-            if not source.exists() or not source.is_file():
-                return jsonify({"error": f"File not found: {source}"}), 400
-            if not _allowed_profile_image(str(source)):
+            try:
+                source = resolve_media_path(
+                    str(data.get("path", "")).strip(),
+                    allow_legacy_absolute=False,
+                    require_exists=True,
+                    image_only=True,
+                )
+                image_path = normalize_media_path(source)
+            except UnsupportedMediaTypeError:
                 return jsonify({"error": "Invalid file type. Use JPEG or PNG."}), 400
-            image_path = str(source.resolve())
+            except FileNotFoundError:
+                return jsonify({"error": "Media file not found."}), 404
+            except (MediaPathError, OSError):
+                return jsonify({"error": "Unsafe media path."}), 403
 
         else:
             return jsonify({"error": "Provide 'image' file or JSON { path }"}), 400

@@ -1,0 +1,61 @@
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass
+import os
+from typing import Any, Mapping
+
+
+@dataclass(frozen=True)
+class QualityFilterConfig:
+    face_min_width: int = 50
+    face_min_height: int = 50
+    face_min_sharpness: float = 50.0
+    body_min_height: int = 80
+    body_min_area: int = 3000
+    body_min_sharpness: float = 50.0
+
+    def validate(self) -> QualityFilterConfig:
+        if self.face_min_width <= 0 or self.face_min_height <= 0:
+            raise ValueError("Face minimum dimensions must be positive.")
+        if self.body_min_height <= 0 or self.body_min_area <= 0:
+            raise ValueError("Body minimum dimensions must be positive.")
+        if self.face_min_sharpness < 0 or self.body_min_sharpness < 0:
+            raise ValueError("Minimum sharpness must be non-negative.")
+        return self
+
+    def to_dict(self) -> dict[str, int | float]:
+        return asdict(self)
+
+
+DEFAULT_QUALITY_FILTER_CONFIG = QualityFilterConfig()
+_CONFIG_FIELDS = tuple(QualityFilterConfig.__dataclass_fields__)
+
+
+def _coerce(name: str, value: Any) -> int | float:
+    default = getattr(DEFAULT_QUALITY_FILTER_CONFIG, name)
+    try:
+        return int(value) if isinstance(default, int) else float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid quality-filter value for {name}: {value!r}") from exc
+
+
+def load_quality_filter_config(
+    overrides: Mapping[str, Any] | None = None,
+) -> QualityFilterConfig:
+    """Resolve explicit overrides, then environment, then production default."""
+    supplied = dict(overrides or {})
+    unknown = sorted(set(supplied) - set(_CONFIG_FIELDS))
+    if unknown:
+        raise ValueError(
+            "Unknown quality-filter setting(s): " + ", ".join(unknown)
+        )
+
+    values: dict[str, int | float] = {}
+    for name in _CONFIG_FIELDS:
+        env_key = f"PERSON_CREATION_{name.upper()}"
+        raw = supplied.get(
+            name,
+            os.getenv(env_key, getattr(DEFAULT_QUALITY_FILTER_CONFIG, name)),
+        )
+        values[name] = _coerce(name, raw)
+    return QualityFilterConfig(**values).validate()

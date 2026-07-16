@@ -108,9 +108,15 @@ function rollingState(value, enabled) {
   return 'waiting'
 }
 
+export function mediaImageUrl(path) {
+  const safePath = stringValue(path).replaceAll('\\', '/')
+  if (!safePath) return ''
+  if (safePath.startsWith('/api/images?path=')) return safePath
+  return `/api/images?path=${encodeURIComponent(safePath)}`
+}
+
 export function identityImageUrl(path) {
-  const safePath = stringValue(path)
-  return safePath ? `/api/images?path=${encodeURIComponent(safePath)}` : ''
+  return mediaImageUrl(path)
 }
 
 export function formatSimilarity(value) {

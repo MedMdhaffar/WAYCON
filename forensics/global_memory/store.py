@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import threading
 from datetime import date, datetime
@@ -8,6 +9,13 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+
+from forensics.media_paths import (
+    MediaPathError,
+    get_media_root,
+    normalize_media_path,
+    resolve_media_path,
+)
 
 from . import config
 
@@ -17,32 +25,69 @@ class ReadOnlyGlobalMemoryError(RuntimeError):
 
 
 class GlobalMemory:
-    def __init__(self, db_path: str | None = None, *, read_only: bool = False):
-        self.db_path = Path(db_path or config.DB_PATH)
+    def __init__(
+        self,
+        db_path: str | None = None,
+        *,
+        read_only: bool = False,
+        media_root: str | Path | None = None,
+    ):
+        self.db_path = Path(db_path or os.getenv("FORENSICS_MEMORY_DB", config.DB_PATH))
+        self.media_root = get_media_root(media_root)
         self.read_only = bool(read_only)
         self._lock = threading.RLock()
+        self._conn = self._open_connection()
+        try:
+            self._conn.row_factory = sqlite3.Row
+            self._configure_connection()
+            if not self.read_only:
+                self._initialize_schema()
+        except BaseException:
+            self._conn.close()
+            raise
+
+    def _open_connection(self) -> sqlite3.Connection:
         if self.read_only:
             uri = f"{self.db_path.resolve().as_uri()}?mode=ro"
-            self._conn = sqlite3.connect(
+            return sqlite3.connect(
                 uri,
                 uri=True,
                 check_same_thread=False,
                 isolation_level=None,
             )
-        else:
-            self.db_path.parent.mkdir(parents=True, exist_ok=True)
-            self._conn = sqlite3.connect(
-                str(self.db_path),
-                check_same_thread=False,
-                isolation_level=None,
-            )
-        self._conn.row_factory = sqlite3.Row
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        return sqlite3.connect(
+            str(self.db_path),
+            check_same_thread=False,
+            isolation_level=None,
+        )
+
+    def _configure_connection(self) -> None:
         if self.read_only:
             self._conn.execute("PRAGMA query_only=ON")
-        else:
-            schema_path = Path(__file__).with_name("schema.sql")
-            self._conn.executescript(schema_path.read_text(encoding="utf-8"))
+            self._conn.execute("PRAGMA busy_timeout=5000")
+            return
+        self._conn.execute("PRAGMA foreign_keys=ON")
+        self._conn.execute("PRAGMA busy_timeout=5000")
+        journal_mode = self._conn.execute("PRAGMA journal_mode=WAL").fetchone()
+        if journal_mode is None or str(journal_mode[0]).lower() != "wal":
+            actual = "unknown" if journal_mode is None else str(journal_mode[0])
+            raise RuntimeError(
+                f"Global Memory requires WAL journal mode; SQLite returned {actual!r}."
+            )
+
+    def _initialize_schema(self) -> None:
+        schema_path = Path(__file__).with_name("schema.sql")
+        try:
+            self._conn.executescript(
+                "BEGIN IMMEDIATE;\n" + schema_path.read_text(encoding="utf-8")
+            )
             self._ensure_schema_columns()
+            self._conn.execute("COMMIT")
+        except BaseException:
+            if self._conn.in_transaction:
+                self._conn.execute("ROLLBACK")
+            raise
 
     def register(self, profile: dict) -> str:
         self._require_writable("register")
@@ -111,7 +156,7 @@ class GlobalMemory:
 
         with self._lock:
             rows = self._conn.execute(
-                "SELECT person_id, name, embedding FROM persons"
+                "SELECT person_id, name, embedding FROM persons WHERE is_active=1"
             ).fetchall()
             if not rows:
                 return []
@@ -143,9 +188,9 @@ class GlobalMemory:
             rows = self._conn.execute(
                 """
                 SELECT p.person_id, p.name, a.*
-                  FROM appearances a
+                 FROM appearances a
                   JOIN persons p ON p.person_id = a.person_id
-                 WHERE a.date = ?
+                 WHERE a.date = ? AND p.is_active = 1
                  ORDER BY p.name
                 """,
                 (date,),
@@ -163,7 +208,8 @@ class GlobalMemory:
         camera_id = str(camera_id)
         with self._lock:
             rows = self._conn.execute(
-                "SELECT person_id, name, enrolled_at, cameras FROM persons"
+                "SELECT person_id, name, enrolled_at, cameras "
+                "FROM persons WHERE is_active=1"
             ).fetchall()
             results = []
             for row in rows:
@@ -194,18 +240,24 @@ class GlobalMemory:
                 "enrolled_at": row["enrolled_at"],
                 "updated_at": row["updated_at"],
                 "cameras": self._json_list(row["cameras"]),
-                "profile_image": row["profile_image"],
+                "profile_image": self._public_media_path(row["profile_image"]),
                 "profile_image_source": row["profile_image_source"],
+                "is_active": bool(row["is_active"]),
+                "merged_into_person_id": row["merged_into_person_id"],
+                "image_candidates": self._image_candidates(row["person_id"]),
                 "latest_appearance": self._latest_appearance(row["person_id"]),
             }
 
-    def list_all(self) -> list[dict]:
+    def list_all(self, include_inactive: bool = False) -> list[dict]:
         with self._lock:
+            where = "" if include_inactive else "WHERE is_active=1"
             rows = self._conn.execute(
-                """
+                f"""
                 SELECT person_id, name, enrolled_at, updated_at, cameras,
-                       profile_image, profile_image_source
+                       profile_image, profile_image_source,
+                       is_active, merged_into_person_id
                   FROM persons
+                 {where}
                  ORDER BY person_id
                 """
             ).fetchall()
@@ -216,8 +268,11 @@ class GlobalMemory:
                     "enrolled_at": row["enrolled_at"],
                     "updated_at": row["updated_at"],
                     "cameras": self._json_list(row["cameras"]),
-                    "profile_image": row["profile_image"],
+                    "profile_image": self._public_media_path(row["profile_image"]),
                     "profile_image_source": row["profile_image_source"],
+                    "is_active": bool(row["is_active"]),
+                    "merged_into_person_id": row["merged_into_person_id"],
+                    "image_candidates": self._image_candidates(row["person_id"]),
                     "latest_appearance": self._latest_appearance(row["person_id"]),
                 }
                 for row in rows
@@ -254,7 +309,7 @@ class GlobalMemory:
                     "embedding_count_before": row["embedding_count_before"],
                     "embedding_count_after": row["embedding_count_after"],
                     "video_sources": self._json_list(row["video_sources"]),
-                    "best_face_crop": row["best_face_crop"],
+                    "best_face_crop": self._public_media_path(row["best_face_crop"]),
                     "ts": row["ts"],
                 }
                 for row in rows
@@ -275,38 +330,44 @@ class GlobalMemory:
         profile_image = self._best_face_crop(profile)
 
         with self._lock:
-            person = self._conn.execute(
-                "SELECT profile_image_source FROM persons WHERE person_id=?",
-                (person_id,),
-            ).fetchone()
-            image_source = person["profile_image_source"] if person else "auto"
-            if profile_image:
-                if image_source != "manual":
-                    self._conn.execute(
-                        """
-                        UPDATE persons
-                           SET profile_image=?, profile_image_source='auto'
-                         WHERE person_id=?
-                        """,
-                        (profile_image, person_id),
-                    )
-                latest = self._conn.execute(
-                    """
-                    SELECT id FROM recognition_log
-                     WHERE person_id=?
-                     ORDER BY id DESC
-                     LIMIT 1
-                    """,
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                person = self._conn.execute(
+                    "SELECT profile_image_source FROM persons WHERE person_id=?",
                     (person_id,),
                 ).fetchone()
-                if latest is not None:
-                    self._conn.execute(
-                        "UPDATE recognition_log SET best_face_crop=? WHERE id=?",
-                        (profile_image, latest["id"]),
-                    )
-            self._upsert_appearance(person_id, appearance_date, profile)
-            self._remove_missing_gallery_paths(person_id)
-            self.update_gallery(person_id, profile)
+                image_source = person["profile_image_source"] if person else "auto"
+                if profile_image:
+                    if image_source != "manual":
+                        self._conn.execute(
+                            """
+                            UPDATE persons
+                               SET profile_image=?, profile_image_source='auto'
+                             WHERE person_id=?
+                            """,
+                            (profile_image, person_id),
+                        )
+                    latest = self._conn.execute(
+                        """
+                        SELECT id FROM recognition_log
+                         WHERE person_id=?
+                         ORDER BY id DESC
+                         LIMIT 1
+                        """,
+                        (person_id,),
+                    ).fetchone()
+                    if latest is not None:
+                        self._conn.execute(
+                            "UPDATE recognition_log SET best_face_crop=? WHERE id=?",
+                            (profile_image, latest["id"]),
+                        )
+                self._upsert_appearance(person_id, appearance_date, profile)
+                self._remove_missing_gallery_paths(person_id)
+                self.update_gallery(person_id, profile)
+                self._conn.execute("COMMIT")
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
 
     def set_profile_image(self, person_id: str, image_path: str, source: str = "auto") -> None:
         self._require_writable("set_profile_image")
@@ -318,7 +379,7 @@ class GlobalMemory:
                    SET profile_image=?, profile_image_source=?
                  WHERE person_id=?
                 """,
-                (str(image_path), source, person_id),
+                (self._stored_media_path(image_path, require_exists=True), source, person_id),
             )
 
     def get_best_face_crop(self, person_id: str) -> dict | None:
@@ -332,8 +393,10 @@ class GlobalMemory:
                 """,
                 (person_id,),
             ).fetchone()
-            if row is not None and Path(row["path"]).exists():
-                return {"path": row["path"], "sharpness": row["sharpness"]}
+            if row is not None:
+                path = self._public_media_path(row["path"])
+                if path:
+                    return {"path": path, "sharpness": row["sharpness"]}
 
             row = self._conn.execute(
                 """
@@ -345,7 +408,9 @@ class GlobalMemory:
                 (person_id,),
             ).fetchone()
             if row is not None and row["best_face_crop"]:
-                return {"path": row["best_face_crop"], "sharpness": 0.0}
+                path = self._public_media_path(row["best_face_crop"])
+                if path:
+                    return {"path": path, "sharpness": 0.0}
             return None
 
     def update_gallery(self, person_id: str, profile: dict) -> None:
@@ -409,7 +474,7 @@ class GlobalMemory:
                     "id": row["id"],
                     "person_id": row["person_id"],
                     "crop_type": row["crop_type"],
-                    "path": row["path"],
+                    "path": self._public_media_path(row["path"]),
                     "sharpness": row["sharpness"],
                     "session_date": row["session_date"],
                     "video_source": row["video_source"],
@@ -417,7 +482,96 @@ class GlobalMemory:
                     "height": row["height"],
                 }
                 for row in rows
+                if self._public_media_path(row["path"])
             ]
+
+    def referenced_media_paths(self, person_id: str) -> set[str]:
+        """Return every persistent media reference for conservative pruning."""
+        with self._lock:
+            values: list[str] = []
+            person = self._conn.execute(
+                "SELECT profile_image FROM persons WHERE person_id=?",
+                (person_id,),
+            ).fetchone()
+            if person is not None and person["profile_image"]:
+                values.append(person["profile_image"])
+            values.extend(
+                row["path"]
+                for row in self._conn.execute(
+                    "SELECT path FROM person_gallery WHERE person_id=?",
+                    (person_id,),
+                ).fetchall()
+                if row["path"]
+            )
+            for row in self._conn.execute(
+                "SELECT best_body_crops FROM appearances WHERE person_id=?",
+                (person_id,),
+            ).fetchall():
+                values.extend(self._json_list(row["best_body_crops"]))
+            values.extend(
+                row["best_face_crop"]
+                for row in self._conn.execute(
+                    "SELECT best_face_crop FROM recognition_log WHERE person_id=?",
+                    (person_id,),
+                ).fetchall()
+                if row["best_face_crop"]
+            )
+
+        references: set[str] = set()
+        for value in values:
+            try:
+                references.add(normalize_media_path(
+                    value,
+                    media_root=self.media_root,
+                    allow_legacy_absolute=True,
+                    require_exists=False,
+                ))
+            except MediaPathError:
+                continue
+        return references
+
+    def all_referenced_media_paths(self) -> set[str]:
+        with self._lock:
+            person_ids = [
+                row["person_id"]
+                for row in self._conn.execute("SELECT person_id FROM persons").fetchall()
+            ]
+        references: set[str] = set()
+        for person_id in person_ids:
+            references.update(self.referenced_media_paths(person_id))
+        return references
+
+    def _image_candidates(self, person_id: str) -> list[str]:
+        values: list[str | None] = []
+        person = self._conn.execute(
+            "SELECT profile_image FROM persons WHERE person_id=?",
+            (person_id,),
+        ).fetchone()
+        values.append(person["profile_image"] if person is not None else None)
+        values.extend(
+            row["path"]
+            for row in self._conn.execute(
+                "SELECT path FROM person_gallery "
+                "WHERE person_id=? AND crop_type='face' "
+                "ORDER BY sharpness DESC, id DESC",
+                (person_id,),
+            ).fetchall()
+        )
+        values.extend(
+            row["best_face_crop"]
+            for row in self._conn.execute(
+                "SELECT best_face_crop FROM recognition_log "
+                "WHERE person_id=? AND best_face_crop IS NOT NULL "
+                "ORDER BY id DESC",
+                (person_id,),
+            ).fetchall()
+        )
+        candidates: list[str] = []
+        for value in values:
+            path = self._public_media_path(value)
+            if path and path not in candidates:
+                candidates.append(path)
+        return candidates
 
     def close(self) -> None:
         with self._lock:
@@ -445,6 +599,27 @@ class GlobalMemory:
         log_columns = self._table_columns("recognition_log")
         if "best_face_crop" not in log_columns:
             self._conn.execute("ALTER TABLE recognition_log ADD COLUMN best_face_crop TEXT DEFAULT NULL")
+
+        appearance_columns = self._table_columns("appearances")
+        if "clothing_status" not in appearance_columns:
+            self._conn.execute(
+                "ALTER TABLE appearances ADD COLUMN clothing_status "
+                "TEXT NOT NULL DEFAULT 'not_attempted'"
+            )
+
+        person_columns = self._table_columns("persons")
+        if "is_active" not in person_columns:
+            self._conn.execute(
+                "ALTER TABLE persons ADD COLUMN is_active INTEGER NOT NULL "
+                "DEFAULT 1 CHECK (is_active IN (0, 1))"
+            )
+        if "merged_into_person_id" not in person_columns:
+            self._conn.execute(
+                "ALTER TABLE persons ADD COLUMN merged_into_person_id TEXT DEFAULT NULL"
+            )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_persons_active ON persons(is_active)"
+        )
 
     def _table_columns(self, table: str) -> set[str]:
         rows = self._conn.execute(f"PRAGMA table_info({table})").fetchall()
@@ -478,7 +653,8 @@ class GlobalMemory:
     def _find_existing_person(self, embedding: np.ndarray, threshold: float | None = None) -> dict | None:
         threshold = config.SIMILARITY_THRESHOLD if threshold is None else float(threshold)
         rows = self._conn.execute(
-            "SELECT person_id, name, embedding, embedding_count FROM persons"
+            "SELECT person_id, name, embedding, embedding_count "
+            "FROM persons WHERE is_active=1"
         ).fetchall()
         if not rows:
             return None
@@ -602,8 +778,14 @@ class GlobalMemory:
     ) -> None:
         if not path:
             return
-        resolved = Path(str(path))
-        if not resolved.exists():
+        try:
+            stored_path = self._stored_media_path(path, require_exists=True)
+            resolved = resolve_media_path(
+                stored_path,
+                media_root=self.media_root,
+                require_exists=True,
+            )
+        except (MediaPathError, FileNotFoundError, OSError):
             return
 
         width = None
@@ -627,7 +809,7 @@ class GlobalMemory:
             (
                 person_id,
                 crop_type,
-                str(resolved.resolve()),
+                stored_path,
                 float(sharpness or 0.0),
                 session_date,
                 video_source,
@@ -659,7 +841,11 @@ class GlobalMemory:
             "SELECT id, path FROM person_gallery WHERE person_id=?",
             (person_id,),
         ).fetchall()
-        missing = [row["id"] for row in rows if not Path(row["path"]).exists()]
+        missing = [
+            row["id"]
+            for row in rows
+            if self._public_media_path(row["path"]) is None
+        ]
         if not missing:
             return
         placeholders = ",".join("?" for _ in missing)
@@ -670,29 +856,85 @@ class GlobalMemory:
 
     def _upsert_appearance(self, person_id: str, appearance_date: str, profile: dict) -> None:
         appearance = profile.get("appearance") or {}
-        clothing_fields = [appearance.get("top"), appearance.get("bottom"), appearance.get("shoes")]
-        if not any(clothing_fields):
-            return
-
         color = ((profile.get("appearance_signals") or {}).get("color") or {})
+        raw_clothing = [
+            appearance.get("top"),
+            appearance.get("bottom"),
+            appearance.get("shoes"),
+            appearance.get("full"),
+        ]
+        default_status = "ok" if any(raw_clothing) else "not_attempted"
+        status = str(appearance.get("clothing_status") or default_status)
+        if status not in {"ok", "failed", "not_attempted"}:
+            status = "failed"
+
+        def useful(value):
+            if value is None:
+                return None
+            text = str(value).strip()
+            if not text or text.lower() in {
+                "unknown",
+                "unavailable",
+                "clothing description unavailable.",
+            }:
+                return None
+            return text
+
+        incoming_clothing = {
+            "top": useful(appearance.get("top")),
+            "bottom": useful(appearance.get("bottom")),
+            "shoes": useful(appearance.get("shoes")),
+            "full_description": useful(appearance.get("full")),
+        }
+        existing = self._conn.execute(
+            "SELECT * FROM appearances WHERE person_id=? AND date=?",
+            (person_id, appearance_date),
+        ).fetchone()
+        if status != "ok":
+            incoming_clothing = {key: None for key in incoming_clothing}
+
+        def preserved(column: str, incoming):
+            if incoming is not None:
+                return incoming
+            return existing[column] if existing is not None else None
+
+        body_paths = [
+            stored
+            for raw in (profile.get("best_body_crops") or [])
+            if (stored := self._try_stored_media_path(raw)) is not None
+        ]
+        old_body = self._json_list(existing["best_body_crops"]) if existing is not None else []
+        old_videos = self._json_list(existing["video_sources"]) if existing is not None else []
         self._conn.execute(
             """
-            INSERT OR REPLACE INTO appearances (
+            INSERT INTO appearances (
                 person_id, date, top, bottom, shoes, full_description,
-                top_color, bottom_color, best_body_crops, video_sources
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                top_color, bottom_color, clothing_status,
+                best_body_crops, video_sources
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(person_id, date) DO UPDATE SET
+                top=excluded.top,
+                bottom=excluded.bottom,
+                shoes=excluded.shoes,
+                full_description=excluded.full_description,
+                top_color=excluded.top_color,
+                bottom_color=excluded.bottom_color,
+                clothing_status=excluded.clothing_status,
+                best_body_crops=excluded.best_body_crops,
+                video_sources=excluded.video_sources
             """,
             (
                 person_id,
                 appearance_date,
-                appearance.get("top"),
-                appearance.get("bottom"),
-                appearance.get("shoes"),
-                appearance.get("full"),
-                color.get("top"),
-                color.get("bottom"),
-                json.dumps(profile.get("best_body_crops") or []),
-                json.dumps(profile.get("video_sources") or []),
+                preserved("top", incoming_clothing["top"]),
+                preserved("bottom", incoming_clothing["bottom"]),
+                preserved("shoes", incoming_clothing["shoes"]),
+                preserved("full_description", incoming_clothing["full_description"]),
+                preserved("top_color", color.get("top")),
+                preserved("bottom_color", color.get("bottom")),
+                status,
+                json.dumps(self._merge_lists(old_body, body_paths)),
+                json.dumps(self._merge_lists(old_videos, profile.get("video_sources") or [])),
             ),
         )
 
@@ -754,7 +996,16 @@ class GlobalMemory:
             "full_description": row["full_description"],
             "top_color": row["top_color"],
             "bottom_color": row["bottom_color"],
-            "best_body_crops": self._json_list(row["best_body_crops"]),
+            "clothing_status": (
+                row["clothing_status"]
+                if "clothing_status" in row.keys()
+                else "not_attempted"
+            ),
+            "best_body_crops": [
+                path
+                for raw in self._json_list(row["best_body_crops"])
+                if (path := self._public_media_path(raw)) is not None
+            ],
             "video_sources": self._json_list(row["video_sources"]),
         }
         if include_stale:
@@ -769,8 +1020,7 @@ class GlobalMemory:
             raise ValueError("face embedding must be non-zero")
         return vec / norm
 
-    @staticmethod
-    def _best_face_crop(profile: dict) -> str | None:
+    def _best_face_crop(self, profile: dict) -> str | None:
         crops = profile.get("face_crops") or []
         sharpness = profile.get("face_crop_sharpness") or {}
 
@@ -778,29 +1028,51 @@ class GlobalMemory:
         for raw in crops:
             if not raw:
                 continue
-            path = Path(str(raw))
-            if path.exists():
-                existing.append(str(path.resolve()))
+            path = self._try_stored_media_path(raw)
+            if path is not None:
+                existing.append(path)
 
         if not existing:
             return None
         if sharpness:
-            return max(existing, key=lambda p: GlobalMemory._sharpness_for_path(sharpness, p))
+            return max(existing, key=lambda p: self._sharpness_for_path(sharpness, p))
         return existing[0]
 
-    @staticmethod
-    def _sharpness_for_path(sharpness: dict, path: str | None) -> float:
+    def _try_stored_media_path(self, path: str | Path | None) -> str | None:
+        if not path:
+            return None
+        try:
+            return self._stored_media_path(path, require_exists=True)
+        except (MediaPathError, FileNotFoundError, OSError):
+            return None
+
+    def _stored_media_path(
+        self,
+        path: str | Path,
+        *,
+        require_exists: bool,
+    ) -> str:
+        return normalize_media_path(
+            path,
+            media_root=self.media_root,
+            allow_legacy_absolute=True,
+            require_exists=require_exists,
+        )
+
+    def _public_media_path(self, path: str | Path | None) -> str | None:
+        return self._try_stored_media_path(path)
+
+    def _sharpness_for_path(self, sharpness: dict, path: str | None) -> float:
         if not path:
             return 0.0
-        variants = [
-            path,
-            str(Path(path)),
-            str(Path(path).resolve()) if Path(path).exists() else path,
-        ]
-        for key in variants:
-            if key in sharpness:
+        for key, value in sharpness.items():
+            try:
+                matches = self._stored_media_path(key, require_exists=False) == path
+            except MediaPathError:
+                matches = str(key) == str(path)
+            if matches:
                 try:
-                    return float(sharpness[key])
+                    return float(value)
                 except (TypeError, ValueError):
                     return 0.0
         return 0.0
