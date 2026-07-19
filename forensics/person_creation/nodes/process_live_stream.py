@@ -5,8 +5,8 @@ from __future__ import annotations
 import re
 import time
 
+from forensics.person_creation.gst_stream import ConnectionState, GstFrameBuffer
 from forensics.person_creation.live_stream import (
-    LiveFrameBuffer,
     mask_camera_uri,
     write_stream_report,
 )
@@ -40,11 +40,30 @@ def process_live_stream(state: PersonCreationState) -> dict:
     body_dir, face_dir = prepare_staging_dirs(state["output_dir"])
     person_detector = get_person_detector()
     face_detector = FaceEngineClient()
-    buffer = LiveFrameBuffer(
+
+    # segment_incomplete/reconnect bookkeeping: set by the buffer's reconnect callbacks,
+    # read back after the capture loop. Presence-gate integration (marking presence
+    # "unknown" during RECONNECTING, restarting debounce after) hooks into the same
+    # on_disconnect/on_reconnected callbacks once the Tier 0 presence gate lands.
+    reconnect_events: list[dict] = []
+
+    def _on_disconnect(reason: str) -> None:
+        reconnect_events.append({"event": "disconnected", "reason": reason, "ts": time.time()})
+        _notify(state, "camera_disconnected", {"reconnect_reason": reason})
+
+    def _on_reconnected() -> None:
+        reconnect_events.append({"event": "reconnected", "ts": time.time()})
+        _notify(state, "camera_reconnected")
+
+    buffer = GstFrameBuffer(
         camera_uri,
         max_size=buffer_max_size,
-        open_timeout_ms=int(config.get("open_timeout_ms", 10_000)),
-        read_timeout_ms=int(config.get("read_timeout_ms", 5_000)),
+        codec=str(config.get("codec", "h264")),
+        decoder=config.get("decoder"),
+        latency_ms=int(config.get("latency_ms", 200)),
+        stall_timeout_seconds=frame_timeout_seconds,
+        on_disconnect=_on_disconnect,
+        on_reconnected=_on_reconnected,
     )
 
     _notify(state, "connecting_camera")
@@ -68,8 +87,10 @@ def process_live_stream(state: PersonCreationState) -> dict:
             item = buffer.get(timeout=min(1.0, frame_timeout_seconds))
             now = time.monotonic()
             if item is None:
-                if buffer.error:
-                    raise OSError(buffer.error)
+                # buffer.error is set while GstFrameBuffer is mid-reconnect (see
+                # gst_stream.py); it is not fatal by itself -- the buffer keeps retrying
+                # with backoff in the background. If the outage outlasts
+                # frame_timeout_seconds the branch below ends this segment early anyway.
                 if buffer.ended and buffer.empty:
                     if buffer.frames_read == 0:
                         raise OSError(
@@ -127,6 +148,8 @@ def process_live_stream(state: PersonCreationState) -> dict:
 
     stats = buffer.stats(frames_processed, warnings=warnings)
     stats["duration_seconds"] = duration_seconds
+    stats["reconnect_events"] = reconnect_events
+    segment_incomplete = any(e["event"] == "disconnected" for e in reconnect_events)
     report_path = write_stream_report(
         state["output_dir"],
         camera_uri=camera_uri,
@@ -148,4 +171,5 @@ def process_live_stream(state: PersonCreationState) -> dict:
         "source_uri_masked": masked_uri,
         "stream_stats": stats,
         "stream_report_path": report_path,
+        "segment_incomplete": segment_incomplete,
     }

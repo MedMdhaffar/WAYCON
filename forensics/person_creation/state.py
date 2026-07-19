@@ -15,6 +15,7 @@ class PersonCreationState(TypedDict):
     live_stream_config: NotRequired[dict]
     stream_stats: NotRequired[dict]
     stream_report_path: NotRequired[str]
+    segment_incomplete: NotRequired[bool]
     _status_callback: NotRequired[Callable[..., Any]]
     output_dir: str
     process_every_n: int

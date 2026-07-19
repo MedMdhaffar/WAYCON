@@ -14,6 +14,15 @@ sentencepiece
 einops
 timm
 scipy
+numpy
+
+# GStreamer bindings (PyGObject/gi) for realtime RTSP ingestion
+# (forensics/person_creation/gst_stream.py). PyGObject itself is a pip package,
+# but it links against system GObject-introspection + GStreamer libraries that
+# pip cannot install -- see the apt packages listed in gst_stream.py's module
+# docstring / the realtime-ingestion runbook. Without those system packages
+# `import gi` / `gi.require_version("Gst", "1.0")` will fail.
+PyGObject>=3.50
 
 # Optional — auto_pair association cues. Each is probed at load_models time;
 # if missing, that cue is disabled and its weight is redistributed across the
