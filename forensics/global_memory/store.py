@@ -27,6 +27,26 @@ from .identity_policy import (
     IdentityRegistrationResult,
     evaluate_identity_decision,
 )
+from .merge import (
+    AlreadyMergedConflictError,
+    IdentityLineage,
+    IdentityLineageMember,
+    InactiveSourceError,
+    InactiveTargetError,
+    InvalidMergeEmbeddingError,
+    InvalidMergeMetadataError,
+    InvalidMergeRequestError,
+    MergeAuditIntegrityError,
+    PersonMergeError,
+    PersonMergeResult,
+    PersonNotFoundError,
+    RedirectChainError,
+    SelfMergeError,
+)
+
+
+SQLITE_MAX_INTEGER = 2**63 - 1
+MERGE_WEIGHTED_NORM_RELATIVE_MINIMUM = 1e-8
 
 
 class ReadOnlyGlobalMemoryError(RuntimeError):
@@ -488,6 +508,193 @@ class GlobalMemory:
 
         self._log_identity_decision(result)
         return result
+
+    def resolve_canonical_person_id(self, person_id: str) -> str:
+        """Resolve one active identity or one direct inactive redirect."""
+        person_id = self._validated_merge_text(person_id, "person_id")
+        with self._lock:
+            return self._resolve_canonical_person_id_locked(person_id)
+
+    def get_identity_lineage(self, person_id: str) -> IdentityLineage:
+        """Return an active canonical person and its direct merged sources."""
+        person_id = self._validated_merge_text(person_id, "person_id")
+        with self._lock:
+            return self._get_identity_lineage_locked(person_id)
+
+    def get_lineage_appearances(self, person_id: str) -> list[dict[str, Any]]:
+        """Return every appearance in a direct lineage without collapsing dates."""
+        person_id = self._validated_merge_text(person_id, "person_id")
+        with self._lock:
+            lineage = self._get_identity_lineage_locked(person_id)
+            placeholders = ",".join("?" for _ in lineage.members)
+            rows = self._conn.execute(
+                f"SELECT * FROM appearances WHERE person_id IN ({placeholders})",
+                lineage.member_person_ids,
+            ).fetchall()
+            return self._lineage_evidence_rows(lineage, rows)
+
+    def get_lineage_gallery(self, person_id: str) -> list[dict[str, Any]]:
+        """Return every gallery row in a direct lineage with original ownership."""
+        person_id = self._validated_merge_text(person_id, "person_id")
+        with self._lock:
+            lineage = self._get_identity_lineage_locked(person_id)
+            placeholders = ",".join("?" for _ in lineage.members)
+            rows = self._conn.execute(
+                f"SELECT * FROM person_gallery WHERE person_id IN ({placeholders})",
+                lineage.member_person_ids,
+            ).fetchall()
+            return self._lineage_evidence_rows(lineage, rows)
+
+    def get_lineage_recognition_history(
+        self,
+        person_id: str,
+        *,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return recognition history across a direct lineage with provenance."""
+        person_id = self._validated_merge_text(person_id, "person_id")
+        if limit is not None and (
+            isinstance(limit, bool) or not isinstance(limit, int) or limit < 1
+        ):
+            raise InvalidMergeRequestError("limit must be a positive integer or None")
+        with self._lock:
+            lineage = self._get_identity_lineage_locked(person_id)
+            placeholders = ",".join("?" for _ in lineage.members)
+            rows = self._conn.execute(
+                f"SELECT * FROM recognition_log WHERE person_id IN ({placeholders})",
+                lineage.member_person_ids,
+            ).fetchall()
+            evidence = self._lineage_evidence_rows(lineage, rows)
+            return evidence if limit is None else evidence[:limit]
+
+    def merge_persons(
+        self,
+        source_person_id: str,
+        target_person_id: str,
+        *,
+        reason: str,
+        decision_source: str | None = None,
+    ) -> PersonMergeResult:
+        """Logically merge an active source into an active canonical target."""
+        self._require_writable("merge_persons")
+        source_id = self._validated_merge_text(source_person_id, "source_person_id")
+        target_id = self._validated_merge_text(target_person_id, "target_person_id")
+        merge_reason = self._validated_merge_text(reason, "reason")
+        if source_id == target_id:
+            raise SelfMergeError("source_person_id and target_person_id must differ")
+        if decision_source is None:
+            audit_source = "phase_3f_logical_merge"
+        else:
+            audit_source = self._validated_merge_text(
+                decision_source,
+                "decision_source",
+            )
+
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                source = self._load_merge_person(source_id, "source")
+                target = self._load_merge_person(target_id, "target")
+                self._validate_merge_target(target)
+
+                if not bool(source["is_active"]):
+                    redirect = source["merged_into_person_id"]
+                    if redirect is None:
+                        raise InactiveSourceError(
+                            f"source person {source_id!r} is inactive without a redirect"
+                        )
+                    if redirect != target_id:
+                        raise AlreadyMergedConflictError(
+                            f"source person {source_id!r} already redirects to {redirect!r}"
+                        )
+                    result = self._replay_person_merge(source, target)
+                    self._conn.execute("COMMIT")
+                    return result
+
+                if source["merged_into_person_id"] is not None:
+                    raise RedirectChainError(
+                        f"active source person {source_id!r} has an invalid redirect"
+                    )
+                self._reject_redirect_children(source_id)
+                self._require_no_source_merge_audit(source_id)
+
+                source_embedding = self._validated_stored_merge_embedding(
+                    source,
+                    "source",
+                )
+                target_embedding = self._validated_stored_merge_embedding(
+                    target,
+                    "target",
+                )
+                if source_embedding.shape != target_embedding.shape:
+                    raise InvalidMergeEmbeddingError(
+                        "source and target embedding dimensions differ"
+                    )
+                source_count = self._validated_stored_merge_count(source, "source")
+                target_count_before = self._validated_stored_merge_count(
+                    target,
+                    "target",
+                )
+                target_count_after = self._validated_merge_count_sum(
+                    target_count_before,
+                    source_count,
+                )
+                target_cameras = self._validated_merge_cameras(
+                    target["cameras"],
+                    "target",
+                )
+                source_cameras = self._validated_merge_cameras(
+                    source["cameras"],
+                    "source",
+                )
+                combined = self._combined_merge_embedding(
+                    target_embedding=target_embedding,
+                    target_count=target_count_before,
+                    source_embedding=source_embedding,
+                    source_count=source_count,
+                    weight_scale=target_count_after,
+                )
+
+                created_at = datetime.now().isoformat(timespec="seconds")
+                audit_id = self._insert_person_merge_audit(
+                    source=source,
+                    target=target,
+                    reason=merge_reason,
+                    decision_source=audit_source,
+                    source_embedding_count=source_count,
+                    created_at=created_at,
+                )
+                self._update_merge_target_embedding(
+                    target_id,
+                    combined,
+                    target_count_after,
+                    created_at,
+                )
+                merged_cameras = self._merge_lists(target_cameras, source_cameras)
+                self._update_merge_target_metadata(target_id, merged_cameras)
+                staled_count = self._stale_merge_suggestions(source_id)
+                self._deactivate_merge_source(source_id)
+                self._redirect_merge_source(source_id, target_id)
+                self._assert_merge_foreign_keys()
+                lineage_count = self._merge_lineage_member_count(target_id)
+                self._before_merge_commit()
+                self._conn.execute("COMMIT")
+            except BaseException:
+                if self._conn.in_transaction:
+                    self._conn.execute("ROLLBACK")
+                raise
+
+        return PersonMergeResult(
+            source_person_id=source_id,
+            target_person_id=target_id,
+            audit_id=audit_id,
+            idempotent_replay=False,
+            source_embedding_count=source_count,
+            target_embedding_count_before=target_count_before,
+            target_embedding_count_after=target_count_after,
+            staled_suggestion_count=staled_count,
+            lineage_member_count_after=lineage_count,
+        )
 
     def set_profile_image(self, person_id: str, image_path: str, source: str = "auto") -> None:
         self._require_writable("set_profile_image")
@@ -953,6 +1160,440 @@ class GlobalMemory:
             candidates.append(IdentityCandidate(row["person_id"], similarity))
         candidates.sort(key=lambda item: (-item.similarity, item.person_id))
         return tuple(candidates[:2])
+
+    @staticmethod
+    def _validated_merge_text(value: object, label: str) -> str:
+        if not isinstance(value, str) or not value.strip():
+            raise InvalidMergeRequestError(f"{label} must be a non-empty string")
+        return value.strip()
+
+    def _resolve_canonical_person_id_locked(self, person_id: str) -> str:
+        row = self._conn.execute(
+            "SELECT person_id, is_active, merged_into_person_id "
+            "FROM persons WHERE person_id=?",
+            (person_id,),
+        ).fetchone()
+        if row is None:
+            raise PersonNotFoundError(f"person {person_id!r} does not exist")
+
+        redirect = row["merged_into_person_id"]
+        if bool(row["is_active"]):
+            if redirect is not None:
+                raise RedirectChainError(
+                    f"active person {person_id!r} has an invalid redirect"
+                )
+            return person_id
+
+        if redirect is None:
+            raise InactiveSourceError(
+                f"inactive person {person_id!r} has no canonical redirect"
+            )
+        if redirect == person_id:
+            raise RedirectChainError(f"person {person_id!r} redirects to itself")
+        child = self._conn.execute(
+            "SELECT person_id FROM persons "
+            "WHERE merged_into_person_id=? AND person_id<>? LIMIT 1",
+            (person_id, person_id),
+        ).fetchone()
+        if child is not None:
+            raise RedirectChainError(
+                f"redirect through {person_id!r} would form a chain"
+            )
+
+        target = self._conn.execute(
+            "SELECT person_id, is_active, merged_into_person_id "
+            "FROM persons WHERE person_id=?",
+            (redirect,),
+        ).fetchone()
+        if target is None:
+            raise RedirectChainError(
+                f"person {person_id!r} redirects to missing person {redirect!r}"
+            )
+        if not bool(target["is_active"]):
+            raise RedirectChainError(
+                f"person {person_id!r} redirects to inactive person {redirect!r}"
+            )
+        if target["merged_into_person_id"] is not None:
+            raise RedirectChainError(
+                f"person {person_id!r} redirects through a non-canonical target"
+            )
+        return str(target["person_id"])
+
+    def _get_identity_lineage_locked(self, person_id: str) -> IdentityLineage:
+        canonical_id = self._resolve_canonical_person_id_locked(person_id)
+        rows = self._conn.execute(
+            """
+            SELECT person_id, is_active, merged_into_person_id
+              FROM persons
+             WHERE person_id=? OR merged_into_person_id=?
+            """,
+            (canonical_id, canonical_id),
+        ).fetchall()
+        by_id = {str(row["person_id"]): row for row in rows}
+        canonical = by_id.get(canonical_id)
+        if canonical is None or not bool(canonical["is_active"]):
+            raise InactiveTargetError(
+                f"canonical person {canonical_id!r} is not active"
+            )
+        if canonical["merged_into_person_id"] is not None:
+            raise RedirectChainError(
+                f"canonical person {canonical_id!r} redirects elsewhere"
+            )
+
+        source_ids = sorted(person for person in by_id if person != canonical_id)
+        members = [IdentityLineageMember(canonical_id, True, None)]
+        for source_id in source_ids:
+            source = by_id[source_id]
+            if bool(source["is_active"]):
+                raise RedirectChainError(
+                    f"active person {source_id!r} redirects to {canonical_id!r}"
+                )
+            if source["merged_into_person_id"] != canonical_id:
+                raise RedirectChainError(
+                    f"person {source_id!r} has an invalid lineage redirect"
+                )
+            child = self._conn.execute(
+                "SELECT person_id FROM persons "
+                "WHERE merged_into_person_id=? AND person_id<>? LIMIT 1",
+                (source_id, source_id),
+            ).fetchone()
+            if child is not None:
+                raise RedirectChainError(
+                    f"lineage contains a redirect chain through {source_id!r}"
+                )
+            members.append(
+                IdentityLineageMember(source_id, False, canonical_id)
+            )
+        return IdentityLineage(canonical_id, tuple(members))
+
+    @staticmethod
+    def _lineage_evidence_rows(
+        lineage: IdentityLineage,
+        rows: list[sqlite3.Row],
+    ) -> list[dict[str, Any]]:
+        member_order = {
+            person_id: index
+            for index, person_id in enumerate(lineage.member_person_ids)
+        }
+        ordered = sorted(
+            rows,
+            key=lambda row: (member_order[str(row["person_id"])], int(row["id"])),
+        )
+        evidence: list[dict[str, Any]] = []
+        for row in ordered:
+            item = dict(row)
+            item["original_person_id"] = str(row["person_id"])
+            item["canonical_person_id"] = lineage.canonical_person_id
+            evidence.append(item)
+        return evidence
+
+    def _load_merge_person(self, person_id: str, role: str) -> sqlite3.Row:
+        row = self._conn.execute(
+            "SELECT * FROM persons WHERE person_id=?",
+            (person_id,),
+        ).fetchone()
+        if row is None:
+            raise PersonNotFoundError(f"{role} person {person_id!r} does not exist")
+        return row
+
+    @staticmethod
+    def _validate_merge_target(target: sqlite3.Row) -> None:
+        target_id = str(target["person_id"])
+        if not bool(target["is_active"]):
+            raise InactiveTargetError(f"target person {target_id!r} is inactive")
+        if target["merged_into_person_id"] is not None:
+            raise RedirectChainError(
+                f"target person {target_id!r} redirects elsewhere"
+            )
+
+    def _reject_redirect_children(self, source_id: str) -> None:
+        child = self._conn.execute(
+            "SELECT person_id FROM persons "
+            "WHERE merged_into_person_id=? AND person_id<>? LIMIT 1",
+            (source_id, source_id),
+        ).fetchone()
+        if child is not None:
+            raise RedirectChainError(
+                f"merging {source_id!r} would create a redirect chain"
+            )
+
+    def _require_no_source_merge_audit(self, source_id: str) -> None:
+        row = self._conn.execute(
+            "SELECT merge_id FROM identity_merge_audit "
+            "WHERE source_person_id=? LIMIT 1",
+            (source_id,),
+        ).fetchone()
+        if row is not None:
+            raise MergeAuditIntegrityError(
+                f"active source person {source_id!r} already has a merge audit"
+            )
+
+    @staticmethod
+    def _validated_stored_merge_embedding(
+        person: sqlite3.Row,
+        role: str,
+    ) -> np.ndarray:
+        raw = person["embedding"]
+        if raw is None:
+            raise InvalidMergeEmbeddingError(f"{role} embedding is missing")
+        try:
+            blob = bytes(raw)
+        except (TypeError, ValueError) as exc:
+            raise InvalidMergeEmbeddingError(
+                f"{role} embedding is malformed"
+            ) from exc
+        item_size = np.dtype(np.float32).itemsize
+        if not blob or len(blob) % item_size:
+            raise InvalidMergeEmbeddingError(f"{role} embedding is malformed")
+        embedding = np.frombuffer(blob, dtype=np.float32).copy()
+        if embedding.ndim != 1 or embedding.size == 0:
+            raise InvalidMergeEmbeddingError(f"{role} embedding is malformed")
+        if not np.isfinite(embedding).all():
+            raise InvalidMergeEmbeddingError(f"{role} embedding must be finite")
+        norm = float(np.linalg.norm(embedding))
+        if not np.isfinite(norm) or norm <= 0:
+            raise InvalidMergeEmbeddingError(f"{role} embedding must be non-zero")
+        return embedding
+
+    @staticmethod
+    def _validated_stored_merge_count(person: sqlite3.Row, role: str) -> int:
+        count = person["embedding_count"]
+        if (
+            isinstance(count, bool)
+            or type(count) is not int
+            or count <= 0
+            or count > SQLITE_MAX_INTEGER
+        ):
+            raise InvalidMergeEmbeddingError(
+                f"{role} embedding_count must be a positive integer "
+                "within the SQLite signed range"
+            )
+        return count
+
+    @staticmethod
+    def _validated_merge_count_sum(target_count: int, source_count: int) -> int:
+        if target_count > SQLITE_MAX_INTEGER - source_count:
+            raise InvalidMergeEmbeddingError(
+                "combined embedding_count exceeds SQLite signed INTEGER range"
+            )
+        return target_count + source_count
+
+    @staticmethod
+    def _validated_merge_cameras(value: object, role: str) -> list[str]:
+        if not isinstance(value, str):
+            raise InvalidMergeMetadataError(
+                f"{role} cameras must be a JSON array of strings"
+            )
+        try:
+            decoded = json.loads(value)
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise InvalidMergeMetadataError(
+                f"{role} cameras contain malformed JSON"
+            ) from exc
+        if not isinstance(decoded, list) or any(
+            not isinstance(camera, str) for camera in decoded
+        ):
+            raise InvalidMergeMetadataError(
+                f"{role} cameras must be a JSON array of strings"
+            )
+        return decoded
+
+    @staticmethod
+    def _combined_merge_embedding(
+        *,
+        target_embedding: np.ndarray,
+        target_count: int,
+        source_embedding: np.ndarray,
+        source_count: int,
+        weight_scale: int,
+    ) -> np.ndarray:
+        target_safe = target_embedding.astype(np.float64, copy=False)
+        source_safe = source_embedding.astype(np.float64, copy=False)
+        weighted = target_safe * target_count + source_safe * source_count
+        if not np.isfinite(weighted).all():
+            raise InvalidMergeEmbeddingError(
+                "combined target embedding contains non-finite values"
+            )
+        weighted_norm = float(np.linalg.norm(weighted))
+        minimum_safe_norm = max(
+            float(np.finfo(np.float64).eps),
+            float(weight_scale) * MERGE_WEIGHTED_NORM_RELATIVE_MINIMUM,
+        )
+        if not np.isfinite(weighted_norm) or weighted_norm <= minimum_safe_norm:
+            raise InvalidMergeEmbeddingError(
+                "combined target embedding is cancelled or numerically unstable"
+            )
+        combined = weighted / weighted_norm
+        if (
+            combined.shape != target_embedding.shape
+            or not np.isfinite(combined).all()
+        ):
+            raise InvalidMergeEmbeddingError(
+                "combined target embedding is invalid"
+            )
+        return combined
+
+    def _insert_person_merge_audit(
+        self,
+        *,
+        source: sqlite3.Row,
+        target: sqlite3.Row,
+        reason: str,
+        decision_source: str,
+        source_embedding_count: int,
+        created_at: str,
+    ) -> int:
+        try:
+            cursor = self._conn.execute(
+                """
+                INSERT INTO identity_merge_audit(
+                    source_person_id, target_person_id, reason,
+                    decision_source, similarity, source_embedding,
+                    source_embedding_count, source_name,
+                    target_name_before, created_at
+                ) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)
+                """,
+                (
+                    source["person_id"],
+                    target["person_id"],
+                    reason,
+                    decision_source,
+                    sqlite3.Binary(bytes(source["embedding"])),
+                    source_embedding_count,
+                    source["name"],
+                    target["name"],
+                    created_at,
+                ),
+            )
+        except sqlite3.DatabaseError as exc:
+            raise MergeAuditIntegrityError("merge audit insertion failed") from exc
+        return int(cursor.lastrowid)
+
+    def _update_merge_target_embedding(
+        self,
+        target_id: str,
+        embedding: np.ndarray,
+        embedding_count: int,
+        updated_at: str,
+    ) -> None:
+        cursor = self._conn.execute(
+            "UPDATE persons SET embedding=?, embedding_count=?, updated_at=? "
+            "WHERE person_id=?",
+            (
+                sqlite3.Binary(embedding.astype(np.float32).tobytes()),
+                embedding_count,
+                updated_at,
+                target_id,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise PersonMergeError("target embedding update did not affect one person")
+
+    def _update_merge_target_metadata(
+        self,
+        target_id: str,
+        cameras: list,
+    ) -> None:
+        cursor = self._conn.execute(
+            "UPDATE persons SET cameras=? WHERE person_id=?",
+            (json.dumps(cameras), target_id),
+        )
+        if cursor.rowcount != 1:
+            raise PersonMergeError("target metadata update did not affect one person")
+
+    def _stale_merge_suggestions(self, source_id: str) -> int:
+        cursor = self._conn.execute(
+            """
+            UPDATE identity_match_suggestions
+               SET status='stale'
+             WHERE status='pending'
+               AND (source_person_id=? OR candidate_person_id=?)
+            """,
+            (source_id, source_id),
+        )
+        return int(cursor.rowcount)
+
+    def _deactivate_merge_source(self, source_id: str) -> None:
+        cursor = self._conn.execute(
+            "UPDATE persons SET is_active=0 WHERE person_id=? AND is_active=1",
+            (source_id,),
+        )
+        if cursor.rowcount != 1:
+            raise PersonMergeError("source deactivation did not affect one person")
+
+    def _redirect_merge_source(self, source_id: str, target_id: str) -> None:
+        cursor = self._conn.execute(
+            "UPDATE persons SET merged_into_person_id=? "
+            "WHERE person_id=? AND is_active=0 AND merged_into_person_id IS NULL",
+            (target_id, source_id),
+        )
+        if cursor.rowcount != 1:
+            raise PersonMergeError("source redirect did not affect one person")
+
+    def _assert_merge_foreign_keys(self) -> None:
+        violations = self._conn.execute("PRAGMA foreign_key_check").fetchall()
+        if violations:
+            raise PersonMergeError("foreign-key violations prevent person merge")
+
+    def _merge_lineage_member_count(self, target_id: str) -> int:
+        row = self._conn.execute(
+            "SELECT COUNT(*) FROM persons "
+            "WHERE person_id=? OR (is_active=0 AND merged_into_person_id=?)",
+            (target_id, target_id),
+        ).fetchone()
+        return int(row[0])
+
+    def _replay_person_merge(
+        self,
+        source: sqlite3.Row,
+        target: sqlite3.Row,
+    ) -> PersonMergeResult:
+        source_id = str(source["person_id"])
+        target_id = str(target["person_id"])
+        self._reject_redirect_children(source_id)
+        source_embedding = self._validated_stored_merge_embedding(source, "source")
+        target_embedding = self._validated_stored_merge_embedding(target, "target")
+        if source_embedding.shape != target_embedding.shape:
+            raise InvalidMergeEmbeddingError(
+                "source and target embedding dimensions differ"
+            )
+        source_count = self._validated_stored_merge_count(source, "source")
+        target_count_after = self._validated_stored_merge_count(target, "target")
+        audits = self._conn.execute(
+            "SELECT * FROM identity_merge_audit WHERE source_person_id=?",
+            (source_id,),
+        ).fetchall()
+        if len(audits) != 1:
+            raise MergeAuditIntegrityError(
+                f"source person {source_id!r} does not have exactly one merge audit"
+            )
+        audit = audits[0]
+        if (
+            audit["target_person_id"] != target_id
+            or bytes(audit["source_embedding"]) != bytes(source["embedding"])
+            or audit["source_embedding_count"] != source_count
+        ):
+            raise MergeAuditIntegrityError(
+                f"source person {source_id!r} redirect and audit disagree"
+            )
+        if target_count_after <= source_count:
+            raise MergeAuditIntegrityError(
+                f"source person {source_id!r} audit has inconsistent evidence counts"
+            )
+        return PersonMergeResult(
+            source_person_id=source_id,
+            target_person_id=target_id,
+            audit_id=int(audit["merge_id"]),
+            idempotent_replay=True,
+            source_embedding_count=source_count,
+            target_embedding_count_before=target_count_after,
+            target_embedding_count_after=target_count_after,
+            staled_suggestion_count=0,
+            lineage_member_count_after=self._merge_lineage_member_count(target_id),
+        )
+
+    def _before_merge_commit(self) -> None:
+        """Failure-injection seam; intentionally performs no work."""
 
     def _insert_identity_suggestion(
         self,

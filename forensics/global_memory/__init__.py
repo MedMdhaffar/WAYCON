@@ -1,3 +1,35 @@
+from .merge import (
+    AlreadyMergedConflictError,
+    IdentityLineage,
+    IdentityLineageMember,
+    InactiveSourceError,
+    InactiveTargetError,
+    InvalidMergeEmbeddingError,
+    InvalidMergeMetadataError,
+    InvalidMergeRequestError,
+    MergeAuditIntegrityError,
+    PersonMergeError,
+    PersonMergeResult,
+    PersonNotFoundError,
+    RedirectChainError,
+    SelfMergeError,
+)
 from .store import GlobalMemory
 
-__all__ = ["GlobalMemory"]
+__all__ = [
+    "AlreadyMergedConflictError",
+    "GlobalMemory",
+    "IdentityLineage",
+    "IdentityLineageMember",
+    "InactiveSourceError",
+    "InactiveTargetError",
+    "InvalidMergeEmbeddingError",
+    "InvalidMergeMetadataError",
+    "InvalidMergeRequestError",
+    "MergeAuditIntegrityError",
+    "PersonMergeError",
+    "PersonMergeResult",
+    "PersonNotFoundError",
+    "RedirectChainError",
+    "SelfMergeError",
+]
