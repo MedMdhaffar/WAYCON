@@ -139,6 +139,14 @@ def _normalize_profile_schema(profile: dict) -> dict:
     return profile
 
 
+def _accepted_face_observation_count(profile: dict) -> int:
+    """Return the accepted embedded faces represented by this profile."""
+    for key in ("cluster_face_count", "face_count", "face_crop_count"):
+        if profile.get(key) is not None:
+            return profile[key]
+    return len(profile.get("face_crops") or [])
+
+
 def _session_report(state: dict, profiles_written: int) -> dict:
     clusters = state.get("identity_clusters", [])
     low_confidence = [c for c in clusters if c.get("low_confidence")]
@@ -218,7 +226,12 @@ def finalize(state: dict) -> dict:
         for raw_cid, profile in profiles.items():
             cid = int(raw_cid)
             profile = _normalize_profile_schema(profile)
-            assigned_id = gm.register(profile)
+            registration = gm.register_with_identity_policy(
+                profile,
+                observation_count=_accepted_face_observation_count(profile),
+                low_confidence=bool(profile.get("low_confidence", False)),
+            )
+            assigned_id = registration.person_id
             profile["id"] = assigned_id
             stored_person = gm.get_person(assigned_id) or {}
             profile["name"] = stored_person.get("name") or assigned_id.replace("_", " ").title()

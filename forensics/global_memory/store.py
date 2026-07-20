@@ -18,6 +18,15 @@ from forensics.media_paths import (
 )
 
 from . import config
+from .identity_policy import (
+    IdentityCandidate,
+    IdentityDecision,
+    IdentityDecisionType,
+    IdentityPolicyConfig,
+    IdentityPolicyInputError,
+    IdentityRegistrationResult,
+    evaluate_identity_decision,
+)
 
 
 class ReadOnlyGlobalMemoryError(RuntimeError):
@@ -368,6 +377,117 @@ class GlobalMemory:
             except Exception:
                 self._conn.execute("ROLLBACK")
                 raise
+
+    def register_with_identity_policy(
+        self,
+        profile: dict,
+        *,
+        observation_count: int,
+        low_confidence: bool = False,
+        configuration: IdentityPolicyConfig | None = None,
+    ) -> IdentityRegistrationResult:
+        """Apply the Phase 3E policy and persist one atomic identity outcome."""
+        self._require_writable("register_with_identity_policy")
+        if configuration is None:
+            policy_config = IdentityPolicyConfig.from_environment()
+        elif isinstance(configuration, IdentityPolicyConfig):
+            policy_config = configuration
+        else:
+            raise TypeError("configuration must be an IdentityPolicyConfig")
+
+        new_vec = self._validated_identity_embedding(profile["face_embedding"])
+        new_count = len(profile.get("face_crops") or []) or 1
+        appearance = profile.get("appearance") or {}
+        appearance_date = str(appearance.get("date") or date.today().isoformat())
+        best_face_crop = self._best_face_crop(profile)
+
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                candidates = self._rank_active_identity_candidates(new_vec)
+                top_candidate = candidates[0] if candidates else None
+                second_candidate = candidates[1] if len(candidates) > 1 else None
+                identity_decision = evaluate_identity_decision(
+                    top_candidate=top_candidate,
+                    second_candidate=second_candidate,
+                    observation_count=observation_count,
+                    low_confidence=low_confidence,
+                    configuration=policy_config,
+                )
+
+                suggestion_id: int | None = None
+                if identity_decision.decision is IdentityDecisionType.ATTACH_EXISTING:
+                    person_id = identity_decision.top_candidate_person_id
+                    if person_id is None:
+                        raise IdentityPolicyInputError(
+                            "attach_existing requires a top candidate"
+                        )
+                    count_before = self._get_embedding_count(person_id)
+                    count_after = self._update_embedding(
+                        person_id=person_id,
+                        embedding=new_vec,
+                        new_count=new_count,
+                        updated_at=appearance_date,
+                        profile=profile,
+                    )
+                    self._upsert_appearance(person_id, appearance_date, profile)
+                    self.update_gallery(person_id, profile)
+                    self._log_event(
+                        person_id=person_id,
+                        event_type="recognized",
+                        similarity=identity_decision.top_similarity,
+                        embedding_count_before=count_before,
+                        embedding_count_after=count_after,
+                        video_sources=profile.get("video_sources") or [],
+                        best_face_crop=best_face_crop,
+                        strict=True,
+                    )
+                else:
+                    person_id, name = self._next_person_id()
+                    self._insert_person(
+                        person_id=person_id,
+                        name=name,
+                        embedding=new_vec,
+                        embedding_count=new_count,
+                        enrolled_at=appearance_date,
+                        cameras=profile.get("cameras") or [],
+                        profile=profile,
+                    )
+                    self._upsert_appearance(person_id, appearance_date, profile)
+                    self.update_gallery(person_id, profile)
+                    self._log_event(
+                        person_id=person_id,
+                        event_type="new_enrollment",
+                        similarity=None,
+                        embedding_count_before=None,
+                        embedding_count_after=new_count,
+                        video_sources=profile.get("video_sources") or [],
+                        best_face_crop=best_face_crop,
+                        strict=True,
+                    )
+                    if (
+                        identity_decision.decision
+                        is IdentityDecisionType.REVIEW_REQUIRED
+                    ):
+                        suggestion_id = self._insert_identity_suggestion(
+                            source_person_id=person_id,
+                            decision=identity_decision,
+                        )
+
+                result = IdentityRegistrationResult.from_decision(
+                    person_id=person_id,
+                    suggestion_id=suggestion_id,
+                    decision=identity_decision,
+                    configuration=policy_config,
+                )
+                self._conn.execute("COMMIT")
+            except BaseException:
+                if self._conn.in_transaction:
+                    self._conn.execute("ROLLBACK")
+                raise
+
+        self._log_identity_decision(result)
+        return result
 
     def set_profile_image(self, person_id: str, image_path: str, source: str = "auto") -> None:
         self._require_writable("set_profile_image")
@@ -770,31 +890,155 @@ class GlobalMemory:
             name = f"Person {n:03d}"
         return person_id, name
 
-    def _find_existing_person(self, embedding: np.ndarray, threshold: float | None = None) -> dict | None:
-        threshold = config.SIMILARITY_THRESHOLD if threshold is None else float(threshold)
+    def _active_identity_similarities(
+        self,
+        embedding: np.ndarray,
+    ) -> list[tuple[sqlite3.Row, float]]:
         rows = self._conn.execute(
             "SELECT person_id, name, embedding, embedding_count "
             "FROM persons WHERE is_active=1"
         ).fetchall()
         if not rows:
-            return None
+            return []
 
         matrix = np.vstack([
             np.frombuffer(row["embedding"], dtype=np.float32).copy() for row in rows
         ])
         sims = matrix @ embedding
-        best_idx = int(np.argmax(sims))
-        best_sim = float(sims[best_idx])
+        return [(row, float(sims[index])) for index, row in enumerate(rows)]
+
+    def _find_existing_person(self, embedding: np.ndarray, threshold: float | None = None) -> dict | None:
+        threshold = config.SIMILARITY_THRESHOLD if threshold is None else float(threshold)
+        similarities = self._active_identity_similarities(embedding)
+        if not similarities:
+            return None
+
+        best_idx = int(np.argmax([similarity for _row, similarity in similarities]))
+        row, best_sim = similarities[best_idx]
         if best_sim < threshold:
             return None
 
-        row = rows[best_idx]
         return {
             "person_id": row["person_id"],
             "name": row["name"],
             "similarity": best_sim,
             "embedding_count": row["embedding_count"],
         }
+
+    def _rank_active_identity_candidates(
+        self,
+        embedding: np.ndarray,
+    ) -> tuple[IdentityCandidate, ...]:
+        candidates: list[IdentityCandidate] = []
+        for row, similarity in self._active_identity_similarities(embedding):
+            stored = np.frombuffer(row["embedding"], dtype=np.float32).copy()
+            if stored.size == 0:
+                raise IdentityPolicyInputError(
+                    f"active person {row['person_id']} has an empty embedding"
+                )
+            if stored.shape != embedding.shape:
+                raise IdentityPolicyInputError(
+                    f"active person {row['person_id']} has an incompatible embedding shape"
+                )
+            if not np.isfinite(stored).all():
+                raise IdentityPolicyInputError(
+                    f"active person {row['person_id']} has a non-finite embedding"
+                )
+            if float(np.linalg.norm(stored)) <= 0:
+                raise IdentityPolicyInputError(
+                    f"active person {row['person_id']} has a zero-norm embedding"
+                )
+            if not np.isfinite(similarity):
+                raise IdentityPolicyInputError("candidate similarity must be finite")
+            candidates.append(IdentityCandidate(row["person_id"], similarity))
+        candidates.sort(key=lambda item: (-item.similarity, item.person_id))
+        return tuple(candidates[:2])
+
+    def _insert_identity_suggestion(
+        self,
+        *,
+        source_person_id: str,
+        decision: IdentityDecision,
+    ) -> int:
+        candidate_person_id = decision.top_candidate_person_id
+        similarity = decision.top_similarity
+        if candidate_person_id is None or similarity is None:
+            raise IdentityPolicyInputError(
+                "review_required requires a top candidate"
+            )
+        try:
+            cursor = self._conn.execute(
+                """
+                INSERT INTO identity_match_suggestions(
+                    source_person_id, candidate_person_id, similarity,
+                    second_similarity, margin, reason, status, created_at,
+                    reviewed_at, reviewed_by
+                ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, NULL, NULL)
+                """,
+                (
+                    source_person_id,
+                    candidate_person_id,
+                    similarity,
+                    decision.second_similarity,
+                    decision.margin,
+                    decision.reason.value,
+                    datetime.now().isoformat(timespec="seconds"),
+                ),
+            )
+            return int(cursor.lastrowid)
+        except sqlite3.IntegrityError:
+            existing = self._conn.execute(
+                """
+                SELECT id FROM identity_match_suggestions
+                 WHERE source_person_id=? AND candidate_person_id=?
+                   AND status='pending'
+                """,
+                (source_person_id, candidate_person_id),
+            ).fetchone()
+            if existing is None:
+                raise
+            return int(existing["id"])
+
+    @staticmethod
+    def _log_identity_decision(result: IdentityRegistrationResult) -> None:
+        print(
+            "[identity_policy] "
+            + json.dumps(
+                {
+                    "decision": result.decision.value,
+                    "reason": result.reason.value,
+                    "person_id": result.person_id,
+                    "suggestion_id": result.suggestion_id,
+                    "top_candidate_person_id": result.top_candidate_person_id,
+                    "top_similarity": result.top_similarity,
+                    "second_candidate_person_id": result.second_candidate_person_id,
+                    "second_similarity": result.second_similarity,
+                    "margin": result.margin,
+                    "observation_count": result.observation_count,
+                    "configuration": result.configuration.as_dict(),
+                },
+                sort_keys=True,
+            )
+        )
+
+    @classmethod
+    def _validated_identity_embedding(cls, embedding: Any) -> np.ndarray:
+        try:
+            raw = np.asarray(embedding, dtype=np.float32)
+        except (TypeError, ValueError) as exc:
+            raise IdentityPolicyInputError(
+                "face embedding must be a numeric one-dimensional vector"
+            ) from exc
+        if raw.ndim != 1 or raw.size == 0:
+            raise IdentityPolicyInputError(
+                "face embedding must be a non-empty one-dimensional vector"
+            )
+        if not np.isfinite(raw).all():
+            raise IdentityPolicyInputError("face embedding must be finite")
+        try:
+            return cls._normalize_embedding(raw)
+        except ValueError as exc:
+            raise IdentityPolicyInputError(str(exc)) from exc
 
     def _insert_person(
         self,
@@ -1067,6 +1311,8 @@ class GlobalMemory:
         embedding_count_after: int,
         video_sources: list[str],
         best_face_crop: str | None = None,
+        *,
+        strict: bool = False,
     ) -> None:
         try:
             self._conn.execute(
@@ -1089,6 +1335,8 @@ class GlobalMemory:
                 ),
             )
         except Exception as exc:
+            if strict:
+                raise
             print(f"[WARNING] recognition_log write failed: {exc}")
 
     def _get_embedding_count(self, person_id: str) -> int:

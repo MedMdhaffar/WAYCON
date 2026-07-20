@@ -186,6 +186,8 @@ def _finalize_state(root: Path, filename: str = "new.jpg") -> tuple[dict, Path, 
     body.write_bytes(b"new-body")
     profile = {
         "face_embedding": _embedding(),
+        "cluster_face_count": 3,
+        "low_confidence": False,
         "face_crops": [str(face)],
         "face_crop_sharpness": {str(face): 100.0},
         "body_crops": [str(body)],
