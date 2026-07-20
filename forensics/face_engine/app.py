@@ -1,3 +1,17 @@
+"""Standalone face_engine HTTP service.
+
+No longer on person_creation's critical path -- the pipeline (load_models.py,
+process_video.py, process_live_stream.py, embed_all_faces.py, auto_pair.py,
+tools/add_face_photos.py) calls forensics.face_engine.local_client.LocalFaceEngine
+in-process instead, to avoid a per-crop HTTP round-trip / JPEG re-encode and to keep
+GPU-resident models in the same process as the rest of the realtime pipeline.
+
+This app (and its /recognize route, which talks to GlobalMemory directly) is kept
+for standalone/external use only -- e.g. a non-Python consumer, or querying face
+recognition remotely without pulling in the full person_creation pipeline. It is not
+started or required by the realtime pipeline or by forensics/person_creation/service.py.
+"""
+
 from __future__ import annotations
 
 from flask import Flask, jsonify

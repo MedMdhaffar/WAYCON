@@ -1,5 +1,5 @@
 import operator
-from typing import Annotated, Any, Callable
+from typing import Annotated, Any
 from typing_extensions import NotRequired, TypedDict
 
 
@@ -15,8 +15,32 @@ class PersonCreationState(TypedDict):
     live_stream_config: NotRequired[dict]
     stream_stats: NotRequired[dict]
     stream_report_path: NotRequired[str]
+
+    # Presence-gated segment ingestion (see presence_segmentation.SegmentBatch /
+    # single_segment_capture.py). Ingestion happens outside the graph; a run of the
+    # graph consumes one already-captured segment via these fields instead of opening
+    # a camera or video path itself. `segment_frames` is the one place raw in-memory
+    # frame tensors live in state -- nodes/process_live_stream.py clears it once
+    # consumed so the rest of the run stays references + compact metadata.
+    segment_id: NotRequired[str]
+    segment_seq_num: NotRequired[int]
+    segment_start_ts: NotRequired[str]
+    segment_end_ts: NotRequired[str]
     segment_incomplete: NotRequired[bool]
-    _status_callback: NotRequired[Callable[..., Any]]
+    segment_frames: NotRequired[list[Any]]
+    segment_frame_timestamps: NotRequired[list[str]]
+
+    # Tag written onto clothing_jobs rows in finalize.py; see
+    # global_memory.config.CLOTHING_PIPELINE_VERSION for the default.
+    pipeline_version: NotRequired[str]
+
+    # Deliberately NOT in state: a live-progress callback. It isn't
+    # JSON/pickle-serializable, which is why a LangGraph checkpointer
+    # (MemorySaver) was previously dropped -- see status_reporting.py, which
+    # threads it through a ContextVar instead so state stays fully
+    # serializable (a prerequisite for any future segment-recovery
+    # checkpointing).
+
     output_dir: str
     process_every_n: int
     identity_clustering_config: dict

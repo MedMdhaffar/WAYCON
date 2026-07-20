@@ -383,6 +383,76 @@ class GstFrameBuffer:
             }
 
 
+# ---------------------------------------------------------------------------------------
+# GPU-resident decode (NOT ENABLED by default -- see the discussion this came out of).
+#
+# The pipeline above always lands frames in host (CPU) memory: `nvvideoconvert`/`videoconvert`
+# converts out of NVMM into a system-memory BGR buffer that `_sample_to_bgr_ndarray` maps with
+# a plain `buf.map()`. That's a deliberate simplification for now, not the final state --
+# BufferedFrame.frame is consumed today as a host-memory np.ndarray by
+# nodes/process_video.py / nodes/process_live_stream.py (cv2.imwrite crops to disk,
+# CPU-side face/person detection calls), so switching to GPU-resident buffers here without
+# also changing those consumers would just move the CPU<->GPU copy from inside GStreamer to
+# inside the first node that touches `frame`, not eliminate it.
+#
+# The zero-copy version -- worth doing once §3 (collapse face_engine in-process) and the
+# detection nodes are rewritten to accept GPU tensors natively -- looks like this:
+#
+# 1. Decoder choice:
+#    - Jetson / L4T (embedded, unified memory):        nvv4l2decoder
+#    - Discrete GPU / dGPU (e.g. this RTX 5080 box):    nvh264dec / nvh265dec (nvcodec plugin,
+#      part of gstreamer1.0-plugins-bad; confirm with `gst-inspect-1.0 nvh264dec`)
+#
+# 2. Pipeline stays in NVMM the whole way instead of converting to system memory:
+#
+#     PIPELINE_NVMM = (
+#         f'rtspsrc location="{source}" latency={self.latency_ms} protocols={self.protocols} name=src ! '
+#         f'{depay} ! {parse} ! '
+#         f'nvh264dec ! '                                   # or nvv4l2decoder on Jetson
+#         f'nvvideoconvert ! video/x-raw(memory:NVMM),format=RGBA ! '  # stays in NVMM, no host copy
+#         f'appsink name=sink emit-signals=true max-buffers=2 drop=true sync=false '
+#         f'caps=video/x-raw(memory:NVMM),format=RGBA'
+#     )
+#
+# 3. Mapping an NVMM Gst.Buffer into a CUDA tensor without a host round-trip requires one of:
+#      a) DeepStream's Python bindings (`pyds`) + `gst-nvdsbufferpool`, which give you a
+#         `pyds.NvBufSurface` you can wrap as a CuPy/torch tensor via
+#         `pyds.get_nvds_buf_surface()` -- the standard path on Jetson/DeepStream deployments.
+#      b) On a discrete GPU without DeepStream: import the buffer's EGLImage/DMABUF via
+#         `Gst.Buffer` -> `GstAllocator`'s NVMM memory -> `nvbuf_utils`/`cudaGraphicsGLRegisterImage`
+#         (or `cuGraphicsEGLRegisterImage`), producing a CUDA device pointer you can wrap with
+#         `torch.as_tensor(..., device="cuda")` (via `torch.utils.dlpack` or a raw CUDA IPC/array
+#         interface) -- more manual, no single canonical Python binding covers this cleanly today.
+#
+#    Rough shape of (b), sketched (not runnable as-is -- needs nvbuf_utils/pycuda/dlpack glue
+#    that isn't vendored anywhere in this repo yet):
+#
+#     def _nvmm_sample_to_cuda_tensor(sample: Gst.Sample):
+#         buf = sample.get_buffer()
+#         # NVMM memory exposes a dmabuf fd via Gst.Memory when the allocator supports it:
+#         mem = buf.peek_memory(0)
+#         ok, dmabuf_fd = mem.get_dmabuf_fd()  # illustrative; exact API depends on nvbuf_utils version
+#         if not ok:
+#             return None
+#         # Import the dmabuf fd into a CUDA device pointer (needs pycuda or a small C extension;
+#         # cuGraphicsEGLRegisterImage / cuImportExternalMemory are the relevant CUDA driver calls):
+#         cuda_ptr, pitch = _import_dmabuf_as_cuda_pointer(dmabuf_fd)  # not implemented
+#         import torch
+#         tensor = torch.as_tensor(
+#             _cuda_ptr_to_dlpack(cuda_ptr, shape=(height, width, 4), dtype="uint8"),
+#             device="cuda",
+#         )  # not implemented -- placeholder for the dlpack-from-raw-pointer glue
+#         return tensor
+#
+# 4. This changes BufferedFrame.frame's contract from "np.ndarray, BGR, host memory" to
+#    "cuda tensor, device memory" -- a breaking change for every current consumer. Do this as
+#    part of §3, alongside rewriting nodes/process_video.py and process_live_stream.py's
+#    detect_and_save_frame() to run YOLO/face-embed directly on the GPU tensor and only copy
+#    to host memory for the handful of crops that actually get written to disk (JPEG staging),
+#    instead of copying every full frame to host memory as today.
+# ---------------------------------------------------------------------------------------
+
+
 def _sample_to_bgr_ndarray(sample: Gst.Sample):
     import numpy as np
 

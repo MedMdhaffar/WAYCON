@@ -109,10 +109,10 @@ def add_face_photos(
     if not dry_run:
         face_crops_dir.mkdir(parents=True, exist_ok=True)
 
-    # --- Face engine client (only when we will actually run detection) ---
-    from forensics.face_engine.client import FaceEngineClient
+    # --- Face engine (only when we will actually run detection) ---
+    from forensics.face_engine.local_client import LocalFaceEngine
 
-    face_engine = FaceEngineClient()
+    face_engine = LocalFaceEngine()
     if not dry_run:
         face_engine.ensure_healthy()
 

@@ -85,10 +85,10 @@ def detect_and_save_frame(
 
 def process_video(state: dict) -> dict:
     from forensics.person_creation.models.person_detector import get_person_detector
-    from forensics.face_engine.client import FaceEngineClient
+    from forensics.face_engine.local_client import LocalFaceEngine
 
     person_det = get_person_detector()
-    face_det = FaceEngineClient()
+    face_det = LocalFaceEngine()
     every_n = state.get("process_every_n", 5)
     body_dir, face_dir = prepare_staging_dirs(state["output_dir"])
 

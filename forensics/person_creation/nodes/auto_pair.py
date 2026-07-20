@@ -221,9 +221,9 @@ class _ScoringContext:
 
 def _attach_available_cues(ctx: _ScoringContext) -> None:
     try:
-        from forensics.face_engine.client import FaceEngineClient
+        from forensics.face_engine.local_client import LocalFaceEngine
 
-        embedder = FaceEngineClient()
+        embedder = LocalFaceEngine()
         embedder.ensure_healthy()
         ctx.face_embedder = embedder
         ctx.cues_enabled["face"] = True
@@ -265,6 +265,19 @@ def _read_image_cached(path: str, cache: dict[str, np.ndarray | None]) -> np.nda
         img = None
     cache[path] = img
     return img
+
+
+def _seed_face_embed_cache(ctx: _ScoringContext, all_face_embeddings: list[dict]) -> None:
+    """Reuse embeddings already computed by embed_all_faces.py instead of recomputing
+    them here -- same crop, same embedder, embedding_all_faces already ran first in the
+    graph (embed_all_faces -> cluster_identities -> assign_bodies_to_clusters).
+    """
+    for record in all_face_embeddings:
+        path = record.get("crop_path")
+        embedding = record.get("embedding")
+        if not path or embedding is None:
+            continue
+        ctx.face_embed_cache[path] = np.asarray(embedding, dtype=np.float64)
 
 
 def _face_embedding_cached(path: str, ctx: _ScoringContext) -> np.ndarray | None:
@@ -745,6 +758,7 @@ def auto_pair(state: dict) -> dict:
 
     ctx = _ScoringContext()
     _attach_available_cues(ctx)
+    _seed_face_embed_cache(ctx, state.get("all_face_embeddings", []))
 
     frame_groups = _build_frame_groups(quality_face, quality_body)
     tm = _TrackManager()

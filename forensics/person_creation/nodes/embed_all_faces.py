@@ -4,9 +4,9 @@ from pathlib import Path
 
 def embed_all_faces(state: dict) -> dict:
     """Embed every quality face crop before any identity decision is made."""
-    from forensics.face_engine.client import FaceEngineClient
+    from forensics.face_engine.local_client import LocalFaceEngine
 
-    embedder = FaceEngineClient()
+    embedder = LocalFaceEngine()
     records: list[dict] = []
     failed: list[dict] = []
 

@@ -182,7 +182,6 @@ _NODE_TO_STATUS = {
     "promote_crops":     "promoting_crops",
     "select_best":       "selecting",
     "compute_reid":      "computing_reid",
-    "describe_clothing": "describing",
     "build_profile":     "building_profile",
     "finalize":          "finalizing",
 }
@@ -199,8 +198,38 @@ def _run_pipeline(job_id: str, initial_state: dict) -> None:
         if snapshot_update:
             job.snapshot.update(snapshot_update)
 
+    raw_camera_uri = initial_state.get("camera_uri")
+    status_token = None
     if initial_state.get("input_type") == "camera_uri":
-        initial_state["_status_callback"] = update_live_status
+        # Ingestion no longer happens inside a graph node (see
+        # nodes/process_live_stream.py) -- capture the fixed-duration window here,
+        # then hand the graph an already-captured segment. The raw camera_uri (which
+        # may embed credentials) is dropped from state before the graph ever sees it;
+        # only the masked form travels through graph state / job snapshots from here on.
+        from forensics.person_creation.single_segment_capture import capture_fixed_duration_segment
+        from forensics.person_creation.status_reporting import set_status_callback, reset_status_callback
+
+        status_token = set_status_callback(update_live_status)
+        try:
+            segment = capture_fixed_duration_segment(
+                raw_camera_uri,
+                initial_state.get("duration_seconds", 30),
+                status_callback=update_live_status,
+            )
+        except Exception:
+            reset_status_callback(status_token)
+            job.status = "error"
+            error = traceback.format_exc()
+            if raw_camera_uri:
+                error = error.replace(raw_camera_uri, mask_camera_uri(raw_camera_uri))
+            job.error = error
+            return
+
+        initial_state.pop("camera_uri", None)
+        initial_state["segment_id"] = segment.segment_id
+        initial_state["segment_incomplete"] = segment.segment_incomplete
+        initial_state["segment_frames"] = segment.frames
+        initial_state["segment_frame_timestamps"] = segment.frame_timestamps
 
     try:
         for event in graph.stream(initial_state, stream_mode="updates"):
@@ -215,10 +244,13 @@ def _run_pipeline(job_id: str, initial_state: dict) -> None:
     except Exception:
         job.status = "error"
         error = traceback.format_exc()
-        raw_uri = initial_state.get("camera_uri")
-        if raw_uri:
-            error = error.replace(raw_uri, mask_camera_uri(raw_uri))
+        if raw_camera_uri:
+            error = error.replace(raw_camera_uri, mask_camera_uri(raw_camera_uri))
         job.error = error
+    finally:
+        if status_token is not None:
+            from forensics.person_creation.status_reporting import reset_status_callback
+            reset_status_callback(status_token)
 
 
 # ─── Endpoints ────────────────────────────────────────────────────────────────

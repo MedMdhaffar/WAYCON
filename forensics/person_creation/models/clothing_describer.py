@@ -40,7 +40,12 @@ class ClothingDescriber:
         self._device = "cpu"
         self._dtype = None
 
+    def is_loaded(self) -> bool:
+        return self._model is not None
+
     def load(self, model_id: str = "OpenGVLab/InternVL3_5-2B", device: str = "auto") -> None:
+        if self._model is not None:
+            return
         import torch
         from transformers import AutoTokenizer, AutoModel
 

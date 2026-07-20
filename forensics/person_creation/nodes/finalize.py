@@ -1,5 +1,6 @@
 import json
 import shutil
+import uuid
 from pathlib import Path
 
 
@@ -142,6 +143,19 @@ def _session_report(state: dict, profiles_written: int) -> dict:
     return report
 
 
+def _resolve_segment_id(state: dict) -> str:
+    """The realtime path (process_segment.py, once §2's presence-gated ingestion is
+    wired into the graph) sets `segment_id` on a SegmentBatch basis. The offline
+    video_file path has no natural segment concept, so it falls back to the run's
+    output_dir name -- stable across re-runs pointed at the same output_dir, which
+    keeps the (person_id, segment_id) uniqueness on clothing_jobs meaningful there too.
+    """
+    segment_id = state.get("segment_id")
+    if segment_id:
+        return str(segment_id)
+    return Path(state["output_dir"]).name or "unknown_segment"
+
+
 def finalize(state: dict) -> dict:
     """Write one profile.json per cluster, plus session and rejects reports.
 
@@ -160,6 +174,8 @@ def finalize(state: dict) -> dict:
     # source of truth for identity; profile.json below is only a debug export.
     from forensics.global_memory import GlobalMemory
     gm = GlobalMemory()
+    segment_id = _resolve_segment_id(state)
+    pipeline_version = state.get("pipeline_version") or None
 
     for raw_cid, profile in profiles.items():
         cid = int(raw_cid)
@@ -196,6 +212,19 @@ def finalize(state: dict) -> dict:
         if profile.get("face_crops"):
             profile["profile_image"] = profile["face_crops"][0]
         gm.update_crop_paths(assigned_id, profile)
+
+        # Best body crop(s) are already durable at this point (moved into person_dir
+        # above, not staging). Enqueue clothing description as an async job instead
+        # of running the VLM synchronously here -- see describe_clothing.py's removal
+        # from graph.py and forensics/global_memory/schema.sql's clothing_jobs table.
+        best_crop = next(iter(profile.get("best_body_crops") or []), None)
+        if best_crop:
+            gm.insert_clothing_job(
+                person_id=assigned_id,
+                segment_id=segment_id,
+                crop_path=best_crop,
+                pipeline_version=pipeline_version,
+            )
 
         finalized_profiles[cid] = profile
         profile_path = person_dir / "profile.json"

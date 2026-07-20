@@ -10,10 +10,15 @@ def load_models(state: dict) -> dict:
     from forensics.person_creation.models.clothing_describer import get_clothing_describer
     from forensics.person_creation.models.pose_estimator import get_pose_estimator
     from forensics.person_creation.models.reid_extractor import get_reid_extractor, normalize_reid_config
-    from forensics.face_engine.client import FaceEngineClient
+    from forensics.face_engine.local_client import LocalFaceEngine
 
+    # Every underlying .load() (person detector, face detector/embedder, clothing
+    # describer, pose, reid) is itself guarded against reloading once resident, so
+    # this node is safe -- and cheap -- to run more than once per process (e.g. once
+    # per segment/job in the current per-request graph.stream() model). Models load
+    # once at process startup and stay resident for the process lifetime.
     get_person_detector().load(model_path=_YOLO_MODEL_PATH, device="auto")
-    FaceEngineClient().ensure_healthy()
+    LocalFaceEngine().ensure_healthy()
     get_clothing_describer().load(model_id=_INTERNVL_MODEL_ID, device="auto")
 
     # Optional auto_pair pose cue. It is a no-op when the optional dependency

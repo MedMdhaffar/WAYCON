@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+import uuid
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
@@ -396,6 +397,43 @@ class GlobalMemory:
                 }
                 for row in rows
             ]
+
+    def insert_clothing_job(
+        self,
+        *,
+        person_id: str,
+        segment_id: str,
+        crop_path: str,
+        pipeline_version: str | None = None,
+    ) -> str | None:
+        """Enqueue an async clothing-description job. Fast, non-blocking insert --
+        no VLM call happens here (see finalize.py, which calls this right after
+        GlobalMemory.register() resolves person_id, replacing the old synchronous
+        describe_clothing graph node). Idempotent on (person_id, segment_id): a
+        duplicate call for the same segment returns None instead of raising or
+        enqueueing a second job.
+        """
+        job_id = str(uuid.uuid4())
+        now = datetime.utcnow().isoformat()
+        with self._lock:
+            try:
+                self._conn.execute(
+                    "INSERT INTO clothing_jobs "
+                    "(job_id, person_id, segment_id, crop_path, pipeline_version, status, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)",
+                    (
+                        job_id,
+                        person_id,
+                        segment_id,
+                        crop_path,
+                        pipeline_version or config.CLOTHING_PIPELINE_VERSION,
+                        now,
+                        now,
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                return None
+        return job_id
 
     def close(self) -> None:
         with self._lock:

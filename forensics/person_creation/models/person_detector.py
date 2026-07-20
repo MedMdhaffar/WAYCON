@@ -10,12 +10,17 @@ class PersonDetector:
         self._lock = threading.Lock()
 
     def load(self, model_path: str, device: str = "auto") -> None:
+        if self._model is not None:
+            return
         from ultralytics import YOLO
         device = resolve_device(device)
         self._model = YOLO(model_path)
         self._model.to(device)
         self._device = device
         print(f"[PersonDetector] loaded {model_path} on {device}")
+
+    def is_loaded(self) -> bool:
+        return self._model is not None
 
     def detect(self, frame_bgr: np.ndarray) -> list[dict]:
         if self._model is None:
