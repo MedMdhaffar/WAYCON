@@ -105,6 +105,9 @@ def repair_media_paths(
         connection.execute("PRAGMA foreign_keys=ON")
         connection.execute("PRAGMA busy_timeout=5000")
         if not dry_run:
+            journal_mode = connection.execute("PRAGMA journal_mode=WAL").fetchone()
+            if journal_mode is None or str(journal_mode[0]).lower() != "wal":
+                raise RuntimeError("media repair requires WAL journal mode")
             connection.execute("BEGIN IMMEDIATE")
 
         gallery_fallbacks: dict[str, list[tuple[float, str]]] = {}
@@ -222,7 +225,7 @@ def repair_media_paths(
         if not dry_run:
             connection.execute("COMMIT")
     except Exception:
-        if not dry_run:
+        if not dry_run and connection.in_transaction:
             connection.execute("ROLLBACK")
         raise
     finally:

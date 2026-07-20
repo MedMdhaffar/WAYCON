@@ -81,11 +81,13 @@ CREATE TABLE IF NOT EXISTS identity_merge_audit (
     reason                 TEXT,
     decision_source        TEXT NOT NULL,
     similarity             REAL,
-    source_embedding       BLOB,
-    source_embedding_count INTEGER,
+    source_embedding       BLOB NOT NULL,
+    source_embedding_count INTEGER NOT NULL
+                           CHECK (source_embedding_count > 0),
     source_name            TEXT,
     target_name_before     TEXT,
-    created_at             TEXT NOT NULL
+    created_at             TEXT NOT NULL,
+    CHECK (source_person_id <> target_person_id)
 );
 
 INSERT OR IGNORE INTO counters (key, value) VALUES ('person_count', 0);
@@ -105,7 +107,19 @@ CREATE INDEX IF NOT EXISTS idx_suggestions_status
 ON identity_match_suggestions(status);
 CREATE INDEX IF NOT EXISTS idx_suggestions_source
 ON identity_match_suggestions(source_person_id);
+CREATE INDEX IF NOT EXISTS idx_suggestions_candidate
+ON identity_match_suggestions(candidate_person_id);
 CREATE INDEX IF NOT EXISTS idx_merge_audit_source
 ON identity_merge_audit(source_person_id);
 CREATE INDEX IF NOT EXISTS idx_merge_audit_target
 ON identity_merge_audit(target_person_id);
+CREATE TRIGGER IF NOT EXISTS trg_identity_merge_audit_no_update
+BEFORE UPDATE ON identity_merge_audit
+BEGIN
+    SELECT RAISE(ABORT, 'identity_merge_audit is append-only: UPDATE is not allowed');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_identity_merge_audit_no_delete
+BEFORE DELETE ON identity_merge_audit
+BEGIN
+    SELECT RAISE(ABORT, 'identity_merge_audit is append-only: DELETE is not allowed');
+END;

@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 
 import forensics.global_memory as global_memory_module
+import forensics.global_memory.repair_media_paths as repair_module
 from forensics.global_memory import GlobalMemory
 from forensics.global_memory.store import ReadOnlyGlobalMemoryError
 
@@ -105,6 +106,58 @@ def _schema_snapshot(path: Path) -> list[tuple]:
         connection.close()
 
 
+def _create_old_phase3d_audit_database(path: Path, audit_values=None) -> None:
+    _create_phase3b_database(path)
+    connection = sqlite3.connect(str(path))
+    try:
+        connection.executescript(
+            """
+            ALTER TABLE persons ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1;
+            ALTER TABLE persons ADD COLUMN merged_into_person_id TEXT DEFAULT NULL;
+            CREATE TABLE identity_match_suggestions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_person_id TEXT NOT NULL REFERENCES persons(person_id),
+                candidate_person_id TEXT NOT NULL REFERENCES persons(person_id),
+                similarity REAL NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE identity_merge_audit (
+                merge_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_person_id TEXT NOT NULL,
+                target_person_id TEXT NOT NULL,
+                reason TEXT,
+                decision_source TEXT NOT NULL,
+                similarity REAL,
+                source_embedding BLOB,
+                source_embedding_count INTEGER,
+                source_name TEXT,
+                target_name_before TEXT,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX idx_merge_audit_source
+            ON identity_merge_audit(source_person_id);
+            CREATE INDEX idx_merge_audit_target
+            ON identity_merge_audit(target_person_id);
+            """
+        )
+        if audit_values is not None:
+            connection.execute(
+                """
+                INSERT INTO identity_merge_audit(
+                    source_person_id, target_person_id, reason,
+                    decision_source, similarity, source_embedding,
+                    source_embedding_count, source_name, target_name_before,
+                    created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                audit_values,
+            )
+        connection.commit()
+    finally:
+        connection.close()
+
+
 def test_fresh_database_has_phase3d_schema_and_indexes(tmp_path):
     database = tmp_path / "fresh.db"
     memory = GlobalMemory(database)
@@ -120,6 +173,11 @@ def test_fresh_database_has_phase3d_schema_and_indexes(tmp_path):
                 "SELECT name FROM sqlite_master WHERE type='index'"
             )
         }
+        triggers = {
+            row[0] for row in memory._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='trigger'"
+            )
+        }
     finally:
         memory.close()
 
@@ -128,8 +186,13 @@ def test_fresh_database_has_phase3d_schema_and_indexes(tmp_path):
     assert {
         "idx_persons_active", "uq_suggestion_pending",
         "idx_suggestions_status", "idx_suggestions_source",
+        "idx_suggestions_candidate",
         "idx_merge_audit_source", "idx_merge_audit_target",
     } <= indexes
+    assert {
+        "trg_identity_merge_audit_no_update",
+        "trg_identity_merge_audit_no_delete",
+    } <= triggers
 
 
 def test_phase3b_database_migrates_without_changing_existing_rows(tmp_path):
@@ -279,13 +342,250 @@ def test_suggestion_foreign_keys_and_constraints(tmp_path):
         memory._conn.execute(sql, (source, candidate, 0.82, "pending", now))
         memory._conn.execute(
             """INSERT INTO identity_merge_audit(
-                source_person_id, target_person_id, decision_source, created_at
-            ) VALUES ('deleted-source', 'deleted-target', 'test', ?)""",
-            (now,),
+                source_person_id, target_person_id, decision_source,
+                source_embedding, source_embedding_count, created_at
+            ) VALUES ('deleted-source', 'deleted-target', 'test', ?, 1, ?)""",
+            (np.asarray(_unit(), dtype=np.float32).tobytes(), now),
         )
         assert memory._conn.execute("PRAGMA foreign_key_check").fetchall() == []
     finally:
         memory.close()
+
+
+def test_candidate_suggestion_lookup_uses_candidate_index(tmp_path):
+    memory = GlobalMemory(tmp_path / "memory.db")
+    try:
+        plan = memory._conn.execute(
+            "EXPLAIN QUERY PLAN SELECT * FROM identity_match_suggestions "
+            "WHERE candidate_person_id = ?",
+            ("person_002",),
+        ).fetchall()
+    finally:
+        memory.close()
+
+    details = " ".join(str(row[3]) for row in plan)
+    assert "idx_suggestions_candidate" in details
+    assert "SCAN identity_match_suggestions" not in details
+
+
+def test_merge_audit_constraints_and_append_only_triggers(tmp_path):
+    memory = GlobalMemory(tmp_path / "memory.db")
+    embedding = np.asarray(_unit(), dtype=np.float32).tobytes()
+    now = datetime.now().isoformat()
+    insert = """INSERT INTO identity_merge_audit(
+        source_person_id, target_person_id, decision_source,
+        source_embedding, source_embedding_count, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?)"""
+    try:
+        memory._conn.execute(
+            insert,
+            ("source", "target", "test", embedding, 2, now),
+        )
+        original = tuple(memory._conn.execute(
+            "SELECT * FROM identity_merge_audit WHERE merge_id=1"
+        ).fetchone())
+
+        with pytest.raises(sqlite3.IntegrityError):
+            memory._conn.execute(
+                """INSERT INTO identity_merge_audit(
+                    source_person_id, target_person_id, decision_source,
+                    source_embedding_count, created_at
+                ) VALUES ('a', 'b', 'test', 1, ?)""",
+                (now,),
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            memory._conn.execute(
+                """INSERT INTO identity_merge_audit(
+                    source_person_id, target_person_id, decision_source,
+                    source_embedding, created_at
+                ) VALUES ('a', 'b', 'test', ?, ?)""",
+                (embedding, now),
+            )
+        for count in (0, -1):
+            with pytest.raises(sqlite3.IntegrityError):
+                memory._conn.execute(
+                    insert,
+                    ("a", "b", "test", embedding, count, now),
+                )
+        with pytest.raises(sqlite3.IntegrityError):
+            memory._conn.execute(
+                insert,
+                ("same", "same", "test", embedding, 1, now),
+            )
+
+        with pytest.raises(sqlite3.IntegrityError, match="UPDATE is not allowed"):
+            memory._conn.execute(
+                "UPDATE identity_merge_audit SET reason='changed' WHERE merge_id=1"
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="DELETE is not allowed"):
+            memory._conn.execute("DELETE FROM identity_merge_audit WHERE merge_id=1")
+        assert tuple(memory._conn.execute(
+            "SELECT * FROM identity_merge_audit WHERE merge_id=1"
+        ).fetchone()) == original
+    finally:
+        memory.close()
+
+
+def test_valid_legacy_merge_audit_rows_survive_upgrade_and_second_open(tmp_path):
+    database = tmp_path / "old-phase3d.db"
+    embedding = b"historical-embedding"
+    values = (
+        "old-source", "old-target", "manual", "operator", 0.91,
+        embedding, 4, "Source Name", "Target Name", "2026-07-17T12:00:00",
+    )
+    _create_old_phase3d_audit_database(database, values)
+
+    first = GlobalMemory(database)
+    try:
+        upgraded = tuple(first._conn.execute(
+            "SELECT source_person_id, target_person_id, reason, decision_source, "
+            "similarity, source_embedding, source_embedding_count, source_name, "
+            "target_name_before, created_at FROM identity_merge_audit"
+        ).fetchone())
+    finally:
+        first.close()
+    after_first = _schema_snapshot(database)
+
+    second = GlobalMemory(database)
+    second.close()
+
+    assert upgraded == values
+    assert _schema_snapshot(database) == after_first
+
+
+@pytest.mark.parametrize(
+    "invalid_values",
+    [
+        ("a", "b", "reason", "test", 0.8, None, 1, None, None, "now"),
+        ("a", "b", "reason", "test", 0.8, b"vec", None, None, None, "now"),
+        ("a", "b", "reason", "test", 0.8, b"vec", 0, None, None, "now"),
+        ("a", "b", "reason", "test", 0.8, b"vec", -1, None, None, "now"),
+        ("same", "same", "reason", "test", 0.8, b"vec", 1, None, None, "now"),
+    ],
+)
+def test_invalid_legacy_merge_audit_row_rolls_back_entire_migration(
+    tmp_path,
+    invalid_values,
+):
+    database = tmp_path / "invalid-old-phase3d.db"
+    _create_old_phase3d_audit_database(database, invalid_values)
+    schema_before = _schema_snapshot(database)
+
+    with pytest.raises(sqlite3.IntegrityError, match="required constraints"):
+        GlobalMemory(database)
+
+    connection = sqlite3.connect(str(database))
+    try:
+        row = tuple(connection.execute(
+            "SELECT source_person_id, target_person_id, reason, decision_source, "
+            "similarity, source_embedding, source_embedding_count, source_name, "
+            "target_name_before, created_at FROM identity_merge_audit"
+        ).fetchone())
+        assert connection.in_transaction is False
+    finally:
+        connection.close()
+    assert row == invalid_values
+    assert _schema_snapshot(database) == schema_before
+
+
+def test_repair_dry_run_does_not_request_journal_mode(monkeypatch, tmp_path):
+    database = tmp_path / "memory.db"
+    memory = GlobalMemory(database)
+    memory.close()
+    statements: list[str] = []
+    original_connect = sqlite3.connect
+
+    class TrackingConnection(sqlite3.Connection):
+        def execute(self, sql, parameters=()):
+            statements.append(str(sql))
+            return super().execute(sql, parameters)
+
+    def tracking_connect(*args, **kwargs):
+        kwargs["factory"] = TrackingConnection
+        return original_connect(*args, **kwargs)
+
+    monkeypatch.setattr(repair_module.sqlite3, "connect", tracking_connect)
+    repair_module.repair_media_paths(
+        database,
+        media_root=tmp_path / "media",
+        dry_run=True,
+    )
+
+    assert not any("journal_mode" in statement.lower() for statement in statements)
+    assert not any(statement.strip().upper().startswith(
+        ("BEGIN", "UPDATE", "DELETE", "INSERT")
+    ) for statement in statements)
+
+
+def test_repair_apply_requires_and_verifies_wal(monkeypatch, tmp_path):
+    database = tmp_path / "memory.db"
+    memory = GlobalMemory(database)
+    memory.close()
+    statements: list[str] = []
+    original_connect = sqlite3.connect
+
+    class TrackingConnection(sqlite3.Connection):
+        def execute(self, sql, parameters=()):
+            statements.append(str(sql))
+            return super().execute(sql, parameters)
+
+    def tracking_connect(*args, **kwargs):
+        kwargs["factory"] = TrackingConnection
+        return original_connect(*args, **kwargs)
+
+    monkeypatch.setattr(repair_module.sqlite3, "connect", tracking_connect)
+    report = repair_module.repair_media_paths(
+        database,
+        media_root=tmp_path / "media",
+        dry_run=False,
+    )
+
+    assert report["dry_run"] is False
+    assert any(
+        statement.replace(" ", "").lower() == "pragmajournal_mode=wal"
+        for statement in statements
+    )
+    assert any(statement.strip().upper() == "BEGIN IMMEDIATE" for statement in statements)
+
+
+def test_repair_apply_refuses_writes_when_wal_is_not_confirmed(
+    monkeypatch,
+    tmp_path,
+):
+    database = tmp_path / "memory.db"
+    memory = GlobalMemory(database)
+    memory.close()
+    statements: list[str] = []
+    original_connect = sqlite3.connect
+
+    class JournalResult:
+        @staticmethod
+        def fetchone():
+            return ("delete",)
+
+    class RefusingConnection(sqlite3.Connection):
+        def execute(self, sql, parameters=()):
+            statements.append(str(sql))
+            if str(sql).replace(" ", "").lower() == "pragmajournal_mode=wal":
+                return JournalResult()
+            return super().execute(sql, parameters)
+
+    def refusing_connect(*args, **kwargs):
+        kwargs["factory"] = RefusingConnection
+        return original_connect(*args, **kwargs)
+
+    monkeypatch.setattr(repair_module.sqlite3, "connect", refusing_connect)
+    with pytest.raises(RuntimeError, match="requires WAL"):
+        repair_module.repair_media_paths(
+            database,
+            media_root=tmp_path / "media",
+            dry_run=False,
+        )
+
+    assert not any(statement.strip().upper() == "BEGIN IMMEDIATE" for statement in statements)
+    assert not any(statement.strip().upper().startswith(
+        ("UPDATE", "DELETE", "INSERT")
+    ) for statement in statements)
 
 
 def test_active_person_reads_and_candidate_matching(tmp_path):

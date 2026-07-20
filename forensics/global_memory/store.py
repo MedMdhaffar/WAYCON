@@ -620,6 +620,126 @@ class GlobalMemory:
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_persons_active ON persons(is_active)"
         )
+        self._ensure_identity_merge_audit_schema()
+
+    def _ensure_identity_merge_audit_schema(self) -> None:
+        columns = {
+            row["name"]: row
+            for row in self._conn.execute(
+                "PRAGMA table_info(identity_merge_audit)"
+            ).fetchall()
+        }
+        schema_row = self._conn.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type='table' AND name='identity_merge_audit'"
+        ).fetchone()
+        schema_sql = "" if schema_row is None else str(schema_row["sql"] or "")
+        compact_schema = "".join(schema_sql.lower().split())
+        required_not_null = {
+            "source_person_id",
+            "target_person_id",
+            "decision_source",
+            "source_embedding",
+            "source_embedding_count",
+            "created_at",
+        }
+        hardened = (
+            required_not_null <= columns.keys()
+            and all(int(columns[name]["notnull"]) == 1 for name in required_not_null)
+            and "check(source_embedding_count>0)" in compact_schema
+            and "check(source_person_id<>target_person_id)" in compact_schema
+        )
+        if hardened:
+            return
+
+        invalid = self._conn.execute(
+            "SELECT merge_id FROM identity_merge_audit WHERE "
+            "source_person_id IS NULL OR target_person_id IS NULL OR "
+            "decision_source IS NULL OR source_embedding IS NULL OR "
+            "source_embedding_count IS NULL OR source_embedding_count <= 0 OR "
+            "created_at IS NULL OR source_person_id = target_person_id LIMIT 1"
+        ).fetchone()
+        if invalid is not None:
+            raise sqlite3.IntegrityError(
+                "identity_merge_audit contains rows that violate required constraints"
+            )
+
+        self._conn.execute("DROP TRIGGER IF EXISTS trg_identity_merge_audit_no_update")
+        self._conn.execute("DROP TRIGGER IF EXISTS trg_identity_merge_audit_no_delete")
+        self._conn.execute("DROP INDEX IF EXISTS idx_merge_audit_source")
+        self._conn.execute("DROP INDEX IF EXISTS idx_merge_audit_target")
+        self._conn.execute(
+            "ALTER TABLE identity_merge_audit RENAME TO identity_merge_audit_legacy"
+        )
+        self._conn.execute(
+            """
+            CREATE TABLE identity_merge_audit (
+                merge_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_person_id TEXT NOT NULL,
+                target_person_id TEXT NOT NULL,
+                reason TEXT,
+                decision_source TEXT NOT NULL,
+                similarity REAL,
+                source_embedding BLOB NOT NULL,
+                source_embedding_count INTEGER NOT NULL
+                    CHECK (source_embedding_count > 0),
+                source_name TEXT,
+                target_name_before TEXT,
+                created_at TEXT NOT NULL,
+                CHECK (source_person_id <> target_person_id)
+            )
+            """
+        )
+        self._conn.execute(
+            """
+            INSERT INTO identity_merge_audit(
+                merge_id, source_person_id, target_person_id, reason,
+                decision_source, similarity, source_embedding,
+                source_embedding_count, source_name, target_name_before,
+                created_at
+            )
+            SELECT
+                merge_id, source_person_id, target_person_id, reason,
+                decision_source, similarity, source_embedding,
+                source_embedding_count, source_name, target_name_before,
+                created_at
+            FROM identity_merge_audit_legacy
+            ORDER BY merge_id
+            """
+        )
+        self._conn.execute("DROP TABLE identity_merge_audit_legacy")
+        self._conn.execute(
+            "CREATE INDEX idx_merge_audit_source "
+            "ON identity_merge_audit(source_person_id)"
+        )
+        self._conn.execute(
+            "CREATE INDEX idx_merge_audit_target "
+            "ON identity_merge_audit(target_person_id)"
+        )
+        self._conn.execute(
+            """
+            CREATE TRIGGER trg_identity_merge_audit_no_update
+            BEFORE UPDATE ON identity_merge_audit
+            BEGIN
+                SELECT RAISE(
+                    ABORT,
+                    'identity_merge_audit is append-only: UPDATE is not allowed'
+                );
+            END
+            """
+        )
+        self._conn.execute(
+            """
+            CREATE TRIGGER trg_identity_merge_audit_no_delete
+            BEFORE DELETE ON identity_merge_audit
+            BEGIN
+                SELECT RAISE(
+                    ABORT,
+                    'identity_merge_audit is append-only: DELETE is not allowed'
+                );
+            END
+            """
+        )
 
     def _table_columns(self, table: str) -> set[str]:
         rows = self._conn.execute(f"PRAGMA table_info({table})").fetchall()
