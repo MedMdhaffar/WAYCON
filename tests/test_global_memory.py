@@ -1,17 +1,42 @@
 from __future__ import annotations
 
-import sqlite3
 import threading
 from datetime import date, timedelta
 
 import numpy as np
+import psycopg
+import psycopg_pool
 import pytest
 
 from forensics.global_memory import GlobalMemory
 
+_EMBEDDING_DIM = 512  # must match schema_postgres.sql's persons.embedding vector(512)
 
-def _unit(values) -> list[float]:
-    vec = np.asarray(values, dtype=np.float32)
+_TRUNCATE_SQL = """
+    TRUNCATE persons, appearances, recognition_log, person_gallery,
+             clothing_jobs, segments, camera_events RESTART IDENTITY CASCADE;
+    UPDATE counters SET value = 0 WHERE key = 'person_count';
+"""
+
+
+def _basis(index: int, dim: int = _EMBEDDING_DIM) -> list[float]:
+    """A one-hot unit vector -- the 512-dim equivalent of the old toy [1,0,0]-style
+    embeddings, exactly orthogonal to every other _basis(j != index) vector so the
+    "these are unrelated people" tests keep the same guarantee at real dimensionality.
+    """
+    vec = np.zeros(dim, dtype=np.float32)
+    vec[index] = 1.0
+    return vec.tolist()
+
+
+def _unit(weights: dict[int, float], dim: int = _EMBEDDING_DIM) -> list[float]:
+    """A unit vector blended from a few basis directions, e.g. _unit({0: 0.8, 1: 0.2})
+    is the 512-dim equivalent of the old _unit([0.8, 0.2, 0.0]) -- "close to person 0,
+    slightly toward person 1" for the same-person-different-angle tests.
+    """
+    vec = np.zeros(dim, dtype=np.float32)
+    for index, weight in weights.items():
+        vec[index] = weight
     vec = vec / np.linalg.norm(vec)
     return vec.tolist()
 
@@ -25,7 +50,7 @@ def _profile(
     cameras: list[str] | None = None,
     top: str = "white shirt",
 ):
-    embedding = embedding or _unit([1.0, 0.0, 0.0])
+    embedding = embedding or _basis(0)
     return {
         "id": person_id,
         "name": name,
@@ -51,8 +76,16 @@ def _profile(
 
 
 @pytest.fixture
-def memory(tmp_path):
-    gm = GlobalMemory(str(tmp_path / "memory.db"))
+def memory():
+    try:
+        gm = GlobalMemory(min_size=1, max_size=2, connect_timeout=2.0)
+    except (psycopg.OperationalError, psycopg_pool.PoolTimeout) as exc:
+        pytest.skip(f"Postgres not reachable (set GLOBAL_MEMORY_* env vars / run docker-compose up): {exc}")
+        return
+
+    with gm._pool.connection() as conn:
+        conn.execute(_TRUNCATE_SQL)
+
     try:
         yield gm
     finally:
@@ -60,13 +93,10 @@ def memory(tmp_path):
 
 
 def _counts(memory: GlobalMemory) -> tuple[int, int]:
-    conn = sqlite3.connect(str(memory.db_path))
-    try:
-        persons = conn.execute("SELECT COUNT(*) FROM persons").fetchone()[0]
-        appearances = conn.execute("SELECT COUNT(*) FROM appearances").fetchone()[0]
+    with memory._pool.connection() as conn:
+        persons = conn.execute("SELECT COUNT(*) AS n FROM persons").fetchone()["n"]
+        appearances = conn.execute("SELECT COUNT(*) AS n FROM appearances").fetchone()["n"]
         return persons, appearances
-    finally:
-        conn.close()
 
 
 def test_register_new_person(memory):
@@ -81,8 +111,8 @@ def test_register_new_person(memory):
 
 
 def test_register_same_person_new_day(memory):
-    emb_a = _unit([1.0, 0.0, 0.0])
-    emb_b = _unit([0.8, 0.2, 0.0])
+    emb_a = _basis(0)
+    emb_b = _unit({0: 0.8, 1: 0.2})
     first = memory.register(_profile(embedding=emb_a, day="2026-05-13"))
     before = np.asarray(memory.get_person(first)["embedding"], dtype=np.float32)
 
@@ -104,8 +134,8 @@ def test_register_same_person_same_day(memory):
 
 
 def test_embedding_averaging_is_weighted(memory):
-    emb_a = _unit([1.0, 0.0, 0.0])
-    emb_b = _unit([0.8, 0.2, 0.0])
+    emb_a = _basis(0)
+    emb_b = _unit({0: 0.8, 1: 0.2})
     assigned = memory.register(_profile(embedding=emb_a, face_count=10, day="2026-05-13"))
     memory.register(_profile(embedding=emb_b, face_count=2, day="2026-05-14"))
 
@@ -116,7 +146,7 @@ def test_embedding_averaging_is_weighted(memory):
 
 
 def test_query_by_face_finds_match(memory):
-    emb = _unit([1.0, 0.0, 0.0])
+    emb = _basis(0)
     assigned = memory.register(_profile(embedding=emb))
 
     results = memory.query_by_face(emb, threshold=0.9)
@@ -126,16 +156,16 @@ def test_query_by_face_finds_match(memory):
 
 
 def test_query_by_face_rejects_below_threshold(memory):
-    memory.register(_profile(embedding=_unit([1.0, 0.0, 0.0])))
+    memory.register(_profile(embedding=_basis(0)))
 
-    assert memory.query_by_face(_unit([0.0, 1.0, 0.0]), threshold=0.6) == []
+    assert memory.query_by_face(_basis(1), threshold=0.6) == []
 
 
 def test_query_by_face_ranks_correctly(memory):
-    memory.register(_profile("cluster_a", "Cluster A", _unit([1.0, 0.0, 0.0])))
-    second = memory.register(_profile("cluster_b", "Cluster B", _unit([0.0, 1.0, 0.0])))
+    memory.register(_profile("cluster_a", "Cluster A", _basis(0)))
+    second = memory.register(_profile("cluster_b", "Cluster B", _basis(1)))
 
-    results = memory.query_by_face(_unit([0.0, 1.0, 0.0]), threshold=0.0)
+    results = memory.query_by_face(_basis(1), threshold=0.0)
 
     assert second == "person_002"
     assert results[0]["person_id"] == "person_002"
@@ -144,7 +174,7 @@ def test_query_by_face_ranks_correctly(memory):
 def test_query_by_face_staleness_flag(memory):
     yesterday = (date.today() - timedelta(days=1)).isoformat()
     today = date.today().isoformat()
-    emb = _unit([1.0, 0.0, 0.0])
+    emb = _basis(0)
     memory.register(_profile(embedding=emb, day=yesterday))
     assert memory.query_by_face(emb, threshold=0.9)[0]["appearance"]["is_stale"] is True
 
@@ -153,9 +183,9 @@ def test_query_by_face_staleness_flag(memory):
 
 
 def test_query_by_date(memory):
-    memory.register(_profile("a", "A", _unit([1.0, 0.0, 0.0]), day="2026-05-13"))
-    memory.register(_profile("b", "B", _unit([0.0, 1.0, 0.0]), day="2026-05-13"))
-    memory.register(_profile("c", "C", _unit([0.0, 0.0, 1.0]), day="2026-05-14"))
+    memory.register(_profile("a", "A", _basis(0), day="2026-05-13"))
+    memory.register(_profile("b", "B", _basis(1), day="2026-05-13"))
+    memory.register(_profile("c", "C", _basis(2), day="2026-05-14"))
 
     assert len(memory.query_by_date("2026-05-13")) == 2
 
@@ -188,9 +218,9 @@ def test_get_person_unknown(memory):
 
 
 def test_list_all(memory):
-    memory.register(_profile("p1", "P1", _unit([1.0, 0.0, 0.0])))
-    memory.register(_profile("p2", "P2", _unit([0.0, 1.0, 0.0])))
-    memory.register(_profile("p3", "P3", _unit([0.0, 0.0, 1.0])))
+    memory.register(_profile("p1", "P1", _basis(0)))
+    memory.register(_profile("p2", "P2", _basis(1)))
+    memory.register(_profile("p3", "P3", _basis(2)))
 
     results = memory.list_all()
 
@@ -200,14 +230,14 @@ def test_list_all(memory):
 
 
 def test_empty_store_query(memory):
-    assert memory.query_by_face(_unit([1.0, 0.0, 0.0])) == []
+    assert memory.query_by_face(_basis(0)) == []
 
 
 def test_thread_safety(memory):
     profiles = [
-        _profile("p1", "P1", _unit([1.0, 0.0, 0.0])),
-        _profile("p2", "P2", _unit([0.0, 1.0, 0.0])),
-        _profile("p3", "P3", _unit([0.0, 0.0, 1.0])),
+        _profile("p1", "P1", _basis(0)),
+        _profile("p2", "P2", _basis(1)),
+        _profile("p3", "P3", _basis(2)),
     ]
 
     threads = [threading.Thread(target=memory.register, args=(profile,)) for profile in profiles]
@@ -220,7 +250,7 @@ def test_thread_safety(memory):
 
 
 def test_register_logs_new_and_recognized_events(memory):
-    emb = _unit([1.0, 0.0, 0.0])
+    emb = _basis(0)
     assigned = memory.register(_profile(embedding=emb, face_count=4, day="2026-05-13"))
     memory.register(_profile(embedding=emb, face_count=2, day="2026-05-14"))
 
@@ -235,8 +265,8 @@ def test_register_logs_new_and_recognized_events(memory):
 
 
 def test_auto_ids_ignore_cluster_names(memory):
-    first = memory.register(_profile("person_malek_cluster_0", "person_malek_cluster_0", _unit([1.0, 0.0, 0.0])))
-    second = memory.register(_profile("person_malek_cluster_1", "person_malek_cluster_1", _unit([0.0, 1.0, 0.0])))
+    first = memory.register(_profile("person_malek_cluster_0", "person_malek_cluster_0", _basis(0)))
+    second = memory.register(_profile("person_malek_cluster_1", "person_malek_cluster_1", _basis(1)))
 
     assert first == "person_001"
     assert second == "person_002"

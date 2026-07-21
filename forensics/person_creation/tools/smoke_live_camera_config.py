@@ -1,4 +1,11 @@
-"""Lightweight live-camera configuration smoke checks (no model or camera I/O)."""
+"""Lightweight live-camera configuration smoke checks (no model or camera I/O).
+
+Camera ingestion is no longer HTTP-triggered (see service.py's module docstring
+and realtime_main.py) -- service.py's build_initial_state() now rejects
+input_type=camera_uri outright. This checks that contract, plus the still-shared
+utilities (mask_camera_uri, write_stream_report, route_ingestion, the graph's
+node shape) that realtime_main.py and nodes/process_live_stream.py still rely on.
+"""
 
 from __future__ import annotations
 
@@ -9,7 +16,7 @@ from pathlib import Path
 from forensics.person_creation.graph import build_graph, route_ingestion
 from forensics.person_creation.live_stream import mask_camera_uri, write_stream_report
 from forensics.person_creation.nodes.describe_clothing import async_vlm_config
-from forensics.person_creation.service import build_initial_state
+from forensics.person_creation.service import build_initial_state, StartRequestError
 
 
 RAW_URI = "rtsp://admin:secret@192.168.1.64:554/Streaming/Channels/101"
@@ -19,20 +26,23 @@ MASKED_URI = "rtsp://admin:****@192.168.1.64:554/Streaming/Channels/101"
 def main() -> None:
     assert mask_camera_uri(RAW_URI) == MASKED_URI
 
-    camera_state = build_initial_state({
-        "name": "malek",
-        "input_type": "camera_uri",
-        "camera_uri": RAW_URI,
-        "camera_id": "103",
-        "duration_seconds": 30,
-        "every_n": 5,
-        "output_dir": "forensics/person_db/runs/malek_live_test",
-    })
-    assert camera_state["camera_uri"] == RAW_URI
-    assert camera_state["source_uri_masked"] == MASKED_URI
-    assert camera_state["source_type"] == "live_camera"
-    assert camera_state["duration_seconds"] == 30
-    assert route_ingestion(camera_state) == "process_live_stream"
+    # service.py's HTTP job-launcher only accepts offline video-file enrollment now.
+    try:
+        build_initial_state({
+            "name": "malek",
+            "input_type": "camera_uri",
+            "camera_uri": RAW_URI,
+            "camera_id": "103",
+            "duration_seconds": 30,
+        })
+        raise AssertionError("build_initial_state should reject input_type=camera_uri")
+    except StartRequestError:
+        pass
+
+    # But the graph itself still supports a camera_uri-tagged run -- that's what
+    # realtime_main.py drives directly, bypassing service.py's HTTP validation.
+    assert route_ingestion({"input_type": "camera_uri"}) == "process_live_stream"
+    assert route_ingestion({"input_type": "video_file"}) == "process_video"
 
     video_state = build_initial_state({
         "name": "video-check",
@@ -44,6 +54,7 @@ def main() -> None:
     graph = build_graph().get_graph()
     node_ids = set(graph.nodes)
     assert {"process_video", "process_live_stream", "finalize"} <= node_ids
+    assert "load_models" not in node_ids  # not a graph node anymore -- see load_models.py
 
     with tempfile.TemporaryDirectory() as tmp:
         report_path = write_stream_report(

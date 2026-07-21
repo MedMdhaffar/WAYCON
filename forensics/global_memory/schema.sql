@@ -14,6 +14,7 @@ CREATE TABLE IF NOT EXISTS appearances (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
     person_id        TEXT NOT NULL REFERENCES persons(person_id),
     date             TEXT NOT NULL,
+    segment_id       TEXT DEFAULT NULL,
     top              TEXT,
     bottom           TEXT,
     shoes            TEXT,
@@ -72,6 +73,7 @@ CREATE TABLE IF NOT EXISTS clothing_jobs (
     pipeline_version TEXT NOT NULL,
     status           TEXT NOT NULL DEFAULT 'pending',
     attempts         INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at  TEXT DEFAULT NULL,
     error            TEXT DEFAULT NULL,
     created_at       TEXT NOT NULL,
     updated_at       TEXT NOT NULL,
@@ -80,6 +82,41 @@ CREATE TABLE IF NOT EXISTS clothing_jobs (
 
 CREATE INDEX IF NOT EXISTS idx_clothing_jobs_status ON clothing_jobs(status);
 CREATE INDEX IF NOT EXISTS idx_clothing_jobs_person ON clothing_jobs(person_id);
+CREATE INDEX IF NOT EXISTS idx_clothing_jobs_next_attempt ON clothing_jobs(next_attempt_at);
+
+-- Segment reliability state machine: CAPTURING -> READY -> PROCESSING -> SUCCEEDED
+-- / FAILED_RETRYABLE (retried, loops back to PROCESSING) / FAILED_FINAL. CAPTURING
+-- and READY are set by the segment accumulator (presence_segmentation.py) as frames
+-- are gathered and the segment closes; PROCESSING/SUCCEEDED/FAILED_* are set by
+-- whoever runs the sync detection graph against the segment (service.py).
+-- `status` here reflects core detection/identity completion ONLY -- clothing
+-- enrichment status lives in clothing_jobs/appearances and is never conflated with
+-- this table (see the /api/segments monitoring endpoints in service.py).
+CREATE TABLE IF NOT EXISTS segments (
+    segment_id         TEXT PRIMARY KEY,
+    seq_num            INTEGER NOT NULL DEFAULT 0,
+    codec              TEXT,
+    segment_start_ts   TEXT NOT NULL,
+    segment_end_ts     TEXT,
+    status             TEXT NOT NULL DEFAULT 'CAPTURING',
+    retry_count        INTEGER NOT NULL DEFAULT 0,
+    segment_incomplete INTEGER NOT NULL DEFAULT 0,
+    error              TEXT DEFAULT NULL,
+    created_at         TEXT NOT NULL,
+    updated_at         TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_segments_status ON segments(status);
+
+-- Per-segment idempotency for appearances, in addition to the existing per-day
+-- (person_id, date) uniqueness used by GlobalMemory.register()'s immediate
+-- placeholder row. The async VLM worker upserts on (person_id, segment_id) instead
+-- via GlobalMemory.upsert_appearance_for_segment() -- a person seen in two segments
+-- on the same day gets two appearance rows (they may be wearing different clothes),
+-- and re-processing the same segment (crash-recovery replay) overwrites in place
+-- rather than duplicating.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_appearances_person_segment
+    ON appearances(person_id, segment_id);
 
 CREATE INDEX IF NOT EXISTS idx_appearances_date     ON appearances(date);
 CREATE INDEX IF NOT EXISTS idx_appearances_person   ON appearances(person_id);

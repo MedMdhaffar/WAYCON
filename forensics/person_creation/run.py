@@ -1,5 +1,6 @@
 import argparse
 from forensics.person_creation.graph import build_graph
+from forensics.person_creation.load_models import load_models
 
 
 def main():
@@ -12,6 +13,18 @@ def main():
     parser.add_argument("--reid-weights", default="market1501", help="Body ReID weights label (default: market1501)")
     args = parser.parse_args()
 
+    reid_config = {
+        "model": args.reid_model,
+        "weights": args.reid_weights,
+        "input_size": [256, 128],
+        "embedding_dim": 512,
+    }
+
+    # load_models() is a plain function now, not a graph node (see
+    # load_models.py) -- call it once before the graph runs, same as
+    # service.py/realtime_main.py do.
+    reid_result = load_models(reid_config)
+
     graph = build_graph()
 
     initial_state = {
@@ -19,14 +32,9 @@ def main():
         "video_paths": args.videos,
         "output_dir": args.output,
         "process_every_n": args.every,
-        "reid_config": {
-            "model": args.reid_model,
-            "weights": args.reid_weights,
-            "input_size": [256, 128],
-            "embedding_dim": 512,
-        },
         "body_crops": [],
         "face_crops": [],
+        **reid_result,
     }
 
     print(f"\n=== Person Creation: {args.name} ===")

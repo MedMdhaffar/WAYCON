@@ -185,11 +185,17 @@ class SegmentAccumulator:
         codec: str = "h264",
         max_segment_seconds: float = 10.0,
         on_segment_dropped: Callable[[SegmentBatch], None] | None = None,
+        on_segment_state_change: Callable[[SegmentBatch, str], None] | None = None,
     ) -> None:
         self.output_queue = output_queue
         self.codec = codec
         self.max_segment_seconds = max(0.5, float(max_segment_seconds))
         self._on_segment_dropped = on_segment_dropped
+        # Optional hook for persisting the segment reliability state machine
+        # (CAPTURING on open, READY on close) -- e.g. GlobalMemory.upsert_segment.
+        # Kept as a callback rather than an import so this module has no DB
+        # dependency and stays testable without one; called with (segment, status).
+        self._on_segment_state_change = on_segment_state_change
 
         self._current: SegmentBatch | None = None
         self._seq_num = 0
@@ -232,6 +238,7 @@ class SegmentAccumulator:
             codec=self.codec,
             segment_start_ts=utc_now_iso(),
         )
+        self._notify_state_change(self._current, "CAPTURING")
 
     def _rotate_segment(self) -> None:
         self._close_segment(reason="duration_cap", incomplete=False)
@@ -244,7 +251,15 @@ class SegmentAccumulator:
         segment.close(reason=reason, incomplete=incomplete)
         self._current = None
         if segment.frames:
+            self._notify_state_change(segment, "READY")
             self._push(segment)
+
+    def _notify_state_change(self, segment: SegmentBatch, status: str) -> None:
+        if self._on_segment_state_change is not None:
+            try:
+                self._on_segment_state_change(segment, status)
+            except Exception:
+                pass
 
     def _push(self, segment: SegmentBatch) -> None:
         if self.output_queue.full():
@@ -288,6 +303,7 @@ class PresenceGatedIngestion:
         max_segment_seconds: float = 10.0,
         codec: str = "h264",
         on_segment_dropped: Callable[[SegmentBatch], None] | None = None,
+        on_segment_state_change: Callable[[SegmentBatch, str], None] | None = None,
     ) -> None:
         self.frame_source = frame_source
         self.detect_person_fn = detect_person_fn
@@ -299,6 +315,7 @@ class PresenceGatedIngestion:
             codec=codec,
             max_segment_seconds=max_segment_seconds,
             on_segment_dropped=on_segment_dropped,
+            on_segment_state_change=on_segment_state_change,
         )
         self.gate = PresenceGate(
             open_debounce_count=open_debounce_count,

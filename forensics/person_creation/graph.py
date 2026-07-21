@@ -1,7 +1,6 @@
 from langgraph.graph import StateGraph, START, END
 
 from forensics.person_creation.state import PersonCreationState
-from forensics.person_creation.nodes.load_models import load_models
 from forensics.person_creation.nodes.process_video import process_video
 from forensics.person_creation.nodes.process_live_stream import process_live_stream
 from forensics.person_creation.nodes.filter_quality import filter_quality
@@ -14,6 +13,11 @@ from forensics.person_creation.nodes.compute_reid import compute_reid
 from forensics.person_creation.nodes.build_profile import build_profile
 from forensics.person_creation.nodes.finalize import finalize
 
+# load_models is intentionally NOT a node here -- see load_models.py's docstring.
+# Models load once, before ingestion starts, called directly by the process
+# entrypoint (service.py); this graph assumes models are already resident by the
+# time it runs.
+
 
 def route_ingestion(state: PersonCreationState) -> str:
     return "process_live_stream" if state.get("input_type") == "camera_uri" else "process_video"
@@ -22,7 +26,6 @@ def route_ingestion(state: PersonCreationState) -> str:
 def build_graph():
     builder = StateGraph(PersonCreationState)
 
-    builder.add_node("load_models",         load_models)
     builder.add_node("process_video",       process_video)
     builder.add_node("process_live_stream", process_live_stream)
     builder.add_node("filter_quality",      filter_quality)
@@ -35,9 +38,8 @@ def build_graph():
     builder.add_node("build_profile",       build_profile)
     builder.add_node("finalize",            finalize)
 
-    builder.add_edge(START,                 "load_models")
     builder.add_conditional_edges(
-        "load_models",
+        START,
         route_ingestion,
         {
             "process_video": "process_video",

@@ -1,14 +1,13 @@
 """Process one already-captured segment of in-memory frames from a live camera.
 
 Ingestion (RTSP connect, buffering, reconnect/backoff, presence gating, segment
-accumulation) happens entirely outside the graph now -- see gst_stream.GstFrameBuffer,
-presence_segmentation.PresenceGatedIngestion/SegmentBatch, and
-single_segment_capture.capture_fixed_duration_segment (the legacy fixed-window path
-used by service.py's /api/person/start camera_uri contract). This node's only job is
-to run the shared person/face detectors over an already-captured stack of frames and
-persist quality crops to disk -- the same as process_video.py does for a video file,
-but over `state["segment_frames"]` (in-memory numpy arrays) instead of opening a video
-path with cv2.VideoCapture.
+accumulation) happens entirely outside the graph now -- see gst_stream.GstFrameBuffer
+and presence_segmentation.PresenceGatedIngestion/SegmentBatch, driven continuously by
+realtime_main.RealtimeProcessor (one long-lived process per camera; see its module
+docstring). This node's only job is to run the shared person/face detectors over an
+already-captured stack of frames and persist quality crops to disk -- the same as
+process_video.py does for a video file, but over `state["segment_frames"]` (in-memory
+numpy arrays) instead of opening a video path with cv2.VideoCapture.
 """
 
 from __future__ import annotations
@@ -104,7 +103,6 @@ def process_live_stream(state: PersonCreationState) -> dict:
     return {
         "body_crops": body_crops,
         "face_crops": face_crops,
-        "camera_uri": "",
         "source_type": "live_camera",
         "stream_stats": stats,
         "stream_report_path": report_path,

@@ -24,6 +24,14 @@ numpy
 # `import gi` / `gi.require_version("Gst", "1.0")` will fail.
 PyGObject>=3.50
 
+# global_memory's Postgres backend (forensics/global_memory/store.py). psycopg3, not
+# psycopg2 -- has native connection-pool support (psycopg_pool) and is the actively
+# developed driver. `pgvector` is the Python adapter for the `vector` column type
+# (registers numpy<->vector(N) conversion); the Postgres-side extension itself
+# (`CREATE EXTENSION vector`) is enabled by schema_postgres.sql, not by this package.
+psycopg[binary,pool]>=3.1
+pgvector>=0.3.0
+
 # Optional — auto_pair association cues. Each is probed at load_models time;
 # if missing, that cue is disabled and its weight is redistributed across the
 # remaining cues. Install to enable body-ReID / pose cues:

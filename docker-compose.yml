@@ -1,0 +1,49 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: waycon-forensics-postgres
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_DB: ${GLOBAL_MEMORY_DB:-waycon_forensics}
+      POSTGRES_USER: ${GLOBAL_MEMORY_USER:-waycon}
+      POSTGRES_PASSWORD: ${GLOBAL_MEMORY_PASSWORD}
+
+    ports:
+      - "${GLOBAL_MEMORY_PORT:-5432}:5432"
+
+    volumes:
+      - waycon_pgdata:/var/lib/postgresql/data
+
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${GLOBAL_MEMORY_USER:-waycon} -d ${GLOBAL_MEMORY_DB:-waycon_forensics}"
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: waycon-forensics-pgadmin
+    restart: unless-stopped
+
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD}
+
+    ports:
+      - "${PGADMIN_PORT:-5050}:80"
+
+    volumes:
+      - waycon_pgadmin_data:/var/lib/pgadmin
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  waycon_pgdata:
+  waycon_pgadmin_data:

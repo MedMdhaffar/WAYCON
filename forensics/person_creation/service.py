@@ -1,3 +1,38 @@
+"""HTTP service: monitoring/query API in front of Postgres, plus offline
+video-file enrollment job launching.
+
+Camera ingestion is NOT triggered from here anymore -- it's realtime_main.py's
+job, a separate long-lived process that continuously consumes one camera via
+GStreamer, presence-gated segmentation, and the same LangGraph pipeline this
+module used to spin up per HTTP request. That per-request threading.Thread +
+in-memory `_jobs` dict model never mapped onto "one resident process
+continuously consuming one camera" -- a request-scoped job that opens an RTSP
+connection, captures for a fixed duration, and tears back down doesn't compose
+with continuous presence-gated capture, and `_jobs` living only in this
+process's memory meant every job's status was lost on restart with no
+persistence or locking around concurrent access.
+
+What's left here:
+  - Monitoring/query endpoints reading straight from GlobalMemory (Postgres) --
+    /api/segments*, /api/clothing-jobs, /api/memory/* -- these were always
+    stateless reads/writes against the DB, not pipeline-dependent, so they're
+    unaffected by any of this.
+  - /api/person/start still exists, but ONLY for offline video-file enrollment
+    (input_type=video_file) -- kept because PERSON_CREATION_DOC.md documents
+    offline enrollment as a prerequisite step, and a video file is naturally a
+    bounded, one-shot unit of work that a request/response job model fits fine
+    (unlike a continuous camera feed). It keeps the per-request
+    threading.Thread + in-memory `_jobs` dict for this narrower purpose --
+    losing an in-progress *offline enrollment* job's status on a service
+    restart is an acceptable, rare tradeoff for what's now a secondary/dev
+    workflow, not the realtime path.
+  - Models load lazily (not eagerly at process startup) since this process's
+    primary job is now lightweight monitoring, not holding GPU models
+    resident. The async VLM worker is NOT started here either -- run it via
+    realtime_main.py (which starts one by default) or standalone via
+    `python -m forensics.person_creation.vlm_worker`.
+"""
+
 import json
 import re
 import threading
@@ -5,7 +40,6 @@ import traceback
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from urllib.parse import urlsplit
 
 from flask import Flask, jsonify, request, send_file
 from flask_cors import CORS
@@ -15,7 +49,6 @@ import cv2 as _cv2
 
 from forensics.person_identifier.config import Config as _PIConfig
 from forensics.person_creation.path_utils import to_wsl_path as _to_wsl_path
-from forensics.person_creation.live_stream import mask_camera_uri
 from forensics.person_creation.tools.cleanup_orphan_crops import (
     cleanup as _cleanup_orphan_crops,
     CleanupError as _CleanupError,
@@ -56,7 +89,10 @@ def _as_int(value, field_name: str) -> int:
 
 
 def build_initial_state(body: dict, *, validate_video_paths: bool = True) -> dict:
-    """Validate a start payload and build graph state for video or live input."""
+    """Validate a start payload and build graph state for offline video-file
+    enrollment. Camera input is not accepted here -- see this module's docstring;
+    continuous camera capture is realtime_main.py's job, not an HTTP-triggered one.
+    """
     if not isinstance(body, dict):
         raise StartRequestError("JSON object required")
     name = str(body.get("name", "")).strip()
@@ -64,17 +100,20 @@ def build_initial_state(body: dict, *, validate_video_paths: bool = True) -> dic
         raise StartRequestError("name required")
 
     input_type = str(body.get("input_type") or "video_file").strip().lower()
-    if input_type not in {"video", "video_file", "camera_uri"}:
-        raise StartRequestError("input_type must be 'video_file' or 'camera_uri'")
     if input_type == "video":
         input_type = "video_file"
+    if input_type != "video_file":
+        raise StartRequestError(
+            "input_type must be 'video_file' -- camera ingestion runs as its own "
+            "long-lived process now, see realtime_main.py"
+        )
 
     output_dir = str(body.get("output_dir") or f"forensics/person_db/{name.lower()}")
     every_n = max(1, _as_int(body.get("every_n", 15), "every_n"))
     initial_state = {
         "person_name": name,
         "input_type": input_type,
-        "source_type": "live_camera" if input_type == "camera_uri" else "video_file",
+        "source_type": "video_file",
         "video_paths": [],
         "output_dir": str(Path(output_dir)),
         "process_every_n": every_n,
@@ -83,37 +122,6 @@ def build_initial_state(body: dict, *, validate_video_paths: bool = True) -> dic
         "body_crops": [],
         "face_crops": [],
     }
-
-    if input_type == "camera_uri":
-        camera_uri = str(body.get("camera_uri") or "").strip()
-        if not camera_uri:
-            raise StartRequestError("camera_uri required when input_type is 'camera_uri'")
-        try:
-            parsed = urlsplit(camera_uri)
-        except ValueError as exc:
-            raise StartRequestError("camera_uri is invalid") from exc
-        if parsed.scheme.lower() not in {"rtsp", "http", "https", "file"}:
-            raise StartRequestError("camera_uri scheme must be rtsp://, http://, https://, or file://")
-        if parsed.scheme.lower() == "file":
-            if not parsed.path:
-                raise StartRequestError("file:// camera_uri must include a path")
-        elif not parsed.netloc:
-            raise StartRequestError("camera_uri must include a host")
-
-        duration = _as_int(body.get("duration_seconds", 30), "duration_seconds")
-        duration = max(5, min(duration, 300))
-        camera_id = str(body.get("camera_id") or "").strip()[:128] or None
-        live_config = body.get("live_stream_config") or {}
-        if not isinstance(live_config, dict):
-            raise StartRequestError("live_stream_config must be an object")
-        initial_state.update({
-            "camera_uri": camera_uri,
-            "source_uri_masked": mask_camera_uri(camera_uri),
-            "camera_id": camera_id,
-            "duration_seconds": duration,
-            "live_stream_config": live_config,
-        })
-        return initial_state
 
     video_paths = body.get("video_paths", [])
     if not isinstance(video_paths, list) or not video_paths:
@@ -160,6 +168,8 @@ class JobState:
 _jobs: dict[str, JobState] = {}
 _graph = None
 _graph_lock = threading.Lock()
+_gm = None
+_gm_lock = threading.Lock()
 
 
 def _get_graph():
@@ -171,10 +181,35 @@ def _get_graph():
     return _graph
 
 
+def _get_gm():
+    """Process-wide GlobalMemory instance backing the monitoring endpoints below
+    (/api/segments*, /api/clothing-jobs, pipeline-status). finalize.py and the VLM
+    worker (run elsewhere -- see this module's docstring) open their own
+    short-lived instances.
+    """
+    global _gm
+    with _gm_lock:
+        if _gm is None:
+            from forensics.global_memory import GlobalMemory
+            _gm = GlobalMemory()
+    return _gm
+
+
+def ensure_models_loaded() -> dict:
+    """Load every model once, resident for this process's lifetime.
+
+    Safe to call repeatedly (every underlying loader is guarded against
+    reloading) -- called lazily, on the first offline video-file job, not
+    eagerly at process startup: this process's primary purpose is now
+    lightweight monitoring, not holding GPU models resident (that's
+    realtime_main.py's job, for the camera path).
+    """
+    from forensics.person_creation.load_models import load_models
+    return load_models()
+
+
 _NODE_TO_STATUS = {
-    "load_models":       "loading_models",
     "process_video":     "processing_video",
-    "process_live_stream": "processing_live_frames",
     "filter_quality":    "filtering",
     "embed_all_faces":   "embedding",
     "cluster_identities": "clustering",
@@ -188,48 +223,16 @@ _NODE_TO_STATUS = {
 
 
 def _run_pipeline(job_id: str, initial_state: dict) -> None:
-    """Run the graph start to end with no human interrupts."""
+    """Run the graph start to end for one offline video-file job. No human
+    interrupts, no segment/camera bookkeeping -- video-file runs aren't part of
+    the segment reliability state machine (that's a camera-capture concept; see
+    realtime_main.py), they're a bounded one-shot job tracked only in `_jobs`.
+    """
     job = _jobs[job_id]
+    job.status = "loading_models"
+    reid_result = ensure_models_loaded()
+    initial_state.update(reid_result)
     graph = _get_graph()
-
-    def update_live_status(status: str, snapshot_update: dict | None = None) -> None:
-        job.node = "process_live_stream"
-        job.status = status
-        if snapshot_update:
-            job.snapshot.update(snapshot_update)
-
-    raw_camera_uri = initial_state.get("camera_uri")
-    status_token = None
-    if initial_state.get("input_type") == "camera_uri":
-        # Ingestion no longer happens inside a graph node (see
-        # nodes/process_live_stream.py) -- capture the fixed-duration window here,
-        # then hand the graph an already-captured segment. The raw camera_uri (which
-        # may embed credentials) is dropped from state before the graph ever sees it;
-        # only the masked form travels through graph state / job snapshots from here on.
-        from forensics.person_creation.single_segment_capture import capture_fixed_duration_segment
-        from forensics.person_creation.status_reporting import set_status_callback, reset_status_callback
-
-        status_token = set_status_callback(update_live_status)
-        try:
-            segment = capture_fixed_duration_segment(
-                raw_camera_uri,
-                initial_state.get("duration_seconds", 30),
-                status_callback=update_live_status,
-            )
-        except Exception:
-            reset_status_callback(status_token)
-            job.status = "error"
-            error = traceback.format_exc()
-            if raw_camera_uri:
-                error = error.replace(raw_camera_uri, mask_camera_uri(raw_camera_uri))
-            job.error = error
-            return
-
-        initial_state.pop("camera_uri", None)
-        initial_state["segment_id"] = segment.segment_id
-        initial_state["segment_incomplete"] = segment.segment_incomplete
-        initial_state["segment_frames"] = segment.frames
-        initial_state["segment_frame_timestamps"] = segment.frame_timestamps
 
     try:
         for event in graph.stream(initial_state, stream_mode="updates"):
@@ -243,14 +246,7 @@ def _run_pipeline(job_id: str, initial_state: dict) -> None:
 
     except Exception:
         job.status = "error"
-        error = traceback.format_exc()
-        if raw_camera_uri:
-            error = error.replace(raw_camera_uri, mask_camera_uri(raw_camera_uri))
-        job.error = error
-    finally:
-        if status_token is not None:
-            from forensics.person_creation.status_reporting import reset_status_callback
-            reset_status_callback(status_token)
+        job.error = traceback.format_exc()
 
 
 # ─── Endpoints ────────────────────────────────────────────────────────────────
@@ -274,9 +270,6 @@ def start():
     job_id = str(uuid.uuid4())
     safe_initial_snapshot = {
         "source_type": initial_state.get("source_type", "video_file"),
-        "camera_id": initial_state.get("camera_id"),
-        "duration_seconds": initial_state.get("duration_seconds"),
-        "source_uri_masked": initial_state.get("source_uri_masked", ""),
     }
     job = JobState(job_id=job_id, snapshot=safe_initial_snapshot)
     _jobs[job_id] = job
@@ -314,11 +307,6 @@ def status(job_id: str):
         "profile":             snap.get("profile", {}),
         "human_feedback_path": snap.get("human_feedback_path", ""),
         "source_type":        snap.get("source_type", "video_file"),
-        "camera_id":          snap.get("camera_id"),
-        "duration_seconds":   snap.get("duration_seconds"),
-        "source_uri_masked":  snap.get("source_uri_masked", ""),
-        "stream_stats":       snap.get("stream_stats", {}),
-        "stream_report_path": snap.get("stream_report_path", ""),
     }
     return jsonify({
         "job_id":   job_id,
@@ -372,8 +360,26 @@ def crops(job_id: str):
 
 @app.get("/api/images")
 def serve_image():
+    """Serve a crop/profile image by absolute or relative path.
+
+    Sandboxed to PROFILE_ROOT (forensics/person_db by default) -- every crop this
+    API is meant to serve lives there (finalize.py moves durable crops under
+    forensics/person_db/<person_id>/..., which output_dir defaults into). Without
+    this check any caller could read arbitrary files the process has access to
+    (e.g. ?path=/etc/passwd or ?path=../../some/secret) via path traversal.
+    """
     path_str = request.args.get("path", "")
-    path = Path(path_str).resolve()
+    if not path_str:
+        return jsonify({"error": "path is required"}), 400
+
+    allowed_root = _PIConfig.load().PROFILE_ROOT.resolve()
+    try:
+        path = Path(path_str).resolve()
+    except (OSError, ValueError):
+        return jsonify({"error": "invalid path"}), 400
+
+    if not (path == allowed_root or path.is_relative_to(allowed_root)):
+        return jsonify({"error": "path is outside the allowed directory"}), 403
     if not path.exists() or not path.is_file():
         return jsonify({"error": "file not found"}), 404
     return send_file(str(path))
@@ -674,5 +680,55 @@ def profile_add_face_photos(name: str):
     return jsonify(result)
 
 
+# ─── Monitoring: segments (core detection) vs. clothing_jobs (enrichment) ─────
+#
+# Deliberately two separate surfaces, not one merged view: a segment's
+# core-detection status (CAPTURING/READY/PROCESSING/SUCCEEDED/FAILED_*) reaching
+# SUCCEEDED says nothing about whether its clothing_jobs row has completed --
+# that's tracked independently and may still be pending/processing/retrying well
+# after the segment itself is done. Conflating them would hide exactly the state
+# ("core detection is done, clothing enrichment is still catching up") this
+# monitoring surface exists to show.
+
+@app.get("/api/segments")
+def list_segments():
+    status = request.args.get("status")
+    limit = _as_int(request.args.get("limit", 50), "limit")
+    gm = _get_gm()
+    return jsonify({"segments": gm.list_segments(status=status, limit=limit)})
+
+
+@app.get("/api/segments/<segment_id>")
+def segment_detail(segment_id: str):
+    gm = _get_gm()
+    segment = gm.get_segment(segment_id)
+    if segment is None:
+        return jsonify({"error": "segment not found"}), 404
+    return jsonify({
+        "segment": segment,
+        "clothing_jobs": gm.list_clothing_jobs_for_segment(segment_id),
+    })
+
+
+@app.get("/api/clothing-jobs")
+def list_clothing_jobs():
+    status = request.args.get("status")
+    limit = _as_int(request.args.get("limit", 100), "limit")
+    gm = _get_gm()
+    return jsonify({"clothing_jobs": gm.list_clothing_jobs(status=status, limit=limit)})
+
+
+@app.get("/api/memory/persons/<person_id>/pipeline-status")
+def person_pipeline_status(person_id: str):
+    gm = _get_gm()
+    if gm.get_person(person_id) is None:
+        return jsonify({"error": "person not found"}), 404
+    return jsonify(gm.get_person_pipeline_status(person_id))
+
+
 if __name__ == "__main__":
+    # No eager model/VLM-worker loading here -- see this module's docstring.
+    # Models load lazily, on the first offline video-file job (ensure_models_loaded()
+    # inside _run_pipeline). For the camera path and its async VLM worker, run
+    # realtime_main.py as its own process.
     app.run(host="0.0.0.0", port=5009, debug=False)

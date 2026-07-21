@@ -12,16 +12,16 @@ class PersonCreationState(TypedDict):
     source_uri_masked: NotRequired[str]
     camera_id: NotRequired[str]
     duration_seconds: NotRequired[int]
-    live_stream_config: NotRequired[dict]
     stream_stats: NotRequired[dict]
     stream_report_path: NotRequired[str]
 
-    # Presence-gated segment ingestion (see presence_segmentation.SegmentBatch /
-    # single_segment_capture.py). Ingestion happens outside the graph; a run of the
-    # graph consumes one already-captured segment via these fields instead of opening
-    # a camera or video path itself. `segment_frames` is the one place raw in-memory
-    # frame tensors live in state -- nodes/process_live_stream.py clears it once
-    # consumed so the rest of the run stays references + compact metadata.
+    # Presence-gated segment ingestion (see presence_segmentation.SegmentBatch and
+    # realtime_main.RealtimeProcessor, which drives it continuously per camera).
+    # Ingestion happens outside the graph; a run of the graph consumes one
+    # already-captured segment via these fields instead of opening a camera or
+    # video path itself. `segment_frames` is the one place raw in-memory frame
+    # tensors live in state -- nodes/process_live_stream.py clears it once consumed
+    # so the rest of the run stays references + compact metadata.
     segment_id: NotRequired[str]
     segment_seq_num: NotRequired[int]
     segment_start_ts: NotRequired[str]
