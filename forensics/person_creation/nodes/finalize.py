@@ -1,9 +1,17 @@
 import json
 import os
+import re
 import shutil
+import uuid
 from pathlib import Path
 
 from forensics.media_paths import MediaPathError, get_media_root, normalize_media_path
+from forensics.person_creation.media_lifecycle import (
+    cleanup_relocated_sources,
+    relocate_profile_media,
+    rewrite_media_references,
+    scrub_obsolete_session_media,
+)
 
 
 def _basenames(items) -> set[str]:
@@ -41,73 +49,12 @@ def _prune_orphans(directory: Path, keep: set[str]) -> tuple[int, int]:
 
 def _write_json(path: Path, data: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
-
-
-def _copy_or_merge_dir(src: Path, dst: Path) -> None:
-    if not src.exists():
-        dst.mkdir(parents=True, exist_ok=True)
-        return
-    dst.mkdir(parents=True, exist_ok=True)
-    for item in src.iterdir():
-        target = dst / item.name
-        if target.exists():
-            continue
-        if item.is_file():
-            shutil.copy2(item, target)
-
-
-def _remove_copied_source(src: Path) -> None:
-    if not src.exists():
-        return
-    for item in src.iterdir():
-        if item.is_file():
-            item.unlink(missing_ok=True)
+    temporary = path.parent / f".{path.name}.{uuid.uuid4().hex}.tmp"
     try:
-        src.rmdir()
-    except OSError:
-        pass
-
-
-def _remap_crop_paths(paths: list[str], person_dir: Path, crop_dir: str) -> list[str]:
-    return [
-        normalize_media_path(person_dir / crop_dir / Path(p).name, require_exists=True)
-        for p in (paths or [])
-        if p and (person_dir / crop_dir / Path(p).name).is_file()
-    ]
-
-
-def _remap_sharpness_map(sharpness: dict, person_dir: Path, crop_dir: str) -> dict:
-    remapped: dict[str, float] = {}
-    for raw_path, value in (sharpness or {}).items():
-        if not raw_path:
-            continue
-        target = person_dir / crop_dir / Path(raw_path).name
-        if not target.is_file():
-            continue
-        new_path = normalize_media_path(target, require_exists=True)
-        try:
-            remapped[new_path] = float(value)
-        except (TypeError, ValueError):
-            remapped[new_path] = 0.0
-    return remapped
-
-
-def _remap_color_sample_paths(color_signal: dict, person_dir: Path) -> dict:
-    color_signal = dict(color_signal or {})
-    samples = []
-    for sample in color_signal.get("samples", []) or []:
-        item = dict(sample)
-        if item.get("path"):
-            target = person_dir / "body_crops" / Path(item["path"]).name
-            item["path"] = (
-                normalize_media_path(target, require_exists=True)
-                if target.is_file()
-                else None
-            )
-        samples.append(item)
-    color_signal["samples"] = samples
-    return color_signal
+        temporary.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _normalize_profile_schema(profile: dict) -> dict:
@@ -203,6 +150,67 @@ def _cleanup_staging(state: dict, staging: Path) -> None:
         print("[finalize] cleanup completed", flush=True)
 
 
+_FINAL_MEDIA_FIELDS = (
+    "body_crops",
+    "face_crops",
+    "quality_body_crops",
+    "quality_face_crops",
+    "all_face_embeddings",
+    "failed_face_embeddings",
+    "frame_groups",
+    "associations",
+    "identity_clusters",
+    "cluster_assignments",
+    "unresolved_faces",
+    "unattached_bodies",
+    "best_body_crops",
+    "per_cluster_best_body_crops",
+    "per_cluster_clothing",
+    "clothing_diagnostics",
+    "rolling_analysis",
+    "stream_stats",
+)
+
+
+def _canonical_replay_person_id(profile: dict) -> str | None:
+    person_id = str(profile.get("id") or "")
+    if not re.fullmatch(r"person_[0-9]+", person_id):
+        return None
+    paths = [
+        *list(profile.get("face_crops") or []),
+        *list(profile.get("body_crops") or []),
+        *list(profile.get("best_body_crops") or []),
+    ]
+    if not paths or any(
+        not str(path).replace("\\", "/").startswith(f"{person_id}/")
+        for path in paths
+    ):
+        return None
+    return person_id
+
+
+def _rewrite_feedback_report(
+    path: Path,
+    remap: dict[str, str],
+    *,
+    output_dir: Path,
+    media_root: Path,
+) -> None:
+    if not path.is_file():
+        return
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    payload = rewrite_media_references(payload, remap)
+    payload = scrub_obsolete_session_media(
+        payload,
+        output_dir=output_dir,
+        media_root=media_root,
+    )
+    _write_json(path, payload)
+
+
 def finalize(state: dict) -> dict:
     """Write one profile.json per cluster, plus session and rejects reports.
 
@@ -216,6 +224,8 @@ def finalize(state: dict) -> dict:
     base_db_dir = get_media_root()
     profiles = state.get("per_cluster_profiles") or {}
     finalized_profiles: dict[int, dict] = {}
+    complete_remap: dict[str, str] = {}
+    cleanup_pairs: list[tuple[str, str]] = []
 
     # Goal 3: register completed profiles into global memory. The DB is the
     # source of truth for identity; profile.json below is only a debug export.
@@ -226,50 +236,45 @@ def finalize(state: dict) -> dict:
         for raw_cid, profile in profiles.items():
             cid = int(raw_cid)
             profile = _normalize_profile_schema(profile)
-            registration = gm.register_with_identity_policy(
-                profile,
-                observation_count=_accepted_face_observation_count(profile),
-                low_confidence=bool(profile.get("low_confidence", False)),
-            )
-            assigned_id = registration.person_id
+            replay_id = _canonical_replay_person_id(profile)
+            relocation_holder = {}
+            if replay_id is not None and gm.get_person(replay_id) is not None:
+                assigned_id = replay_id
+                relocation = relocate_profile_media(
+                    profile,
+                    assigned_id,
+                    media_root=base_db_dir,
+                )
+                profile = relocation.profile
+            else:
+                def prepare_for_person(person_id: str, raw_profile: dict) -> dict:
+                    relocation = relocate_profile_media(
+                        raw_profile,
+                        person_id,
+                        media_root=base_db_dir,
+                    )
+                    relocation_holder["value"] = relocation
+                    return relocation.profile
+
+                registration = gm.register_with_identity_policy(
+                    profile,
+                    observation_count=_accepted_face_observation_count(profile),
+                    low_confidence=bool(profile.get("low_confidence", False)),
+                    prepare_profile_for_person=prepare_for_person,
+                )
+                assigned_id = registration.person_id
+                relocation = relocation_holder["value"]
+                profile = relocation.profile
+
+            complete_remap.update(relocation.remap)
+            for pair in relocation.cleanup_pairs:
+                if pair not in cleanup_pairs:
+                    cleanup_pairs.append(pair)
             profile["id"] = assigned_id
             stored_person = gm.get_person(assigned_id) or {}
             profile["name"] = stored_person.get("name") or assigned_id.replace("_", " ").title()
             person_dir = base_db_dir / assigned_id
             person_dir.mkdir(parents=True, exist_ok=True)
-
-            cluster_dir = output_dir / f"cluster_{cid}"
-            source_body = cluster_dir / "body_crops"
-            source_face = cluster_dir / "face_crops"
-            _copy_or_merge_dir(source_body, person_dir / "body_crops")
-            _copy_or_merge_dir(source_face, person_dir / "face_crops")
-
-            profile["body_crops"] = _remap_crop_paths(profile.get("body_crops", []), person_dir, "body_crops")
-            profile["best_body_crops"] = _remap_crop_paths(profile.get("best_body_crops", []), person_dir, "body_crops")
-            profile["face_crops"] = _remap_crop_paths(profile.get("face_crops", []), person_dir, "face_crops")
-            profile["body_crop_sharpness"] = _remap_sharpness_map(
-                profile.get("body_crop_sharpness", {}),
-                person_dir,
-                "body_crops",
-            )
-            profile["face_crop_sharpness"] = _remap_sharpness_map(
-                profile.get("face_crop_sharpness", {}),
-                person_dir,
-                "face_crops",
-            )
-            if (profile.get("appearance_signals") or {}).get("color"):
-                profile["appearance_signals"]["color"] = _remap_color_sample_paths(
-                    profile["appearance_signals"]["color"],
-                    person_dir,
-                )
-            if profile.get("face_crops"):
-                profile["profile_image"] = profile["face_crops"][0]
-            gm.update_crop_paths(assigned_id, profile)
-
-            # Old session files remain valid until the database atomically points
-            # at copied canonical files. Only then is the old copy removed.
-            _remove_copied_source(source_body)
-            _remove_copied_source(source_face)
 
             finalized_profiles[cid] = profile
             profile_path = person_dir / "profile.json"
@@ -301,12 +306,33 @@ def finalize(state: dict) -> dict:
     finally:
         gm.close()
 
-    rejected = {
+    promotion_remap = state.get("_media_path_remap") or {}
+    if isinstance(promotion_remap, dict):
+        for staging_path, promoted_path in promotion_remap.items():
+            canonical_path = complete_remap.get(promoted_path)
+            if canonical_path is not None:
+                complete_remap[staging_path] = canonical_path
+
+    rejected = rewrite_media_references({
         "unresolved_faces": state.get("unresolved_faces", []),
         "unattached_bodies": state.get("unattached_bodies", []),
-    }
+    }, complete_remap)
+    rejected = scrub_obsolete_session_media(
+        rejected,
+        output_dir=output_dir,
+        media_root=base_db_dir,
+    )
     _write_json(output_dir / "rejected_detections.json", rejected)
-    session_report = _session_report(state, len(profiles))
+    session_report = rewrite_media_references(
+        _session_report(state, len(profiles)),
+        complete_remap,
+    )
+    session_report["stream_report_path"] = ""
+    session_report = scrub_obsolete_session_media(
+        session_report,
+        output_dir=output_dir,
+        media_root=base_db_dir,
+    )
     for profile in finalized_profiles.values():
         person_dir = base_db_dir / profile["id"]
         _write_json(person_dir / "session_report.json", session_report)
@@ -314,11 +340,72 @@ def finalize(state: dict) -> dict:
         _write_json(output_dir / "session_report.json", session_report)
     print(f"[finalize] session report saved")
 
-    staging = output_dir / "_staging"
-    _cleanup_staging(state, staging)
+    _rewrite_feedback_report(
+        output_dir / "pairing_feedback.json",
+        complete_remap,
+        output_dir=output_dir,
+        media_root=base_db_dir,
+    )
 
     first_id = sorted(finalized_profiles)[0] if finalized_profiles else None
-    return {
+    update = {
         "per_cluster_profiles": finalized_profiles,
         "profile": finalized_profiles.get(first_id, {}) if first_id is not None else {},
+        "human_feedback_path": "",
+        "stream_report_path": "",
+        "_media_path_remap": complete_remap,
+        "_media_cleanup_pairs": cleanup_pairs,
+        "_media_finalized_root": str(output_dir),
+        "media_lifecycle_version": int(state.get("media_lifecycle_version", 0)) + 1,
+    }
+    for field in _FINAL_MEDIA_FIELDS:
+        if field in state:
+            rewritten = rewrite_media_references(state.get(field), complete_remap)
+            update[field] = scrub_obsolete_session_media(
+                rewritten,
+                output_dir=output_dir,
+                media_root=base_db_dir,
+            )
+    return update
+
+
+def cleanup_finalized_media(state: dict) -> dict:
+    """Run disposable-session cleanup after canonical state publication."""
+    warnings: list[str] = []
+    relocated_sources_verified = True
+    try:
+        cleanup_relocated_sources(
+            list(state.get("_media_cleanup_pairs") or []),
+            media_root=get_media_root(),
+        )
+    except Exception as exc:
+        relocated_sources_verified = False
+        warnings.append(f"relocated source cleanup failed: {type(exc).__name__}")
+    output_dir = Path(state["output_dir"])
+    if relocated_sources_verified:
+        try:
+            _cleanup_staging(state, output_dir / "_staging")
+            for cluster_dir in output_dir.glob("cluster_*"):
+                for crop_dir in (cluster_dir / "body_crops", cluster_dir / "face_crops"):
+                    try:
+                        crop_dir.rmdir()
+                    except OSError:
+                        pass
+                for generated_report in (
+                    cluster_dir / "profile.json",
+                    cluster_dir / "session_report.json",
+                ):
+                    try:
+                        generated_report.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                try:
+                    cluster_dir.rmdir()
+                except OSError:
+                    pass
+        except Exception as exc:
+            warnings.append(f"session cleanup failed: {type(exc).__name__}")
+    return {
+        "_media_cleanup_pairs": [],
+        "media_cleanup_warning": "; ".join(warnings),
     }

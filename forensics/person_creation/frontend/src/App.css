@@ -209,6 +209,107 @@ body {
   font-size: 13px;
 }
 
+.identity-review-layout {
+  display: grid;
+  grid-template-columns: 330px minmax(0, 1fr);
+  gap: 16px;
+  align-items: start;
+}
+.identity-review-sidebar,
+.identity-review-main { margin: 0; min-height: 650px; }
+.identity-review-sidebar { display: flex; flex-direction: column; max-height: calc(100vh - 145px); }
+.identity-review-toolbar { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
+.identity-review-toolbar .card-title { margin-bottom: 3px; }
+.identity-review-toolbar span { color: #8792a5; font-size: 12px; }
+.identity-review-toolbar .btn { padding: 7px 10px; font-size: 12px; }
+.identity-review-queue { display: grid; gap: 8px; overflow-y: auto; }
+.identity-review-queue-card {
+  display: grid;
+  grid-template-columns: 72px minmax(0, 1fr);
+  gap: 10px;
+  width: 100%;
+  border: 1px solid #252b38;
+  border-radius: 8px;
+  padding: 8px;
+  background: #0f1117;
+  color: #e2e8f0;
+  text-align: left;
+  cursor: pointer;
+}
+.identity-review-queue-card:hover,
+.identity-review-queue-card.is-selected { border-color: #7c9ef8; background: #151c2b; }
+.identity-review-queue-image { width: 72px; height: 90px; border-radius: 6px; object-fit: cover; background: #181c25; }
+.identity-review-queue-image.is-missing { display: grid; place-items: center; padding: 6px; color: #64748b; font-size: 10px; text-align: center; }
+.identity-review-queue-copy { display: grid; align-content: start; gap: 2px; min-width: 0; }
+.identity-review-queue-copy strong,
+.identity-review-queue-copy span,
+.identity-review-queue-copy small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.identity-review-queue-copy strong { color: #f1f5f9; font-size: 13px; }
+.identity-review-queue-copy span { color: #a6b0bf; font-size: 11px; }
+.identity-review-queue-copy small { margin-top: 3px; color: #64748b; font-size: 10px; }
+.identity-review-queue-status,
+.identity-review-status {
+  width: fit-content;
+  border: 1px solid #8a641c;
+  border-radius: 999px;
+  padding: 2px 7px;
+  background: #2a2111;
+  color: #f6c96c;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+.identity-review-status.is-accepted { border-color: #2a6047; background: #10281e; color: #73d6a3; }
+.identity-review-status.is-rejected,
+.identity-review-status.is-stale { border-color: #596273; background: #181c25; color: #bac2cf; }
+.identity-review-banner { margin-bottom: 14px; border: 1px solid; border-radius: 7px; padding: 10px 12px; font-size: 13px; }
+.identity-review-banner.is-error { border-color: #8b2f3c; background: #2a151a; color: #f7a8b2; }
+.identity-review-banner.is-success { border-color: #2a6047; background: #10281e; color: #73d6a3; }
+.identity-review-empty { min-height: 180px; display: grid; place-items: center; color: #7b8799; font-size: 13px; text-align: center; }
+.identity-review-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 16px; }
+.identity-review-heading .card-title { margin-bottom: 4px; }
+.identity-review-heading h2 { font-size: 22px; color: #f1f5f9; }
+.identity-review-heading p { margin-top: 3px; color: #7b8799; font-size: 12px; }
+.identity-review-comparison { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+.identity-review-profile { min-width: 0; border: 1px solid #252b38; border-radius: 9px; padding: 14px; background: #0f1117; }
+.identity-review-profile-heading { display: grid; grid-template-columns: 92px minmax(0, 1fr); gap: 12px; align-items: start; }
+.identity-review-profile-image { width: 92px; height: 116px; border-radius: 7px; object-fit: cover; background: #181c25; }
+.identity-review-profile-image.is-missing { display: grid; place-items: center; padding: 8px; color: #64748b; font-size: 10px; text-align: center; }
+.identity-review-side-label { color: #7c9ef8; font-size: 10px; font-weight: 700; text-transform: uppercase; }
+.identity-review-profile h3 { margin: 5px 0 2px; overflow-wrap: anywhere; font-size: 17px; }
+.identity-review-profile code { display: block; color: #8792a5; font-size: 11px; overflow-wrap: anywhere; }
+.identity-review-person-state { display: inline-block; margin-top: 8px; color: #73d6a3; font-size: 11px; }
+.identity-review-person-state.is-inactive { color: #f6c96c; }
+.identity-review-facts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; margin: 14px 0; }
+.identity-review-facts div { min-width: 0; border: 1px solid #1e2330; border-radius: 6px; padding: 7px; }
+.identity-review-facts dt { color: #64748b; font-size: 10px; }
+.identity-review-facts dd { margin-top: 2px; color: #cbd5e1; font-size: 11px; overflow-wrap: anywhere; }
+.identity-review-evidence-group { margin-top: 14px; }
+.identity-review-evidence-group h4 { margin-bottom: 7px; color: #94a3b8; font-size: 11px; text-transform: uppercase; }
+.identity-review-crops { display: flex; gap: 6px; overflow-x: auto; }
+.identity-review-crop { flex: 0 0 66px; width: 66px; border-radius: 5px; object-fit: cover; background: #181c25; }
+.identity-review-crop.is-face { height: 66px; }
+.identity-review-crop.is-body { height: 105px; }
+.identity-review-crop.is-missing { display: grid; place-items: center; padding: 4px; color: #64748b; font-size: 9px; text-align: center; }
+.identity-review-muted { color: #64748b; font-size: 11px; }
+.identity-review-appearance-list,
+.identity-review-recognition-list { display: grid; gap: 5px; }
+.identity-review-appearance-list > div,
+.identity-review-recognition-list > div { display: grid; gap: 2px; border-bottom: 1px solid #1e2330; padding-bottom: 5px; }
+.identity-review-appearance-list strong,
+.identity-review-recognition-list span { color: #cbd5e1; font-size: 11px; }
+.identity-review-appearance-list span,
+.identity-review-appearance-list small,
+.identity-review-recognition-list small { color: #7b8799; font-size: 10px; overflow-wrap: anywhere; }
+.identity-review-actions { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-top: 16px; border-top: 1px solid #252b38; padding-top: 16px; }
+.identity-review-actions > div:first-child { display: grid; gap: 3px; }
+.identity-review-actions strong { color: #f1f5f9; font-size: 13px; }
+.identity-review-actions span { color: #8792a5; font-size: 11px; overflow-wrap: anywhere; }
+.identity-review-action-buttons,
+.identity-review-confirm { display: flex; align-items: center; justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
+.identity-review-confirm { border: 1px solid #2a6047; border-radius: 7px; padding: 8px; background: #10281e; }
+.identity-review-confirm > span { color: #b5e8cc; }
+
 @media (max-width: 640px) {
   .header { align-items: flex-start; flex-wrap: wrap; padding: 14px 16px; }
   .tabs { padding: 0 8px; overflow-x: auto; }
@@ -220,4 +321,11 @@ body {
   .live-identity-image-placeholder { width: 88px; min-height: 160px; }
   .live-events li { align-items: flex-start; flex-direction: column; gap: 2px; }
   .live-events small { text-align: left; }
+  .identity-review-layout { grid-template-columns: 1fr; }
+  .identity-review-sidebar { min-height: 360px; max-height: none; }
+  .identity-review-main { min-height: 440px; }
+  .identity-review-comparison { grid-template-columns: 1fr; }
+  .identity-review-actions { align-items: stretch; flex-direction: column; }
+  .identity-review-action-buttons,
+  .identity-review-confirm { justify-content: flex-start; }
 }

@@ -246,9 +246,7 @@ def _describe_cluster(
         last_reason = reason or "inference_error"
         diagnostic = {
             "cluster_id": cluster_id,
-            "selected_body_crop": meta.get("basename") or (
-                Path(attempt_paths[0]).name if attempt_paths else None
-            ),
+            "selected_body_crop": attempt_paths[0] if attempt_paths else None,
             "width": meta.get("width"),
             "height": meta.get("height"),
             "attempt": attempt,

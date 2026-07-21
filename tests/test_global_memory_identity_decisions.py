@@ -610,6 +610,8 @@ def test_canonical_finalize_uses_policy_and_returns_without_review_blocking(
             del args, kwargs
 
         def register_with_identity_policy(self, received, **kwargs):
+            prepare = kwargs.pop("prepare_profile_for_person")
+            prepare(review_result.person_id, received)
             calls.append((received, kwargs))
             return review_result
 
@@ -627,6 +629,9 @@ def test_canonical_finalize_uses_policy_and_returns_without_review_blocking(
 
     root = tmp_path / "person_db"
     output = root / "session"
+    root.mkdir()
+    for path in profile.get("face_crops", []):
+        (root / path).write_bytes(b"accepted-face")
     monkeypatch.setenv("PERSON_CREATION_MEDIA_ROOT", str(root))
     monkeypatch.setattr(global_memory_package, "GlobalMemory", FakeMemory)
     state = {

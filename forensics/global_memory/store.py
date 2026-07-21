@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import threading
 from datetime import date, datetime
-from pathlib import Path
-from typing import Any
+from pathlib import Path, PureWindowsPath
+from typing import Any, Callable
+from urllib.parse import urlsplit, urlunsplit
 
 import numpy as np
 
@@ -43,10 +45,28 @@ from .merge import (
     RedirectChainError,
     SelfMergeError,
 )
+from .review import (
+    IdentityReviewDecision,
+    IdentityReviewDecisionResult,
+    IdentityReviewDetail,
+    IdentityReviewSummary,
+    InvalidReviewDecisionError,
+    InvalidReviewRequestError,
+    ReviewSuggestionConflictError,
+    ReviewSuggestionIntegrityError,
+    ReviewSuggestionNotFoundError,
+    ReviewSuggestionStaleError,
+)
 
 
 SQLITE_MAX_INTEGER = 2**63 - 1
 MERGE_WEIGHTED_NORM_RELATIVE_MINIMUM = 1e-8
+IDENTITY_REVIEW_DEFAULT_LIMIT = 50
+IDENTITY_REVIEW_MAX_LIMIT = 100
+IDENTITY_REVIEW_MAX_OFFSET = SQLITE_MAX_INTEGER
+IDENTITY_REVIEW_GALLERY_LIMIT_PER_TYPE = 6
+IDENTITY_REVIEW_APPEARANCE_LIMIT = 10
+IDENTITY_REVIEW_RECOGNITION_LIMIT = 10
 
 
 class ReadOnlyGlobalMemoryError(RuntimeError):
@@ -405,6 +425,7 @@ class GlobalMemory:
         observation_count: int,
         low_confidence: bool = False,
         configuration: IdentityPolicyConfig | None = None,
+        prepare_profile_for_person: Callable[[str, dict], dict] | None = None,
     ) -> IdentityRegistrationResult:
         """Apply the Phase 3E policy and persist one atomic identity outcome."""
         self._require_writable("register_with_identity_policy")
@@ -417,9 +438,22 @@ class GlobalMemory:
 
         new_vec = self._validated_identity_embedding(profile["face_embedding"])
         new_count = len(profile.get("face_crops") or []) or 1
-        appearance = profile.get("appearance") or {}
-        appearance_date = str(appearance.get("date") or date.today().isoformat())
-        best_face_crop = self._best_face_crop(profile)
+
+        def prepared_profile(person_id: str) -> tuple[dict, str, str | None]:
+            prepared = (
+                profile
+                if prepare_profile_for_person is None
+                else prepare_profile_for_person(person_id, profile)
+            )
+            if not isinstance(prepared, dict):
+                raise IdentityPolicyInputError(
+                    "prepared identity profile must be a dictionary"
+                )
+            appearance = prepared.get("appearance") or {}
+            appearance_date = str(
+                appearance.get("date") or date.today().isoformat()
+            )
+            return prepared, appearance_date, self._best_face_crop(prepared)
 
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
@@ -442,46 +476,60 @@ class GlobalMemory:
                         raise IdentityPolicyInputError(
                             "attach_existing requires a top candidate"
                         )
+                    stored_profile, appearance_date, best_face_crop = (
+                        prepared_profile(person_id)
+                    )
                     count_before = self._get_embedding_count(person_id)
                     count_after = self._update_embedding(
                         person_id=person_id,
                         embedding=new_vec,
                         new_count=new_count,
                         updated_at=appearance_date,
-                        profile=profile,
+                        profile=stored_profile,
                     )
-                    self._upsert_appearance(person_id, appearance_date, profile)
-                    self.update_gallery(person_id, profile)
+                    self._upsert_appearance(
+                        person_id,
+                        appearance_date,
+                        stored_profile,
+                    )
+                    self.update_gallery(person_id, stored_profile)
                     self._log_event(
                         person_id=person_id,
                         event_type="recognized",
                         similarity=identity_decision.top_similarity,
                         embedding_count_before=count_before,
                         embedding_count_after=count_after,
-                        video_sources=profile.get("video_sources") or [],
+                        video_sources=stored_profile.get("video_sources") or [],
                         best_face_crop=best_face_crop,
                         strict=True,
                     )
                 else:
                     person_id, name = self._next_person_id()
+                    stored_profile, appearance_date, best_face_crop = (
+                        prepared_profile(person_id)
+                    )
                     self._insert_person(
                         person_id=person_id,
                         name=name,
                         embedding=new_vec,
                         embedding_count=new_count,
                         enrolled_at=appearance_date,
-                        cameras=profile.get("cameras") or [],
-                        profile=profile,
+                        cameras=stored_profile.get("cameras") or [],
+                        profile=stored_profile,
                     )
-                    self._upsert_appearance(person_id, appearance_date, profile)
-                    self.update_gallery(person_id, profile)
+                    self._upsert_appearance(
+                        person_id,
+                        appearance_date,
+                        stored_profile,
+                    )
+                    self.update_gallery(person_id, stored_profile)
                     self._log_event(
                         person_id=person_id,
                         event_type="new_enrollment",
                         similarity=None,
                         embedding_count_before=None,
                         embedding_count_after=new_count,
-                        video_sources=profile.get("video_sources") or [],
+                        video_sources=stored_profile.get("video_sources") or [],
                         best_face_crop=best_face_crop,
                         strict=True,
                     )
@@ -567,6 +615,227 @@ class GlobalMemory:
             evidence = self._lineage_evidence_rows(lineage, rows)
             return evidence if limit is None else evidence[:limit]
 
+    def list_pending_identity_reviews(
+        self,
+        *,
+        limit: int = IDENTITY_REVIEW_DEFAULT_LIMIT,
+        offset: int = 0,
+    ) -> list[IdentityReviewSummary]:
+        """Return the oldest pending supervisor reviews without biometric data."""
+        page_limit, page_offset = self._validated_review_pagination(limit, offset)
+        with self._lock:
+            try:
+                rows = self._conn.execute(
+                    """
+                    SELECT s.*,
+                           source.name AS source_name,
+                           source.profile_image AS source_profile_image,
+                           candidate.name AS candidate_name,
+                           candidate.profile_image AS candidate_profile_image
+                      FROM identity_match_suggestions AS s
+                      JOIN persons AS source
+                        ON source.person_id = s.source_person_id
+                      JOIN persons AS candidate
+                        ON candidate.person_id = s.candidate_person_id
+                     WHERE s.status = 'pending'
+                     ORDER BY s.created_at ASC, s.id ASC
+                     LIMIT ? OFFSET ?
+                    """,
+                    (page_limit, page_offset),
+                ).fetchall()
+            except (OverflowError, sqlite3.DataError) as exc:
+                raise InvalidReviewRequestError(
+                    "identity review pagination is outside SQLite's supported range"
+                ) from exc
+            return [self._identity_review_summary_from_row(row) for row in rows]
+
+    def count_pending_identity_reviews(self) -> int:
+        """Return the current pending supervisor-review count."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) FROM identity_match_suggestions "
+                "WHERE status='pending'"
+            ).fetchone()
+            return int(row[0])
+
+    def get_identity_review(self, suggestion_id: str | int) -> IdentityReviewDetail:
+        """Return a bounded, embedding-free source/candidate comparison."""
+        review_id = self._validated_review_suggestion_id(suggestion_id)
+        with self._lock:
+            row = self._load_identity_review_summary_row(review_id)
+            source = self._load_review_person(str(row["source_person_id"]), "source")
+            candidate = self._load_review_person(
+                str(row["candidate_person_id"]),
+                "candidate",
+            )
+            self._validate_review_relationship(row, source, candidate)
+            summary = self._identity_review_summary_from_row(row)
+
+            source_ids = (str(source["person_id"]),)
+            candidate_lineage = self._get_identity_lineage_locked(
+                str(candidate["person_id"])
+            )
+            candidate_ids = candidate_lineage.member_person_ids
+            source_lineage = self._review_lineage_summary(source)
+
+            return IdentityReviewDetail(
+                suggestion=summary,
+                source_profile=self._review_profile_summary(source),
+                candidate_profile=self._review_profile_summary(candidate),
+                source_lineage=source_lineage,
+                candidate_lineage=tuple(
+                    {
+                        "person_id": member.person_id,
+                        "is_active": member.is_active,
+                        "merged_into_person_id": member.merged_into_person_id,
+                        "canonical_person_id": candidate_lineage.canonical_person_id,
+                    }
+                    for member in candidate_lineage.members
+                ),
+                source_gallery=self._review_gallery(source_ids),
+                candidate_gallery=self._review_gallery(candidate_ids),
+                source_appearances=self._review_appearances(source_ids),
+                candidate_appearances=self._review_appearances(candidate_ids),
+                source_recognition_events=self._review_recognition_events(source_ids),
+                candidate_recognition_events=self._review_recognition_events(
+                    candidate_ids
+                ),
+            )
+
+    def resolve_identity_review(
+        self,
+        suggestion_id: str | int,
+        decision: IdentityReviewDecision | str,
+        *,
+        reason: str | None = None,
+        decision_source: str | None = None,
+    ) -> IdentityReviewDecisionResult:
+        """Atomically accept or reject one persisted identity suggestion."""
+        self._require_writable("resolve_identity_review")
+        review_id = self._validated_review_suggestion_id(suggestion_id)
+        review_decision = self._validated_review_decision(decision)
+        review_reason = self._validated_optional_review_text(reason, "reason")
+        reviewer = self._validated_optional_review_text(
+            decision_source,
+            "decision_source",
+        )
+        if review_decision is IdentityReviewDecision.REJECT and review_reason is not None:
+            raise InvalidReviewRequestError(
+                "reason is unsupported for rejection because the schema has no review-note field"
+            )
+
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                suggestion = self._load_identity_review_row(review_id)
+                source_id = str(suggestion["source_person_id"])
+                candidate_id = str(suggestion["candidate_person_id"])
+                source = self._load_review_person(source_id, "source")
+                candidate = self._load_review_person(candidate_id, "candidate")
+                if source_id == candidate_id:
+                    raise ReviewSuggestionIntegrityError(
+                        "review suggestion source and candidate must differ"
+                    )
+
+                status = str(suggestion["status"])
+                if status == "stale":
+                    raise ReviewSuggestionStaleError(
+                        f"identity review suggestion {review_id} is stale"
+                    )
+                if status == "accepted":
+                    if review_decision is IdentityReviewDecision.REJECT:
+                        raise ReviewSuggestionConflictError(
+                            f"identity review suggestion {review_id} was already accepted"
+                        )
+                    result = self._replay_accepted_identity_review(
+                        review_id,
+                        source,
+                        candidate,
+                    )
+                    self._conn.execute("COMMIT")
+                    return result
+                if status == "rejected":
+                    if review_decision is IdentityReviewDecision.ACCEPT:
+                        raise ReviewSuggestionConflictError(
+                            f"identity review suggestion {review_id} was already rejected"
+                        )
+                    self._validate_rejected_review_state(
+                        review_id,
+                        source,
+                        candidate,
+                    )
+                    result = self._rejected_identity_review_result(
+                        review_id,
+                        source_id,
+                        candidate_id,
+                        idempotent_replay=True,
+                    )
+                    self._conn.execute("COMMIT")
+                    return result
+                if status != "pending":
+                    raise ReviewSuggestionIntegrityError(
+                        f"identity review suggestion {review_id} has invalid status {status!r}"
+                    )
+
+                self._validate_pending_review_people(source, candidate)
+                reviewed_at = datetime.now().isoformat(timespec="seconds")
+                if review_decision is IdentityReviewDecision.ACCEPT:
+                    merge_result = self._merge_persons_in_transaction(
+                        source_id,
+                        candidate_id,
+                        reason=(
+                            review_reason
+                            or f"supervisor accepted identity review {review_id}"
+                        ),
+                        decision_source=self._review_audit_source(review_id),
+                        preserve_suggestion_id=review_id,
+                    )
+                    self._update_identity_review_status(
+                        review_id,
+                        status="accepted",
+                        reviewed_at=reviewed_at,
+                        reviewed_by=reviewer,
+                    )
+                    result = IdentityReviewDecisionResult(
+                        suggestion_id=str(review_id),
+                        decision=review_decision,
+                        status="accepted",
+                        source_person_id=source_id,
+                        target_person_id=candidate_id,
+                        audit_id=merge_result.audit_id,
+                        idempotent_replay=False,
+                        staled_suggestion_count=merge_result.staled_suggestion_count,
+                        source_embedding_count=merge_result.source_embedding_count,
+                        target_embedding_count_before=(
+                            merge_result.target_embedding_count_before
+                        ),
+                        target_embedding_count_after=(
+                            merge_result.target_embedding_count_after
+                        ),
+                    )
+                else:
+                    self._update_identity_review_status(
+                        review_id,
+                        status="rejected",
+                        reviewed_at=reviewed_at,
+                        reviewed_by=reviewer,
+                    )
+                    result = self._rejected_identity_review_result(
+                        review_id,
+                        source_id,
+                        candidate_id,
+                        idempotent_replay=False,
+                    )
+
+                self._assert_merge_foreign_keys()
+                self._before_review_commit()
+                self._conn.execute("COMMIT")
+                return result
+            except BaseException:
+                if self._conn.in_transaction:
+                    self._conn.execute("ROLLBACK")
+                raise
+
     def merge_persons(
         self,
         source_person_id: str,
@@ -593,90 +862,12 @@ class GlobalMemory:
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
-                source = self._load_merge_person(source_id, "source")
-                target = self._load_merge_person(target_id, "target")
-                self._validate_merge_target(target)
-
-                if not bool(source["is_active"]):
-                    redirect = source["merged_into_person_id"]
-                    if redirect is None:
-                        raise InactiveSourceError(
-                            f"source person {source_id!r} is inactive without a redirect"
-                        )
-                    if redirect != target_id:
-                        raise AlreadyMergedConflictError(
-                            f"source person {source_id!r} already redirects to {redirect!r}"
-                        )
-                    result = self._replay_person_merge(source, target)
-                    self._conn.execute("COMMIT")
-                    return result
-
-                if source["merged_into_person_id"] is not None:
-                    raise RedirectChainError(
-                        f"active source person {source_id!r} has an invalid redirect"
-                    )
-                self._reject_redirect_children(source_id)
-                self._require_no_source_merge_audit(source_id)
-
-                source_embedding = self._validated_stored_merge_embedding(
-                    source,
-                    "source",
-                )
-                target_embedding = self._validated_stored_merge_embedding(
-                    target,
-                    "target",
-                )
-                if source_embedding.shape != target_embedding.shape:
-                    raise InvalidMergeEmbeddingError(
-                        "source and target embedding dimensions differ"
-                    )
-                source_count = self._validated_stored_merge_count(source, "source")
-                target_count_before = self._validated_stored_merge_count(
-                    target,
-                    "target",
-                )
-                target_count_after = self._validated_merge_count_sum(
-                    target_count_before,
-                    source_count,
-                )
-                target_cameras = self._validated_merge_cameras(
-                    target["cameras"],
-                    "target",
-                )
-                source_cameras = self._validated_merge_cameras(
-                    source["cameras"],
-                    "source",
-                )
-                combined = self._combined_merge_embedding(
-                    target_embedding=target_embedding,
-                    target_count=target_count_before,
-                    source_embedding=source_embedding,
-                    source_count=source_count,
-                    weight_scale=target_count_after,
-                )
-
-                created_at = datetime.now().isoformat(timespec="seconds")
-                audit_id = self._insert_person_merge_audit(
-                    source=source,
-                    target=target,
+                result = self._merge_persons_in_transaction(
+                    source_id,
+                    target_id,
                     reason=merge_reason,
                     decision_source=audit_source,
-                    source_embedding_count=source_count,
-                    created_at=created_at,
                 )
-                self._update_merge_target_embedding(
-                    target_id,
-                    combined,
-                    target_count_after,
-                    created_at,
-                )
-                merged_cameras = self._merge_lists(target_cameras, source_cameras)
-                self._update_merge_target_metadata(target_id, merged_cameras)
-                staled_count = self._stale_merge_suggestions(source_id)
-                self._deactivate_merge_source(source_id)
-                self._redirect_merge_source(source_id, target_id)
-                self._assert_merge_foreign_keys()
-                lineage_count = self._merge_lineage_member_count(target_id)
                 self._before_merge_commit()
                 self._conn.execute("COMMIT")
             except BaseException:
@@ -684,6 +875,96 @@ class GlobalMemory:
                     self._conn.execute("ROLLBACK")
                 raise
 
+        return result
+
+    def _merge_persons_in_transaction(
+        self,
+        source_id: str,
+        target_id: str,
+        *,
+        reason: str,
+        decision_source: str,
+        preserve_suggestion_id: int | None = None,
+    ) -> PersonMergeResult:
+        """Execute Phase 3F merge logic inside the caller-owned transaction."""
+        if not self._conn.in_transaction:
+            raise PersonMergeError("person merge primitive requires an active transaction")
+
+        source = self._load_merge_person(source_id, "source")
+        target = self._load_merge_person(target_id, "target")
+        self._validate_merge_target(target)
+
+        if not bool(source["is_active"]):
+            redirect = source["merged_into_person_id"]
+            if redirect is None:
+                raise InactiveSourceError(
+                    f"source person {source_id!r} is inactive without a redirect"
+                )
+            if redirect != target_id:
+                raise AlreadyMergedConflictError(
+                    f"source person {source_id!r} already redirects to {redirect!r}"
+                )
+            return self._replay_person_merge(source, target)
+
+        if source["merged_into_person_id"] is not None:
+            raise RedirectChainError(
+                f"active source person {source_id!r} has an invalid redirect"
+            )
+        self._reject_redirect_children(source_id)
+        self._require_no_source_merge_audit(source_id)
+
+        source_embedding = self._validated_stored_merge_embedding(source, "source")
+        target_embedding = self._validated_stored_merge_embedding(target, "target")
+        if source_embedding.shape != target_embedding.shape:
+            raise InvalidMergeEmbeddingError(
+                "source and target embedding dimensions differ"
+            )
+        source_count = self._validated_stored_merge_count(source, "source")
+        target_count_before = self._validated_stored_merge_count(target, "target")
+        target_count_after = self._validated_merge_count_sum(
+            target_count_before,
+            source_count,
+        )
+        target_cameras = self._validated_merge_cameras(target["cameras"], "target")
+        source_cameras = self._validated_merge_cameras(source["cameras"], "source")
+        combined = self._combined_merge_embedding(
+            target_embedding=target_embedding,
+            target_count=target_count_before,
+            source_embedding=source_embedding,
+            source_count=source_count,
+            weight_scale=target_count_after,
+        )
+
+        created_at = datetime.now().isoformat(timespec="seconds")
+        audit_id = self._insert_person_merge_audit(
+            source=source,
+            target=target,
+            reason=reason,
+            decision_source=decision_source,
+            source_embedding_count=source_count,
+            created_at=created_at,
+        )
+        self._update_merge_target_embedding(
+            target_id,
+            combined,
+            target_count_after,
+            created_at,
+        )
+        self._update_merge_target_metadata(
+            target_id,
+            self._merge_lists(target_cameras, source_cameras),
+        )
+        if preserve_suggestion_id is None:
+            staled_count = self._stale_merge_suggestions(source_id)
+        else:
+            staled_count = self._stale_merge_suggestions(
+                source_id,
+                preserve_suggestion_id=preserve_suggestion_id,
+            )
+        self._deactivate_merge_source(source_id)
+        self._redirect_merge_source(source_id, target_id)
+        self._assert_merge_foreign_keys()
+        lineage_count = self._merge_lineage_member_count(target_id)
         return PersonMergeResult(
             source_person_id=source_id,
             target_person_id=target_id,
@@ -1287,6 +1568,492 @@ class GlobalMemory:
             evidence.append(item)
         return evidence
 
+    @staticmethod
+    def _validated_review_pagination(limit: int, offset: int) -> tuple[int, int]:
+        if isinstance(limit, bool) or not isinstance(limit, int):
+            raise InvalidReviewRequestError("limit must be an integer")
+        if limit < 1 or limit > IDENTITY_REVIEW_MAX_LIMIT:
+            raise InvalidReviewRequestError(
+                f"limit must be between 1 and {IDENTITY_REVIEW_MAX_LIMIT}"
+            )
+        if (
+            isinstance(offset, bool)
+            or not isinstance(offset, int)
+            or offset < 0
+            or offset > IDENTITY_REVIEW_MAX_OFFSET
+        ):
+            raise InvalidReviewRequestError(
+                f"offset must be between 0 and {IDENTITY_REVIEW_MAX_OFFSET}"
+            )
+        return limit, offset
+
+    @staticmethod
+    def _validated_review_suggestion_id(suggestion_id: str | int) -> int:
+        if isinstance(suggestion_id, bool):
+            raise InvalidReviewRequestError("suggestion_id must be a positive integer")
+        if isinstance(suggestion_id, int):
+            review_id = suggestion_id
+        elif isinstance(suggestion_id, str):
+            value = suggestion_id
+            if not re.fullmatch(r"[0-9]+", value, flags=re.ASCII):
+                raise InvalidReviewRequestError(
+                    "suggestion_id must be a positive integer"
+                )
+            if len(value) > len(str(SQLITE_MAX_INTEGER)):
+                raise InvalidReviewRequestError(
+                    "suggestion_id must be a positive SQLite integer"
+                )
+            try:
+                review_id = int(value)
+            except ValueError as exc:
+                raise InvalidReviewRequestError(
+                    "suggestion_id must be a positive integer"
+                ) from exc
+        else:
+            raise InvalidReviewRequestError("suggestion_id must be a positive integer")
+        if review_id < 1 or review_id > SQLITE_MAX_INTEGER:
+            raise InvalidReviewRequestError("suggestion_id must be a positive integer")
+        return review_id
+
+    @staticmethod
+    def _validated_review_decision(
+        decision: IdentityReviewDecision | str,
+    ) -> IdentityReviewDecision:
+        if isinstance(decision, IdentityReviewDecision):
+            return decision
+        if isinstance(decision, str):
+            try:
+                return IdentityReviewDecision(decision.strip())
+            except ValueError as exc:
+                raise InvalidReviewDecisionError(
+                    "decision must be 'accept' or 'reject'"
+                ) from exc
+        raise InvalidReviewDecisionError("decision must be 'accept' or 'reject'")
+
+    @staticmethod
+    def _validated_optional_review_text(
+        value: str | None,
+        label: str,
+    ) -> str | None:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise InvalidReviewRequestError(f"{label} must be a string or null")
+        normalized = value.strip()
+        if not normalized:
+            return None
+        if len(normalized) > 500:
+            raise InvalidReviewRequestError(f"{label} is too long (max 500 characters)")
+        return normalized
+
+    def _load_identity_review_row(self, review_id: int) -> sqlite3.Row:
+        row = self._conn.execute(
+            "SELECT * FROM identity_match_suggestions WHERE id=?",
+            (review_id,),
+        ).fetchone()
+        if row is None:
+            raise ReviewSuggestionNotFoundError(
+                f"identity review suggestion {review_id} does not exist"
+            )
+        return row
+
+    def _load_identity_review_summary_row(self, review_id: int) -> sqlite3.Row:
+        row = self._conn.execute(
+            """
+            SELECT s.*,
+                   source.name AS source_name,
+                   source.profile_image AS source_profile_image,
+                   candidate.name AS candidate_name,
+                   candidate.profile_image AS candidate_profile_image
+              FROM identity_match_suggestions AS s
+              JOIN persons AS source ON source.person_id = s.source_person_id
+              JOIN persons AS candidate ON candidate.person_id = s.candidate_person_id
+             WHERE s.id=?
+            """,
+            (review_id,),
+        ).fetchone()
+        if row is None:
+            suggestion = self._conn.execute(
+                "SELECT id FROM identity_match_suggestions WHERE id=?",
+                (review_id,),
+            ).fetchone()
+            if suggestion is None:
+                raise ReviewSuggestionNotFoundError(
+                    f"identity review suggestion {review_id} does not exist"
+                )
+            raise ReviewSuggestionIntegrityError(
+                f"identity review suggestion {review_id} references a missing person"
+            )
+        return row
+
+    def _identity_review_summary_from_row(
+        self,
+        row: sqlite3.Row,
+    ) -> IdentityReviewSummary:
+        source_id = str(row["source_person_id"])
+        candidate_id = str(row["candidate_person_id"])
+        source_candidates = self._image_candidates(source_id)
+        candidate_candidates = self._image_candidates(candidate_id)
+        return IdentityReviewSummary(
+            suggestion_id=str(row["id"]),
+            status=str(row["status"]),
+            source_person_id=source_id,
+            candidate_person_id=candidate_id,
+            similarity=float(row["similarity"]),
+            second_similarity=(
+                None
+                if row["second_similarity"] is None
+                else float(row["second_similarity"])
+            ),
+            margin=None if row["margin"] is None else float(row["margin"]),
+            reason=None if row["reason"] is None else str(row["reason"]),
+            created_at=str(row["created_at"]),
+            reviewed_at=(
+                None if row["reviewed_at"] is None else str(row["reviewed_at"])
+            ),
+            reviewed_by=(
+                None if row["reviewed_by"] is None else str(row["reviewed_by"])
+            ),
+            source_name=str(row["source_name"]),
+            candidate_name=str(row["candidate_name"]),
+            source_preview=source_candidates[0] if source_candidates else None,
+            candidate_preview=(
+                candidate_candidates[0] if candidate_candidates else None
+            ),
+        )
+
+    def _load_review_person(self, person_id: str, role: str) -> sqlite3.Row:
+        row = self._conn.execute(
+            "SELECT * FROM persons WHERE person_id=?",
+            (person_id,),
+        ).fetchone()
+        if row is None:
+            raise ReviewSuggestionIntegrityError(
+                f"identity review {role} person {person_id!r} does not exist"
+            )
+        return row
+
+    def _validate_review_relationship(
+        self,
+        suggestion: sqlite3.Row,
+        source: sqlite3.Row,
+        candidate: sqlite3.Row,
+    ) -> None:
+        review_id = int(suggestion["id"])
+        if source["person_id"] == candidate["person_id"]:
+            raise ReviewSuggestionIntegrityError(
+                "identity review source and candidate must differ"
+            )
+        status = str(suggestion["status"])
+        if status == "pending":
+            self._validate_pending_review_people(source, candidate)
+        elif status == "accepted":
+            self._validate_accepted_review_state(review_id, source, candidate)
+        elif status == "rejected":
+            self._validate_rejected_review_state(review_id, source, candidate)
+        elif status != "stale":
+            raise ReviewSuggestionIntegrityError(
+                f"identity review suggestion {review_id} has invalid status {status!r}"
+            )
+
+    def _validate_pending_review_people(
+        self,
+        source: sqlite3.Row,
+        candidate: sqlite3.Row,
+    ) -> None:
+        source_id = str(source["person_id"])
+        candidate_id = str(candidate["person_id"])
+        if not bool(source["is_active"]) or source["merged_into_person_id"] is not None:
+            redirect = source["merged_into_person_id"]
+            detail = "inactive" if redirect is None else f"merged into {redirect!r}"
+            raise ReviewSuggestionConflictError(
+                f"pending review source {source_id!r} is already {detail}"
+            )
+        if (
+            not bool(candidate["is_active"])
+            or candidate["merged_into_person_id"] is not None
+        ):
+            raise ReviewSuggestionConflictError(
+                f"pending review candidate {candidate_id!r} is not canonical and active"
+            )
+
+    @staticmethod
+    def _review_audit_source(review_id: int) -> str:
+        return f"identity_review:{review_id}"
+
+    def _validate_accepted_review_state(
+        self,
+        review_id: int,
+        source: sqlite3.Row,
+        candidate: sqlite3.Row,
+    ) -> None:
+        source_id = str(source["person_id"])
+        candidate_id = str(candidate["person_id"])
+        if bool(source["is_active"]) or source["merged_into_person_id"] != candidate_id:
+            raise ReviewSuggestionIntegrityError(
+                f"accepted review {review_id} has no matching source redirect"
+            )
+        if not bool(candidate["is_active"]) or candidate["merged_into_person_id"] is not None:
+            raise ReviewSuggestionIntegrityError(
+                f"accepted review {review_id} candidate is not canonical and active"
+            )
+        audits = self._conn.execute(
+            "SELECT * FROM identity_merge_audit WHERE source_person_id=?",
+            (source_id,),
+        ).fetchall()
+        if len(audits) != 1:
+            raise ReviewSuggestionIntegrityError(
+                f"accepted review {review_id} does not have exactly one merge audit"
+            )
+        audit = audits[0]
+        if (
+            audit["target_person_id"] != candidate_id
+            or audit["decision_source"] != self._review_audit_source(review_id)
+            or bytes(audit["source_embedding"]) != bytes(source["embedding"])
+            or audit["source_embedding_count"] != source["embedding_count"]
+        ):
+            raise ReviewSuggestionIntegrityError(
+                f"accepted review {review_id} redirect and merge audit disagree"
+            )
+
+    def _require_no_review_merge_audit(self, review_id: int) -> None:
+        audit = self._conn.execute(
+            "SELECT merge_id FROM identity_merge_audit WHERE decision_source=? LIMIT 1",
+            (self._review_audit_source(review_id),),
+        ).fetchone()
+        if audit is not None:
+            raise ReviewSuggestionIntegrityError(
+                f"rejected review {review_id} has a review merge audit"
+            )
+
+    def _validate_rejected_review_state(
+        self,
+        review_id: int,
+        source: sqlite3.Row,
+        candidate: sqlite3.Row,
+    ) -> None:
+        source_id = str(source["person_id"])
+        candidate_id = str(candidate["person_id"])
+        if source_id == candidate_id:
+            raise ReviewSuggestionIntegrityError(
+                "identity review source and candidate must differ"
+            )
+        if not bool(source["is_active"]) or source["merged_into_person_id"] is not None:
+            raise ReviewSuggestionIntegrityError(
+                f"rejected review {review_id} source is not active and unredirected"
+            )
+        if (
+            not bool(candidate["is_active"])
+            or candidate["merged_into_person_id"] is not None
+        ):
+            raise ReviewSuggestionIntegrityError(
+                f"rejected review {review_id} candidate is not a separate canonical profile"
+            )
+        self._require_no_review_merge_audit(review_id)
+        try:
+            self._require_no_source_merge_audit(source_id)
+        except MergeAuditIntegrityError as exc:
+            raise ReviewSuggestionIntegrityError(
+                f"rejected review {review_id} source has a merge audit"
+            ) from exc
+
+    def _replay_accepted_identity_review(
+        self,
+        review_id: int,
+        source: sqlite3.Row,
+        candidate: sqlite3.Row,
+    ) -> IdentityReviewDecisionResult:
+        self._validate_accepted_review_state(review_id, source, candidate)
+        try:
+            merge = self._replay_person_merge(source, candidate)
+        except PersonMergeError as exc:
+            raise ReviewSuggestionIntegrityError(
+                f"accepted review {review_id} merge state is inconsistent"
+            ) from exc
+        return IdentityReviewDecisionResult(
+            suggestion_id=str(review_id),
+            decision=IdentityReviewDecision.ACCEPT,
+            status="accepted",
+            source_person_id=merge.source_person_id,
+            target_person_id=merge.target_person_id,
+            audit_id=merge.audit_id,
+            idempotent_replay=True,
+            staled_suggestion_count=0,
+            source_embedding_count=merge.source_embedding_count,
+            target_embedding_count_before=merge.target_embedding_count_before,
+            target_embedding_count_after=merge.target_embedding_count_after,
+        )
+
+    @staticmethod
+    def _rejected_identity_review_result(
+        review_id: int,
+        source_id: str,
+        candidate_id: str,
+        *,
+        idempotent_replay: bool,
+    ) -> IdentityReviewDecisionResult:
+        return IdentityReviewDecisionResult(
+            suggestion_id=str(review_id),
+            decision=IdentityReviewDecision.REJECT,
+            status="rejected",
+            source_person_id=source_id,
+            target_person_id=candidate_id,
+            audit_id=None,
+            idempotent_replay=idempotent_replay,
+            staled_suggestion_count=0,
+            source_embedding_count=None,
+            target_embedding_count_before=None,
+            target_embedding_count_after=None,
+        )
+
+    def _update_identity_review_status(
+        self,
+        review_id: int,
+        *,
+        status: str,
+        reviewed_at: str,
+        reviewed_by: str | None,
+    ) -> None:
+        cursor = self._conn.execute(
+            "UPDATE identity_match_suggestions "
+            "SET status=?, reviewed_at=?, reviewed_by=? "
+            "WHERE id=? AND status='pending'",
+            (status, reviewed_at, reviewed_by, review_id),
+        )
+        if cursor.rowcount != 1:
+            raise ReviewSuggestionConflictError(
+                f"identity review suggestion {review_id} changed concurrently"
+            )
+
+    def _before_review_commit(self) -> None:
+        """Failure-injection seam; intentionally performs no work."""
+
+    def _review_profile_summary(self, person: sqlite3.Row) -> dict[str, Any]:
+        person_id = str(person["person_id"])
+        redirect = person["merged_into_person_id"]
+        return {
+            "person_id": person_id,
+            "name": str(person["name"]),
+            "embedding_count": int(person["embedding_count"]),
+            "enrolled_at": str(person["enrolled_at"]),
+            "updated_at": str(person["updated_at"]),
+            "cameras": self._safe_review_sources(self._json_list(person["cameras"])),
+            "profile_image": self._public_media_path(person["profile_image"]),
+            "profile_image_source": str(person["profile_image_source"]),
+            "is_active": bool(person["is_active"]),
+            "merged_into_person_id": None if redirect is None else str(redirect),
+            "canonical_person_id": person_id if redirect is None else str(redirect),
+        }
+
+    @staticmethod
+    def _review_lineage_summary(person: sqlite3.Row) -> tuple[dict[str, Any], ...]:
+        person_id = str(person["person_id"])
+        redirect = person["merged_into_person_id"]
+        return ({
+            "person_id": person_id,
+            "is_active": bool(person["is_active"]),
+            "merged_into_person_id": None if redirect is None else str(redirect),
+            "canonical_person_id": person_id if redirect is None else str(redirect),
+        },)
+
+    def _review_gallery(self, person_ids: tuple[str, ...]) -> tuple[dict[str, Any], ...]:
+        placeholders = ",".join("?" for _ in person_ids)
+        rows = self._conn.execute(
+            f"SELECT * FROM person_gallery WHERE person_id IN ({placeholders}) "
+            "ORDER BY crop_type ASC, sharpness DESC, id DESC",
+            person_ids,
+        ).fetchall()
+        counts = {"face": 0, "body": 0}
+        evidence: list[dict[str, Any]] = []
+        for row in rows:
+            crop_type = str(row["crop_type"])
+            if crop_type not in counts or counts[crop_type] >= IDENTITY_REVIEW_GALLERY_LIMIT_PER_TYPE:
+                continue
+            path = self._public_media_path(row["path"])
+            if path is None:
+                continue
+            counts[crop_type] += 1
+            evidence.append({
+                "id": str(row["id"]),
+                "original_person_id": str(row["person_id"]),
+                "crop_type": crop_type,
+                "path": path,
+                "sharpness": float(row["sharpness"]),
+                "session_date": str(row["session_date"]),
+                "video_source": self._safe_review_source(row["video_source"]),
+                "width": row["width"],
+                "height": row["height"],
+            })
+        return tuple(evidence)
+
+    def _review_appearances(
+        self,
+        person_ids: tuple[str, ...],
+    ) -> tuple[dict[str, Any], ...]:
+        placeholders = ",".join("?" for _ in person_ids)
+        rows = self._conn.execute(
+            f"SELECT * FROM appearances WHERE person_id IN ({placeholders}) "
+            "ORDER BY date DESC, id DESC LIMIT ?",
+            (*person_ids, IDENTITY_REVIEW_APPEARANCE_LIMIT),
+        ).fetchall()
+        results = []
+        for row in rows:
+            item = self._appearance_from_row(row)
+            item.update({
+                "id": str(row["id"]),
+                "original_person_id": str(row["person_id"]),
+                "video_sources": self._safe_review_sources(
+                    self._json_list(row["video_sources"])
+                ),
+            })
+            results.append(item)
+        return tuple(results)
+
+    def _review_recognition_events(
+        self,
+        person_ids: tuple[str, ...],
+    ) -> tuple[dict[str, Any], ...]:
+        placeholders = ",".join("?" for _ in person_ids)
+        rows = self._conn.execute(
+            f"SELECT * FROM recognition_log WHERE person_id IN ({placeholders}) "
+            "ORDER BY ts DESC, id DESC LIMIT ?",
+            (*person_ids, IDENTITY_REVIEW_RECOGNITION_LIMIT),
+        ).fetchall()
+        return tuple({
+            "id": str(row["id"]),
+            "original_person_id": str(row["person_id"]),
+            "event_type": str(row["event_type"]),
+            "similarity": row["similarity"],
+            "embedding_count_before": row["embedding_count_before"],
+            "embedding_count_after": row["embedding_count_after"],
+            "video_sources": self._safe_review_sources(
+                self._json_list(row["video_sources"])
+            ),
+            "best_face_crop": self._public_media_path(row["best_face_crop"]),
+            "ts": str(row["ts"]),
+        } for row in rows)
+
+    @staticmethod
+    def _safe_review_source(value: object) -> str | None:
+        if value is None:
+            return None
+        display = str(value).strip()
+        if not display:
+            return None
+        parsed = urlsplit(display)
+        if parsed.scheme and parsed.netloc:
+            host = parsed.hostname or ""
+            if parsed.port is not None:
+                host = f"{host}:{parsed.port}"
+            return urlunsplit((parsed.scheme, host, parsed.path, parsed.query, ""))
+        if Path(display).is_absolute() or PureWindowsPath(display).is_absolute():
+            return PureWindowsPath(display).name or Path(display).name
+        return display
+
+    @classmethod
+    def _safe_review_sources(cls, values: list) -> list[str]:
+        return [safe for value in values if (safe := cls._safe_review_source(value))]
+
     def _load_merge_person(self, person_id: str, role: str) -> sqlite3.Row:
         row = self._conn.execute(
             "SELECT * FROM persons WHERE person_id=?",
@@ -1501,16 +2268,22 @@ class GlobalMemory:
         if cursor.rowcount != 1:
             raise PersonMergeError("target metadata update did not affect one person")
 
-    def _stale_merge_suggestions(self, source_id: str) -> int:
-        cursor = self._conn.execute(
-            """
-            UPDATE identity_match_suggestions
-               SET status='stale'
-             WHERE status='pending'
-               AND (source_person_id=? OR candidate_person_id=?)
-            """,
-            (source_id, source_id),
+    def _stale_merge_suggestions(
+        self,
+        source_id: str,
+        *,
+        preserve_suggestion_id: int | None = None,
+    ) -> int:
+        sql = (
+            "UPDATE identity_match_suggestions SET status='stale' "
+            "WHERE status='pending' "
+            "AND (source_person_id=? OR candidate_person_id=?)"
         )
+        parameters: tuple[object, ...] = (source_id, source_id)
+        if preserve_suggestion_id is not None:
+            sql += " AND id<>?"
+            parameters = (*parameters, preserve_suggestion_id)
+        cursor = self._conn.execute(sql, parameters)
         return int(cursor.rowcount)
 
     def _deactivate_merge_source(self, source_id: str) -> None:

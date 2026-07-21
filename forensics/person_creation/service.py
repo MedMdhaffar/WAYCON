@@ -174,6 +174,7 @@ _MEDIA_VALUE_KEYS = {
     "representative_face_path",
     "profile_image",
     "best_face_crop",
+    "selected_body_crop",
 }
 _MEDIA_LIST_KEYS = {"face_crops", "body_crops", "best_body_crops"}
 
@@ -185,7 +186,7 @@ def _public_media_reference(value: Any) -> str | None:
         return normalize_media_path(
             str(value),
             allow_legacy_absolute=True,
-            require_exists=False,
+            require_exists=True,
         )
     except (MediaPathError, OSError):
         return None
@@ -246,7 +247,22 @@ def _rolling_counter(value: Any) -> int:
 
 def _merge_job_snapshot(job: JobState, snapshot_update: dict) -> None:
     """Merge a status callback while rejecting stale rolling publications."""
+    from forensics.person_creation.media_lifecycle import (
+        rewrite_media_references,
+        scrub_obsolete_session_media,
+    )
+
     update = dict(snapshot_update)
+    remap = update.pop("_media_path_remap", None)
+    finalized_root = update.pop("_media_finalized_root", None)
+    update.pop("_media_cleanup_pairs", None)
+    if isinstance(remap, dict) and remap:
+        job.snapshot = rewrite_media_references(job.snapshot, remap)
+    if finalized_root:
+        job.snapshot = scrub_obsolete_session_media(
+            job.snapshot,
+            output_dir=finalized_root,
+        )
     incoming = update.pop("rolling_analysis", None)
     job.snapshot.update(update)
     if not isinstance(incoming, dict):
@@ -290,11 +306,13 @@ _NODE_TO_STATUS = {
     "cluster_identities": "clustering",
     "assign_bodies_to_clusters": "auto_pairing",
     "promote_crops":     "promoting_crops",
+    "cleanup_promoted_crops": "promoting_crops",
     "select_best":       "selecting",
     "compute_reid":      "computing_reid",
     "describe_clothing": "describing",
     "build_profile":     "building_profile",
     "finalize":          "finalizing",
+    "cleanup_finalized_media": "finalizing",
 }
 
 
@@ -468,6 +486,8 @@ def status(job_id: str):
         "duration_seconds_per_chunk": snap.get("duration_seconds_per_chunk"),
         "live_preprocessing": snap.get("live_preprocessing", {}),
         "rolling_analysis": snap.get("rolling_analysis", {}),
+        "media_lifecycle_version": snap.get("media_lifecycle_version", 0),
+        "media_cleanup_warning": snap.get("media_cleanup_warning", ""),
     }
     return jsonify({
         "job_id":   job_id,
@@ -763,6 +783,183 @@ def memory_search():
 
 # ─── Profile management endpoints ─────────────────────────────────────────────
 
+# --- Supervisor identity-review endpoints ---------------------------------------
+
+def _identity_review_memory():
+    from forensics.global_memory import GlobalMemory
+
+    return GlobalMemory(
+        read_only=bool(app.config.get("GLOBAL_MEMORY_READ_ONLY", False))
+    )
+
+
+def _identity_review_error(error: BaseException):
+    from forensics.global_memory import (
+        IdentityReviewError,
+        InvalidReviewRequestError,
+        PersonMergeError,
+        ReviewSuggestionConflictError,
+        ReviewSuggestionIntegrityError,
+        ReviewSuggestionNotFoundError,
+        ReviewSuggestionStaleError,
+    )
+    from forensics.global_memory.store import ReadOnlyGlobalMemoryError
+
+    if isinstance(error, ReviewSuggestionNotFoundError):
+        return jsonify({"error": str(error)}), 404
+    if isinstance(error, InvalidReviewRequestError):
+        return jsonify({"error": str(error)}), 400
+    if isinstance(
+        error,
+        (
+            ReviewSuggestionConflictError,
+            ReviewSuggestionStaleError,
+            ReviewSuggestionIntegrityError,
+            PersonMergeError,
+        ),
+    ):
+        return jsonify({"error": str(error)}), 409
+    if isinstance(error, ReadOnlyGlobalMemoryError):
+        return jsonify({"error": "identity reviews are read-only"}), 503
+    if isinstance(error, IdentityReviewError):
+        return jsonify({"error": str(error)}), 400
+    return jsonify({"error": "identity review operation failed"}), 500
+
+
+def _identity_review_pagination():
+    from forensics.global_memory.review import InvalidReviewRequestError
+    from forensics.global_memory.store import (
+        IDENTITY_REVIEW_DEFAULT_LIMIT,
+        IDENTITY_REVIEW_MAX_OFFSET,
+    )
+
+    allowed = {"limit", "offset"}
+    unsupported = sorted(set(request.args) - allowed)
+    if unsupported:
+        raise InvalidReviewRequestError(
+            "unsupported query parameters: " + ", ".join(unsupported)
+        )
+    values = {}
+    for field, default in (
+        ("limit", IDENTITY_REVIEW_DEFAULT_LIMIT),
+        ("offset", 0),
+    ):
+        raw_values = request.args.getlist(field)
+        if not raw_values:
+            values[field] = default
+            continue
+        if len(raw_values) != 1:
+            raise InvalidReviewRequestError(
+                f"{field} must be provided exactly once"
+            )
+        raw = raw_values[0]
+        if not re.fullmatch(r"[0-9]+", raw):
+            raise InvalidReviewRequestError(
+                f"{field} must be an unsigned decimal integer"
+            )
+        if len(raw) > len(str(IDENTITY_REVIEW_MAX_OFFSET)):
+            raise InvalidReviewRequestError(
+                f"{field} exceeds the maximum supported integer"
+            )
+        try:
+            value = int(raw)
+        except ValueError as exc:
+            raise InvalidReviewRequestError(
+                f"{field} must be an unsigned decimal integer"
+            ) from exc
+        if value > IDENTITY_REVIEW_MAX_OFFSET:
+            raise InvalidReviewRequestError(
+                f"{field} exceeds the maximum supported integer"
+            )
+        values[field] = value
+    return values["limit"], values["offset"]
+
+
+def _identity_review_request_body(*, allow_reason: bool) -> dict[str, Any]:
+    from forensics.global_memory.review import InvalidReviewRequestError
+
+    if request.data:
+        if not request.is_json:
+            raise InvalidReviewRequestError("request body must be JSON")
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            raise InvalidReviewRequestError("request body must be a JSON object")
+    else:
+        data = {}
+    allowed = {"decision_source"}
+    if allow_reason:
+        allowed.add("reason")
+    unsupported = sorted(set(data) - allowed)
+    if unsupported:
+        raise InvalidReviewRequestError(
+            "unsupported request fields: " + ", ".join(unsupported)
+        )
+    return data
+
+
+@app.get("/api/identity-reviews")
+def identity_review_queue():
+    gm = None
+    try:
+        limit, offset = _identity_review_pagination()
+        gm = _identity_review_memory()
+        reviews = gm.list_pending_identity_reviews(limit=limit, offset=offset)
+        return jsonify({
+            "reviews": [review.as_dict() for review in reviews],
+            "pending_count": gm.count_pending_identity_reviews(),
+            "limit": limit,
+            "offset": offset,
+        })
+    except Exception as exc:
+        return _identity_review_error(exc)
+    finally:
+        if gm is not None:
+            gm.close()
+
+
+@app.get("/api/identity-reviews/<suggestion_id>")
+def identity_review_detail(suggestion_id):
+    gm = None
+    try:
+        gm = _identity_review_memory()
+        detail = gm.get_identity_review(suggestion_id)
+        return jsonify(_sanitize_media_references(detail.as_dict()))
+    except Exception as exc:
+        return _identity_review_error(exc)
+    finally:
+        if gm is not None:
+            gm.close()
+
+
+def _resolve_identity_review_request(suggestion_id: str, decision: str):
+    gm = None
+    try:
+        data = _identity_review_request_body(allow_reason=decision == "accept")
+        gm = _identity_review_memory()
+        result = gm.resolve_identity_review(
+            suggestion_id,
+            decision,
+            reason=data.get("reason"),
+            decision_source=data.get("decision_source"),
+        )
+        return jsonify(result.as_dict())
+    except Exception as exc:
+        return _identity_review_error(exc)
+    finally:
+        if gm is not None:
+            gm.close()
+
+
+@app.post("/api/identity-reviews/<suggestion_id>/accept")
+def identity_review_accept(suggestion_id):
+    return _resolve_identity_review_request(suggestion_id, "accept")
+
+
+@app.post("/api/identity-reviews/<suggestion_id>/reject")
+def identity_review_reject(suggestion_id):
+    return _resolve_identity_review_request(suggestion_id, "reject")
+
+
 def _profile_dir(name: str) -> Path:
     return _PIConfig.load().PROFILE_ROOT / name
 
@@ -826,11 +1023,17 @@ def profile_detail(name: str):
         raw.replace("\\", "/").rsplit("/", 1)[-1].startswith("iphone_")
         for raw in (prof.get("face_crops") or [])
     )
-    return jsonify({
+    return jsonify(_sanitize_media_references({
         "id":                     name,                      # folder slug = canonical id
         "profile_id":             prof.get("id", name),      # profile.json's claimed id (display only)
         "name":                   prof.get("name", name),
         "created_at":             prof.get("created_at", ""),
+        "media": {
+            "profile_image":      prof.get("profile_image"),
+            "face_crops":         prof.get("face_crops", []),
+            "body_crops":         prof.get("body_crops", []),
+            "best_body_crops":    prof.get("best_body_crops", []),
+        },
         "face_crops_referenced":  len(prof.get("face_crops", []) or []),
         "body_crops_referenced":  len(prof.get("body_crops", []) or []),
         "best_body_crops":        len(prof.get("best_body_crops", []) or []),
@@ -840,7 +1043,7 @@ def profile_detail(name: str):
         "orphan_body":            orphan_body,
         "has_iphone_photos":      has_iphone,
         "appearance":             prof.get("appearance", {}),
-    })
+    }))
 
 
 @app.post("/api/profiles/<name>/cleanup")

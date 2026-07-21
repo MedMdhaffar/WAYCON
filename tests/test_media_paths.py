@@ -47,7 +47,18 @@ def test_old_wsl_absolute_path_is_portable_only_for_internal_migration(tmp_path)
         resolve_media_path(legacy, media_root=root, allow_legacy_absolute=False)
 
 
-@pytest.mark.parametrize("unsafe", ["../outside.jpg", "folder/../../outside.jpg", "/etc/passwd", "C:/secret.txt"])
+@pytest.mark.parametrize(
+    "unsafe",
+    [
+        "../outside.jpg",
+        "folder/../../outside.jpg",
+        "/etc/passwd",
+        "C:/secret.txt",
+        "file:///etc/passwd.jpg",
+        "https://camera.local/private.jpg",
+        "rtsp://camera.local/private.jpg",
+    ],
+)
 def test_unsafe_media_paths_are_rejected(tmp_path, unsafe):
     with pytest.raises(MediaPathError):
         resolve_media_path(unsafe, media_root=tmp_path)
@@ -212,7 +223,7 @@ def _finalize_state(root: Path, filename: str = "new.jpg") -> tuple[dict, Path, 
     return state, face, body
 
 
-def test_finalize_copy_first_failure_keeps_original_database_reference_valid(
+def test_finalize_database_failure_keeps_sources_and_rolls_back_references(
     tmp_path,
     monkeypatch,
 ):
@@ -222,10 +233,10 @@ def test_finalize_copy_first_failure_keeps_original_database_reference_valid(
     monkeypatch.setenv("FORENSICS_MEMORY_DB", str(database))
     state, source_face, _source_body = _finalize_state(root)
 
-    def fail_update(self, _person_id, _profile):
+    def fail_gallery(self, _person_id, _profile):
         raise RuntimeError("injected update failure")
 
-    monkeypatch.setattr(GlobalMemory, "update_crop_paths", fail_update)
+    monkeypatch.setattr(GlobalMemory, "update_gallery", fail_gallery)
     with pytest.raises(RuntimeError, match="injected update failure"):
         finalize_node.finalize(state)
 
@@ -233,9 +244,10 @@ def test_finalize_copy_first_failure_keeps_original_database_reference_valid(
     assert (root / "person_001" / "face_crops" / source_face.name).is_file()
     memory = GlobalMemory(database, media_root=root)
     try:
-        stored = memory._conn.execute("SELECT profile_image FROM persons").fetchone()[0]
-        assert stored == "session/cluster_0/face_crops/new.jpg"
-        assert resolve_media_path(stored, media_root=root).is_file()
+        assert memory._conn.execute("SELECT COUNT(*) FROM persons").fetchone()[0] == 0
+        assert memory._conn.execute("SELECT COUNT(*) FROM appearances").fetchone()[0] == 0
+        assert memory._conn.execute("SELECT COUNT(*) FROM person_gallery").fetchone()[0] == 0
+        assert memory._conn.execute("SELECT COUNT(*) FROM recognition_log").fetchone()[0] == 0
     finally:
         memory.close()
 

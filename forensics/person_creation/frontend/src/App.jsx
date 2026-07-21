@@ -10,6 +10,7 @@ import ClothingPanel from './components/ClothingPanel.jsx'
 import ReviewPanel from './components/ReviewPanel.jsx'
 import ProfileManager from './components/ProfileManager.jsx'
 import MemoryTab from './components/MemoryTab.jsx'
+import IdentityReviewView from './components/IdentityReviewView.jsx'
 import {
   isJobActive,
   isCanonicalFinalizing,
@@ -26,7 +27,7 @@ import {
   statusLabel,
 } from './liveJob.js'
 
-const TABS = ['Setup', 'Progress & Crops', 'Results', 'Memory']
+const TABS = ['Setup', 'Progress & Crops', 'Results', 'Memory', 'Identity Reviews']
 
 export default function App() {
   const [mode, setMode] = useState('enroll')   // 'enroll' | 'manage'
@@ -174,7 +175,7 @@ export default function App() {
                 key={label}
                 className={`tab-btn${tab === i ? ' active' : ''}`}
                 onClick={() => setTab(i)}
-                disabled={i > 0 && i !== 3 && !jobId}
+                disabled={i > 0 && i !== 3 && i !== 4 && !jobId}
               >
                 {label}
               </button>
@@ -211,6 +212,7 @@ export default function App() {
               jobId={jobId}
               bodyCrops={snapshot.quality_body_crops ?? []}
               faceCrops={snapshot.quality_face_crops ?? []}
+              mediaVersion={snapshot.media_lifecycle_version ?? 0}
               onDeleted={refreshStatus}
             />
           </>
@@ -247,6 +249,7 @@ export default function App() {
         )}
 
         {tab === 3 && <MemoryTab />}
+        {tab === 4 && <IdentityReviewView />}
           </div>
         </>
       )}

@@ -1,6 +1,5 @@
-import operator
 from threading import Event
-from typing import Annotated, Any, Callable
+from typing import Any, Callable
 from typing_extensions import NotRequired, TypedDict
 
 
@@ -25,8 +24,8 @@ class PersonCreationState(TypedDict):
     reid_available: bool
     reid_unavailable_reason: str
 
-    body_crops: Annotated[list[dict], operator.add]
-    face_crops: Annotated[list[dict], operator.add]
+    body_crops: list[dict]
+    face_crops: list[dict]
     # each dict: {path, frame_idx, video, bbox:[x1,y1,x2,y2], sharpness}
 
     quality_body_crops: list[dict]
@@ -62,3 +61,8 @@ class PersonCreationState(TypedDict):
 
     profile: dict
     per_cluster_profiles: dict[int, dict]
+    media_lifecycle_version: NotRequired[int]
+    media_cleanup_warning: NotRequired[str]
+    _media_path_remap: NotRequired[dict[str, str]]
+    _media_cleanup_pairs: NotRequired[list[tuple[str, str]]]
+    _media_finalized_root: NotRequired[str]

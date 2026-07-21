@@ -137,7 +137,13 @@ assert.equal(formatSimilarity(4), '100%')
 assert.equal(formatSimilarity(-1), '0%')
 assert.equal(formatSimilarity('malformed'), null)
 assert.equal(identityImageUrl('folder/face one.jpg'), '/api/images?path=folder%2Fface%20one.jpg')
-assert.equal(mediaImageUrl('folder\\face one.jpg'), '/api/images?path=folder%2Fface%20one.jpg')
+assert.equal(mediaImageUrl('folder\\face one.jpg'), '')
+assert.equal(mediaImageUrl('/mnt/c/private/face.jpg'), '')
+assert.equal(mediaImageUrl('C:\\private\\face.jpg'), '')
+assert.equal(mediaImageUrl('file:///private/face.jpg'), '')
+assert.equal(mediaImageUrl('https://camera.local/face.jpg'), '')
+assert.equal(mediaImageUrl('rtsp://camera.local/live'), '')
+assert.equal(mediaImageUrl('../private/face.jpg'), '')
 assert.equal(identityImageUrl(''), '')
 assert.deepEqual(rolling.events.map(event => event.eventId), ['event-3', 'event-2', 'event-1'])
 assert.equal(rolling.events[0].type, 'future_event')
@@ -183,6 +189,21 @@ const reconnectStatus = mergeJobStatus(previousStatus, {
 assert.equal(reconnectStatus.snapshot.rolling_analysis.live_identities.length, 2)
 assert.equal(reconnectStatus.snapshot.stream_stats.stream_state, 'reconnecting')
 assert.equal(mergeJobStatus(previousStatus, null), previousStatus)
+const lifecyclePrevious = {
+  status: 'processing_live_frames',
+  snapshot: {
+    media_lifecycle_version: 1,
+    quality_face_crops: [{ path: 'malek/_staging/face.jpg' }],
+  },
+}
+const lifecycleIncoming = {
+  status: 'filtering',
+  snapshot: {
+    media_lifecycle_version: 2,
+    quality_face_crops: [{ path: 'malek/cluster_0/face.jpg' }],
+  },
+}
+assert.deepEqual(mergeJobStatus(lifecyclePrevious, lifecycleIncoming), lifecycleIncoming)
 
 const requestGuard = createStatusRequestGuard()
 const oldRequest = requestGuard.start('old-job')
@@ -284,7 +305,8 @@ assert.match(cardSource, /Unknown person detected/)
 assert.match(cardSource, /Known person'/)
 assert.match(imageSource, /No face image/)
 assert.match(imageSource, /SafeImage/)
-assert.match(safeImageSource, /onError=\{\(\) => setIndex\(current => current \+ 1\)\}/)
+assert.match(safeImageSource, /failedUrlsByScope/)
+assert.match(safeImageSource, /failed\.add\(src\)/)
 assert.match(safeImageSource, /setIndex\(0\)/)
 assert.match(safeImageSource, /placeholder/)
 assert.equal(/style\.display\s*=\s*['"]none/.test(memorySource), false)

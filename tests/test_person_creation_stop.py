@@ -229,7 +229,9 @@ def test_status_exposes_only_compact_rolling_analysis(client):
     snapshot = client.get(f"/api/person/status/{job_id}").get_json()["snapshot"]
     serialized = json.dumps(snapshot)
 
-    assert snapshot["rolling_analysis"] == rolling
+    expected = json.loads(json.dumps(rolling))
+    expected["live_identities"][0]["representative_face_path"] = None
+    assert snapshot["rolling_analysis"] == expected
     assert "all_face_embeddings" not in serialized
     assert "analysis_thread" not in serialized
     assert "database_path" not in serialized

@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import SafeImage from './SafeImage.jsx'
 
-function CropThumb({ crop, jobId, cropType, onDeleted }) {
+function CropThumb({ crop, jobId, cropType, onDeleted, mediaVersion }) {
   const [deleting, setDeleting] = useState(false)
 
   const sharp = crop.sharpness?.toFixed(1) ?? '?'
@@ -35,6 +35,7 @@ function CropThumb({ crop, jobId, cropType, onDeleted }) {
     }}>
       <SafeImage
         path={crop.path}
+        version={mediaVersion}
         alt={`${cropType} crop`}
         placeholder="Unavailable"
         style={{ width: '100%', aspectRatio: '1', objectFit: 'cover', display: 'grid', placeItems: 'center', color: '#64748b', fontSize: 11 }}
@@ -65,7 +66,7 @@ function CropThumb({ crop, jobId, cropType, onDeleted }) {
   )
 }
 
-export default function CropsGrid({ jobId, bodyCrops, faceCrops, onDeleted }) {
+export default function CropsGrid({ jobId, bodyCrops, faceCrops, onDeleted, mediaVersion }) {
   const [subTab, setSubTab] = useState('body')
 
   const crops = subTab === 'body' ? bodyCrops : faceCrops
@@ -102,7 +103,7 @@ export default function CropsGrid({ jobId, bodyCrops, faceCrops, onDeleted }) {
           </div>
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(130px, 1fr))', gap: '10px' }}>
             {crops.map((c, i) => (
-              <CropThumb key={c.path + i} crop={c} jobId={jobId} cropType={cropType} onDeleted={onDeleted} />
+              <CropThumb key={`${mediaVersion}-${c.path}`} crop={c} jobId={jobId} cropType={cropType} onDeleted={onDeleted} mediaVersion={mediaVersion} />
             ))}
           </div>
         </>

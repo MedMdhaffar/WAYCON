@@ -109,9 +109,16 @@ function rollingState(value, enabled) {
 }
 
 export function mediaImageUrl(path) {
-  const safePath = stringValue(path).replaceAll('\\', '/')
+  const safePath = stringValue(path)
   if (!safePath) return ''
-  if (safePath.startsWith('/api/images?path=')) return safePath
+  if (
+    safePath.includes('\\')
+    || safePath.startsWith('/')
+    || /^[A-Za-z]:/.test(safePath)
+    || /^[A-Za-z][A-Za-z0-9+.-]*:/.test(safePath)
+  ) return ''
+  const segments = safePath.split('/')
+  if (segments.some(segment => !segment || segment === '.' || segment === '..')) return ''
   return `/api/images?path=${encodeURIComponent(safePath)}`
 }
 
@@ -197,6 +204,9 @@ export function mergeJobStatus(previous, incoming) {
   if (incoming.status === 'done') return incoming
   const previousRolling = objectOrEmpty(previous?.snapshot?.rolling_analysis)
   const incomingSnapshot = objectOrEmpty(incoming.snapshot)
+  const previousMediaVersion = nonNegativeInteger(previous?.snapshot?.media_lifecycle_version)
+  const incomingMediaVersion = nonNegativeInteger(incomingSnapshot.media_lifecycle_version)
+  if (incomingMediaVersion !== previousMediaVersion) return incoming
   const incomingRolling = objectOrEmpty(incomingSnapshot.rolling_analysis)
   if (previousRolling.enabled !== true) return incoming
 

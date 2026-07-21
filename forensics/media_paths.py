@@ -7,6 +7,7 @@ from pathlib import Path, PurePosixPath
 
 IMAGE_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".webp", ".bmp"})
 _WINDOWS_DRIVE = re.compile(r"^[A-Za-z]:/")
+_URI_SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
 _MEDIA_MARKER = "/forensics/person_db/"
 
 
@@ -45,6 +46,8 @@ def _relative_text(
     value = _portable_text(path)
     if not value or "\x00" in value:
         raise MediaPathError("media path is required")
+    if _URI_SCHEME.match(value) and not _WINDOWS_DRIVE.match(value):
+        raise MediaPathError("media URLs are not allowed")
 
     root_text = root.as_posix().rstrip("/")
     lower_value = value.lower()

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import re
 from pathlib import Path
 
 import pytest
@@ -41,7 +43,18 @@ def test_valid_encoded_and_nested_image_request(client, isolated_service):
     assert absolute.status_code == 403
 
 
-@pytest.mark.parametrize("path", ["/etc/passwd", "../../outside.jpg", "/mnt/c/Users/user/secret.txt"])
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/etc/passwd",
+        "../../outside.jpg",
+        "/mnt/c/Users/user/secret.txt",
+        r"C:\Users\user\secret.jpg",
+        "file:///etc/passwd.jpg",
+        "https://camera.local/private.jpg",
+        "rtsp://camera.local/private.jpg",
+    ],
+)
 def test_image_endpoint_rejects_outside_paths(client, path):
     response = client.get("/api/images", query_string={"path": path})
 
@@ -146,3 +159,62 @@ def test_status_exposes_relative_media_ids_not_internal_paths(client, isolated_s
     public_path = payload["snapshot"]["quality_face_crops"][0]["path"]
     assert public_path == "session/_staging/face_crops/face.jpg"
     assert str(isolated_service) not in str(payload)
+
+
+def test_status_sanitizes_selected_body_crop_diagnostics(client, isolated_service):
+    # A valid canonical relative crop that actually exists under the media root.
+    relative_id = "person_001/body_crops/body.jpg"
+    real_crop = isolated_service / "person_001" / "body_crops" / "body.jpg"
+    real_crop.parent.mkdir(parents=True)
+    real_crop.write_bytes(b"body")
+
+    # The exact class of value the audit demonstrated leaking through the status
+    # API: an absolute Windows path (drive letter + backslashes) carrying an
+    # internal cluster_N staging segment. It does not resolve under the
+    # temporary media root, so it must be dropped rather than exposed.
+    absolute_cluster_path = (
+        r"C:\Users\aziza\Documents\GitHub\WAYCON\forensics\person_db"
+        r"\john\cluster_0\body_crops\body_000123.jpg"
+    )
+
+    with service._jobs_lock:
+        service._jobs["job-clothing"] = service.JobState(
+            "job-clothing",
+            input_type="camera_uri",
+            output_dir=str(isolated_service / "session"),
+            snapshot={
+                "clothing_diagnostics": [
+                    {
+                        "cluster_id": 0,
+                        "selected_body_crop": absolute_cluster_path,
+                        "status": "failed",
+                    },
+                    {
+                        "cluster_id": 1,
+                        "selected_body_crop": relative_id,
+                        "status": "ok",
+                    },
+                ],
+            },
+        )
+
+    payload = client.get("/api/person/status/job-clothing").get_json()
+    diagnostics = payload["snapshot"]["clothing_diagnostics"]
+
+    # The absolute cluster path is never returned unchanged; it is sanitized away.
+    assert diagnostics[0]["selected_body_crop"] != absolute_cluster_path
+    assert diagnostics[0]["selected_body_crop"] is None
+
+    # A valid canonical relative reference stays relative and unchanged.
+    assert diagnostics[1]["selected_body_crop"] == relative_id
+
+    # No absolute path and no cluster_N segment leaks anywhere in the payload.
+    serialized = json.dumps(payload)
+    assert absolute_cluster_path not in serialized
+    assert absolute_cluster_path.replace("\\", "/") not in serialized
+    # A cluster_N path segment (cluster_0, cluster_12, ...) must not appear;
+    # the plain "cluster_id" diagnostic key is metadata, not a path.
+    assert re.search(r"cluster_\d", serialized) is None
+    # No Windows/POSIX absolute path root (drive letter or leading marker).
+    assert re.search(r"[A-Za-z]:[\\/]", serialized) is None
+    assert str(isolated_service) not in serialized
