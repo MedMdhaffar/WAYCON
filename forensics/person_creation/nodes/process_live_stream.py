@@ -95,10 +95,31 @@ def live_overlap_enabled() -> bool:
 
 
 def live_rolling_analysis_enabled() -> bool:
-    return os.getenv(
-        "PERSON_CREATION_LIVE_ROLLING_ANALYSIS",
-        "0",
-    ).strip().lower() in {"1", "true", "yes", "on"}
+    configured = os.getenv("PERSON_CREATION_LIVE_ROLLING_ANALYSIS")
+    if configured is None:
+        # Rolling analysis consumes the embeddings produced by the overlap lane.
+        # Once that lane is enabled, silently requiring a second opt-in leaves
+        # valid live observations stranded in the preprocessing accumulator.
+        return live_overlap_enabled()
+    return configured.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _publishable_rolling_snapshot(snapshot: dict | None) -> dict:
+    """Keep status empty until rolling evidence or a useful warning exists."""
+    if not isinstance(snapshot, dict):
+        return {}
+    try:
+        analyzed = int(snapshot.get("analyzed_embedding_count") or 0)
+    except (TypeError, ValueError):
+        analyzed = 0
+    if (
+        analyzed > 0
+        or snapshot.get("live_identities")
+        or snapshot.get("live_recognition_events")
+        or snapshot.get("analysis_warning")
+    ):
+        return snapshot
+    return {}
 
 
 def capture_live_chunk(
@@ -308,8 +329,10 @@ def process_live_stream(state: PersonCreationState) -> dict:
             return None
         if not vlm_closed:
             vlm_closed = True
-            return vlm_session.close(vlm_drain_timeout)
-        return vlm_session.public_snapshot()
+            snapshot = vlm_session.close(vlm_drain_timeout)
+        else:
+            snapshot = vlm_session.public_snapshot()
+        return _publishable_rolling_snapshot(snapshot)
 
     def current_analysis_snapshot() -> dict | None:
         if analysis_session is None:
@@ -320,7 +343,7 @@ def process_live_stream(state: PersonCreationState) -> dict:
                 snapshot,
                 _collect_identity_decisions(analysis_session),
             )
-        return snapshot
+        return _publishable_rolling_snapshot(snapshot)
 
     if overlap_enabled:
         from forensics.person_creation.live_session import LivePreprocessingSession
@@ -369,12 +392,12 @@ def process_live_stream(state: PersonCreationState) -> dict:
                         _collect_identity_decisions(analysis_session),
                     )
                 _notify(state, "processing_live_frames", {
-                    "rolling_analysis": snapshot,
+                    "rolling_analysis": _publishable_rolling_snapshot(snapshot),
                 })
 
             def publish_vlm(snapshot: dict) -> None:
                 _notify(state, "processing_live_frames", {
-                    "rolling_analysis": snapshot,
+                    "rolling_analysis": _publishable_rolling_snapshot(snapshot),
                 })
 
             from forensics.person_creation.live_vlm import (

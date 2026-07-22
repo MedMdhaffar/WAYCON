@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import threading
+from copy import deepcopy
 from types import SimpleNamespace
 
 import pytest
@@ -918,6 +919,324 @@ def test_live_rolling_analysis_feature_flag(monkeypatch, value, expected):
     else:
         monkeypatch.setenv("PERSON_CREATION_LIVE_ROLLING_ANALYSIS", value)
     assert live_node.live_rolling_analysis_enabled() is expected
+
+
+def test_rolling_analysis_defaults_to_enabled_overlap_lane(monkeypatch):
+    monkeypatch.setenv("PERSON_CREATION_LIVE_OVERLAP", "1")
+    monkeypatch.delenv("PERSON_CREATION_LIVE_ROLLING_ANALYSIS", raising=False)
+
+    assert live_node.live_rolling_analysis_enabled() is True
+
+
+def test_live_chunk_without_usable_faces_keeps_rolling_status_empty(
+    monkeypatch,
+    tmp_path,
+):
+    from forensics.person_creation import live_session
+    from forensics.person_creation.live_chunk_processing import PreprocessedLiveChunk
+
+    clock = FakeClock()
+    buffer = FakeBuffer(clock)
+    stop_event = threading.Event()
+    rolling_updates = []
+    _install_continuous_dependencies(monkeypatch, tmp_path, buffer)
+    monkeypatch.setenv("PERSON_CREATION_LIVE_OVERLAP", "1")
+    monkeypatch.delenv("PERSON_CREATION_LIVE_ROLLING_ANALYSIS", raising=False)
+
+    def preprocess(*, chunk, **_kwargs):
+        return PreprocessedLiveChunk(
+            chunk_index=chunk.chunk_index,
+            capture_summary=chunk.report_metrics(),
+            quality_body_crops=[],
+            quality_face_crops=[],
+            face_embeddings=[],
+            failed_face_embeddings=[],
+            warnings=[],
+            processing_elapsed_seconds=0.01,
+        )
+
+    def capture(**kwargs):
+        stop_event.set()
+        return _chunk_result(kwargs["chunk_index"], stop=True, empty=True)
+
+    def notify(_status, update=None):
+        if isinstance(update, dict) and "rolling_analysis" in update:
+            rolling_updates.append(deepcopy(update["rolling_analysis"]))
+
+    monkeypatch.setattr(live_session, "preprocess_live_chunk", preprocess)
+    monkeypatch.setattr(live_node, "capture_live_chunk", capture)
+
+    result = live_node.process_live_stream({
+        "camera_uri": "rtsp://camera.local/live",
+        "duration_seconds": 10,
+        "process_every_n": 1,
+        "output_dir": str(tmp_path),
+        "_stop_event": stop_event,
+        "_status_callback": notify,
+    })
+
+    assert rolling_updates
+    assert all(snapshot == {} for snapshot in rolling_updates)
+    assert result["stream_stats"]["rolling_analysis"] == {}
+    assert result["live_identity_decisions"] == []
+
+
+def test_live_embeddings_reach_rolling_identity_decision_and_async_vlm_before_stop(
+    monkeypatch,
+    tmp_path,
+):
+    from forensics.global_memory.identity_policy import IdentityPolicyConfig
+    from forensics.person_creation import live_analysis, live_session, live_vlm, service
+    from forensics.person_creation.live_chunk_processing import PreprocessedLiveChunk
+
+    clock = FakeClock()
+    buffer = FakeBuffer(clock)
+    stop_event = threading.Event()
+    second_capture_started = threading.Event()
+    first_identity_ready = threading.Event()
+    second_identity_ready = threading.Event()
+    no_face_update_ready = threading.Event()
+    vlm_received_identity = threading.Event()
+    session_root = tmp_path / "person_db" / "session"
+    staging_faces = session_root / "_staging" / "face_crops"
+    staging_bodies = session_root / "_staging" / "body_crops"
+    staging_faces.mkdir(parents=True)
+    staging_bodies.mkdir(parents=True)
+    database = tmp_path / "memory.db"
+    job_id = "job-live-integration"
+    rolling_updates = []
+    described_jobs = []
+    persisted_jobs = []
+
+    _install_continuous_dependencies(monkeypatch, session_root, buffer)
+    monkeypatch.setenv("PERSON_CREATION_LIVE_OVERLAP", "1")
+    monkeypatch.delenv("PERSON_CREATION_LIVE_ROLLING_ANALYSIS", raising=False)
+    monkeypatch.setenv("PERSON_CREATION_MEDIA_ROOT", str(tmp_path / "person_db"))
+    monkeypatch.setenv("FORENSICS_MEMORY_DB", str(database))
+
+    def face_record(path, index):
+        return {
+            "path": str(path),
+            "frame_idx": index,
+            "video": "camera-source",
+            "bbox": [0, 0, 80, 80],
+            "sharpness": 100.0 + index,
+        }
+
+    def embedding_record(path, index):
+        record = face_record(path, index)
+        record["crop_path"] = record.pop("path")
+        record["embedding"] = [1.0, float(index) / 1000.0]
+        return record
+
+    def fake_preprocess(*, chunk, **_kwargs):
+        if chunk.chunk_index == 0:
+            indices = range(6)
+        elif chunk.chunk_index == 1:
+            indices = range(6, 7)
+        else:
+            indices = ()
+        faces = []
+        embeddings = []
+        for index in indices:
+            path = staging_faces / f"face-{index}.jpg"
+            path.write_bytes(f"face:{index}".encode())
+            faces.append(face_record(path, index))
+            embeddings.append(embedding_record(path, index))
+        bodies = []
+        if chunk.chunk_index == 0:
+            body = staging_bodies / "body-0.jpg"
+            body.write_bytes(b"body:0")
+            bodies.append({
+                "path": str(body),
+                "frame_idx": 0,
+                "video": "camera-source",
+                "bbox": [0, 0, 80, 160],
+                "sharpness": 120.0,
+            })
+        return PreprocessedLiveChunk(
+            chunk_index=chunk.chunk_index,
+            capture_summary=chunk.report_metrics(),
+            quality_body_crops=bodies,
+            quality_face_crops=faces,
+            face_embeddings=embeddings,
+            failed_face_embeddings=[],
+            warnings=[],
+            processing_elapsed_seconds=0.01,
+        )
+
+    def cluster_all(state):
+        records = list(state["all_face_embeddings"])
+        if not records:
+            return {"identity_clusters": [], "unresolved_faces": []}
+        if len(records) == 6:
+            assert second_capture_started.wait(5.0)
+        return {
+            "identity_clusters": [{
+                "cluster_id": 0,
+                "face_records": records,
+                "representative_embedding": [1.0, 0.0],
+                "face_count": len(records),
+                "confidence": 1.0,
+                "low_confidence": False,
+            }],
+            "unresolved_faces": [],
+        }
+
+    def associate(state):
+        bodies = list(state.get("quality_body_crops") or [])
+        assignments = [{
+            "body_crop_path": record["path"],
+            "body_sharpness": record["sharpness"],
+        } for record in bodies]
+        return SimpleNamespace(cluster_assignments={0: assignments})
+
+    real_analysis = live_analysis.LiveRollingAnalysisSession
+
+    def analysis_factory(**kwargs):
+        kwargs.update({
+            "database_path": database,
+            "cluster": cluster_all,
+            "associate": associate,
+            "identity_decisions": True,
+            "policy_config": IdentityPolicyConfig(),
+        })
+        return real_analysis(**kwargs)
+
+    real_vlm = live_vlm.LiveIdentityVLMCoordinator
+
+    def describe(job):
+        described_jobs.append(job)
+        vlm_received_identity.set()
+        return {
+            "per_cluster_clothing": {0: {
+                "status": "ok",
+                "attempts": 1,
+                "top": "black jacket",
+                "bottom": "blue jeans",
+                "shoes": "white shoes",
+                "full": "black jacket, blue jeans, white shoes",
+                "failure_reason": None,
+            }},
+            "clothing_diagnostics": [{
+                "cluster_id": 0,
+                "attempts": 1,
+                "status": "ok",
+                "failure_reason": None,
+            }],
+        }
+
+    def persist(job, _clothing):
+        persisted_jobs.append(job)
+
+    def vlm_factory(**kwargs):
+        return real_vlm(
+            **kwargs,
+            media_root=tmp_path / "person_db",
+            describe=describe,
+            persist=persist,
+        )
+
+    monkeypatch.setattr(live_session, "preprocess_live_chunk", fake_preprocess)
+    monkeypatch.setattr(live_analysis, "LiveRollingAnalysisSession", analysis_factory)
+    monkeypatch.setattr(live_vlm, "LiveIdentityVLMCoordinator", vlm_factory)
+
+    with service._jobs_lock:
+        service._jobs[job_id] = service.JobState(
+            job_id,
+            input_type="camera_uri",
+            output_dir=str(session_root),
+        )
+
+    def publish_status(status, update=None):
+        if not isinstance(update, dict):
+            return
+        with service._jobs_lock:
+            job = service._jobs[job_id]
+            job.status = status
+            service._merge_job_snapshot(job, update)
+        rolling = update.get("rolling_analysis")
+        if not isinstance(rolling, dict):
+            return
+        rolling_updates.append((stop_event.is_set(), deepcopy(rolling)))
+        identities = rolling.get("live_identities") or []
+        if not identities:
+            return
+        identity = identities[0]
+        if (
+            identity.get("face_count") == 6
+            and identity.get("decision") == "new_person"
+            and identity.get("canonical_person_id")
+        ):
+            first_identity_ready.set()
+        if identity.get("face_count") == 7:
+            if int(rolling.get("analysis_version") or 0) >= 3:
+                no_face_update_ready.set()
+            else:
+                second_identity_ready.set()
+
+    def fake_capture(**kwargs):
+        index = kwargs["chunk_index"]
+        if index == 1:
+            second_capture_started.set()
+            assert first_identity_ready.wait(5.0)
+            assert vlm_received_identity.wait(5.0)
+        elif index == 2:
+            assert second_identity_ready.wait(5.0)
+        elif index == 3:
+            assert no_face_update_ready.wait(5.0)
+            stop_event.set()
+            return _chunk_result(index, stop=True, empty=True)
+        return _chunk_result(index, empty=index >= 2)
+
+    monkeypatch.setattr(live_node, "capture_live_chunk", fake_capture)
+    try:
+        result = live_node.process_live_stream({
+            "camera_uri": "rtsp://camera.local/live",
+            "duration_seconds": 10,
+            "process_every_n": 1,
+            "live_stream_config": {"vlm_drain_timeout_seconds": 2.0},
+            "output_dir": str(session_root),
+            "_job_id": job_id,
+            "_stop_event": stop_event,
+            "_status_callback": publish_status,
+        })
+        payload = service.app.test_client().get(
+            f"/api/person/status/{job_id}"
+        ).get_json()
+    finally:
+        with service._jobs_lock:
+            service._jobs.pop(job_id, None)
+
+    before_stop = [
+        snapshot for stopped, snapshot in rolling_updates
+        if not stopped and snapshot.get("live_identities")
+    ]
+    assert before_stop
+    assert {item["live_identities"][0]["live_identity_id"] for item in before_stop} == {
+        "live_0001"
+    }
+    assert any(item["live_identities"][0]["face_count"] == 6 for item in before_stop)
+    assert any(item["live_identities"][0]["face_count"] == 7 for item in before_stop)
+    no_face_snapshot = next(
+        item for item in before_stop
+        if int(item.get("analysis_version") or 0) >= 3
+    )
+    assert no_face_snapshot["live_identities"][0]["live_identity_id"] == "live_0001"
+    assert no_face_snapshot["live_identities"][0]["face_count"] == 7
+
+    decisions = result["live_identity_decisions"]
+    assert decisions and decisions[0]["live_identity_id"] == "live_0001"
+    assert decisions[0]["canonical_person_id"].startswith("person_")
+    assert described_jobs and persisted_jobs
+    assert described_jobs[0].live_identity_id == "live_0001"
+    assert described_jobs[0].canonical_person_id == decisions[0]["canonical_person_id"]
+
+    rolling = payload["snapshot"]["rolling_analysis"]
+    assert rolling["live_identities"][0]["live_identity_id"] == "live_0001"
+    assert rolling["live_identities"][0]["decision"] == "new_person"
+    assert rolling["vlm_completed"] >= 1
+    assert payload["snapshot"]["live_preprocessing"]["embedded_faces"] == 7
 
 
 def test_rolling_without_overlap_is_rejected_before_camera_or_staging(
