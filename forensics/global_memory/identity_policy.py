@@ -244,6 +244,32 @@ class IdentityRegistrationResult:
         }
 
 
+@dataclass(frozen=True)
+class IdentityEvidenceAppendResult:
+    """Outcome of appending later evidence to one canonical identity."""
+
+    person_id: str
+    canonical_person_id: str
+    appended: bool
+    idempotent_replay: bool
+    appended_evidence_keys: tuple[str, ...]
+    embedding_count_before: int
+    embedding_count_after: int
+    gallery_rows_added: int
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "person_id": self.person_id,
+            "canonical_person_id": self.canonical_person_id,
+            "appended": self.appended,
+            "idempotent_replay": self.idempotent_replay,
+            "appended_evidence_keys": list(self.appended_evidence_keys),
+            "embedding_count_before": self.embedding_count_before,
+            "embedding_count_after": self.embedding_count_after,
+            "gallery_rows_added": self.gallery_rows_added,
+        }
+
+
 def evaluate_identity_decision(
     *,
     top_candidate: IdentityCandidate | None,

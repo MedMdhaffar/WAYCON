@@ -5,6 +5,9 @@ import shutil
 import uuid
 from pathlib import Path
 
+import numpy as np
+
+from forensics.identity_evidence import identity_evidence_key
 from forensics.media_paths import MediaPathError, get_media_root, normalize_media_path
 from forensics.person_creation.media_lifecycle import (
     cleanup_relocated_sources,
@@ -189,6 +192,169 @@ def _canonical_replay_person_id(profile: dict) -> str | None:
     return person_id
 
 
+def _profile_evidence(profile: dict) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+    def unique(items, crop_type: str) -> list[tuple[str, str]]:
+        result: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for path in items or []:
+            if not path:
+                continue
+            key = identity_evidence_key(path, crop_type)
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append((key, str(path)))
+        return result
+
+    return (
+        unique(profile.get("face_crops"), "face"),
+        unique(profile.get("body_crops"), "body"),
+    )
+
+
+def _live_decision_index(receipts) -> list:
+    """Index live decision receipts by their recorded evidence identifiers."""
+    index: list = []
+    for receipt in receipts or []:
+        if not isinstance(receipt, dict):
+            continue
+        if not receipt.get("canonical_person_id"):
+            continue
+        keys = {
+            str(key).strip()
+            for key in (
+                receipt.get("persisted_evidence_keys")
+                or receipt.get("evidence_keys")
+                or []
+            )
+            if str(key).strip()
+        }
+        if keys:
+            index.append((keys, receipt))
+    return index
+
+
+def _live_decision_for_profile(profile: dict, index: list) -> dict | None:
+    """Return the receipt whose recorded evidence this cluster carries.
+
+    Matching is by the receipt's own evidence identifiers only - never by name,
+    embedding, or profile similarity.
+    """
+    faces, bodies = _profile_evidence(profile)
+    candidates = {key for key, _path in faces + bodies}
+    if not candidates:
+        return None
+    best: dict | None = None
+    best_overlap = 0
+    for keys, receipt in index:
+        overlap = len(candidates & keys)
+        if overlap > best_overlap:
+            best_overlap = overlap
+            best = receipt
+    return best if best_overlap else None
+
+
+def _mean_unseen_face_embedding(
+    state: dict,
+    cid: int,
+    unseen_keys: set[str],
+    profile: dict,
+    all_face_keys: set[str],
+):
+    if not unseen_keys:
+        return None
+    vectors: list[np.ndarray] = []
+    matched: set[str] = set()
+    for cluster in state.get("identity_clusters") or []:
+        if int(cluster.get("cluster_id", -1)) != cid:
+            continue
+        for record in cluster.get("face_records") or []:
+            path = record.get("crop_path")
+            if not path:
+                continue
+            key = identity_evidence_key(path, "face")
+            if key not in unseen_keys or key in matched:
+                continue
+            vector = np.asarray(record.get("embedding"), dtype=np.float64)
+            if vector.ndim != 1 or vector.size == 0 or not np.isfinite(vector).all():
+                raise ValueError("unseen face evidence embedding is invalid")
+            norm = float(np.linalg.norm(vector))
+            if norm <= 0:
+                raise ValueError("unseen face evidence embedding has zero norm")
+            vectors.append(vector / norm)
+            matched.add(key)
+        break
+
+    if matched == unseen_keys:
+        mean = np.mean(np.asarray(vectors), axis=0)
+        norm = float(np.linalg.norm(mean))
+        if norm <= 0:
+            raise ValueError("unseen face evidence mean embedding has zero norm")
+        return (mean / norm).astype(float).tolist()
+
+    # A profile aggregate is exact only when every face in that profile is new.
+    if unseen_keys == all_face_keys:
+        return profile.get("face_embedding")
+    raise ValueError("individual embeddings are required for later unseen faces")
+
+
+def _append_unpersisted_evidence(
+    memory,
+    person_id: str,
+    profile: dict,
+    receipt: dict,
+    *,
+    state: dict,
+    cid: int,
+) -> None:
+    faces, bodies = _profile_evidence(profile)
+    durable_keys = set(memory.identity_evidence_keys(person_id))
+    unseen_face_keys = {key for key, _path in faces if key not in durable_keys}
+    embedding = _mean_unseen_face_embedding(
+        state,
+        cid,
+        unseen_face_keys,
+        profile,
+        {key for key, _path in faces},
+    )
+    appearance = dict(profile.get("appearance") or {})
+    appearance.update({
+        "video_sources": list(profile.get("video_sources") or []),
+        "face_crop_sharpness": dict(profile.get("face_crop_sharpness") or {}),
+        "body_crop_sharpness": dict(profile.get("body_crop_sharpness") or {}),
+    })
+    appended = memory.append_identity_evidence(
+        person_id,
+        embedding=embedding,
+        observation_count=len(unseen_face_keys),
+        face_crops=[path for _key, path in faces],
+        body_crops=[path for _key, path in bodies],
+        appearance=appearance,
+        evidence_keys=[key for key, _path in faces + bodies],
+    )
+
+    all_keys = sorted(key for key, _path in faces + bodies)
+    face_paths = sorted(path for _key, path in faces)
+    body_paths = sorted(path for _key, path in bodies)
+    receipt["evidence_keys"] = all_keys
+    receipt["persisted_evidence_keys"] = all_keys
+    receipt["persisted_face_crops"] = face_paths
+    receipt["persisted_body_crops"] = body_paths
+    receipt["canonical_face_paths"] = face_paths
+    receipt["canonical_body_paths"] = body_paths
+    receipt["persisted_face_count"] = len(face_paths)
+    receipt["persisted_body_count"] = len(body_paths)
+    receipt["persisted_observation_count"] = int(
+        receipt.get("persisted_observation_count") or 0
+    ) + int(appended.embedding_count_after - appended.embedding_count_before)
+    analysis_version = (
+        (state.get("rolling_analysis") or {}).get("analysis_version")
+        or receipt.get("last_appended_analysis_version")
+        or receipt.get("decision_version")
+    )
+    receipt["last_appended_analysis_version"] = analysis_version
+
+
 def _rewrite_feedback_report(
     path: Path,
     remap: dict[str, str],
@@ -226,6 +392,8 @@ def finalize(state: dict) -> dict:
     finalized_profiles: dict[int, dict] = {}
     complete_remap: dict[str, str] = {}
     cleanup_pairs: list[tuple[str, str]] = []
+    live_decision_index = _live_decision_index(state.get("live_identity_decisions"))
+    reconciled_live_decisions: list[dict] = []
 
     # Goal 3: register completed profiles into global memory. The DB is the
     # source of truth for identity; profile.json below is only a debug export.
@@ -237,9 +405,40 @@ def finalize(state: dict) -> dict:
             cid = int(raw_cid)
             profile = _normalize_profile_schema(profile)
             replay_id = _canonical_replay_person_id(profile)
+            live_decision = _live_decision_for_profile(profile, live_decision_index)
+            resolved_id = replay_id
+            if resolved_id is None and live_decision is not None:
+                resolved_id = str(live_decision.get("canonical_person_id") or "") or None
             relocation_holder = {}
-            if replay_id is not None and gm.get_person(replay_id) is not None:
-                assigned_id = replay_id
+            if live_decision is not None:
+                if resolved_id is None:
+                    raise RuntimeError("live identity receipt has no canonical person")
+                assigned_id = gm.resolve_canonical_person_id(resolved_id)
+                if gm.get_person(assigned_id) is None:
+                    raise RuntimeError(
+                        "live identity receipt references a missing canonical person"
+                    )
+                relocation = relocate_profile_media(
+                    profile,
+                    assigned_id,
+                    media_root=base_db_dir,
+                )
+                profile = relocation.profile
+                _append_unpersisted_evidence(
+                    gm,
+                    assigned_id,
+                    profile,
+                    live_decision,
+                    state=state,
+                    cid=cid,
+                )
+                reconciled_live_decisions.append(live_decision)
+            elif resolved_id is not None and gm.get_person(resolved_id) is not None:
+                # Already persisted (batch replay, or a Phase 3E decision taken
+                # while capture was live): reuse that canonical identity without
+                # registering a second person, re-attaching evidence, or
+                # creating a second review suggestion.
+                assigned_id = resolved_id
                 relocation = relocate_profile_media(
                     profile,
                     assigned_id,
@@ -305,6 +504,12 @@ def finalize(state: dict) -> dict:
                     )
     finally:
         gm.close()
+
+    if reconciled_live_decisions:
+        print(
+            f"[finalize] reused {len(reconciled_live_decisions)} identity "
+            "decision(s) already persisted during live capture"
+        )
 
     promotion_remap = state.get("_media_path_remap") or {}
     if isinstance(promotion_remap, dict):

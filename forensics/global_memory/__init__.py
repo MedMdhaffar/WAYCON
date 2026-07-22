@@ -14,6 +14,7 @@ from .merge import (
     RedirectChainError,
     SelfMergeError,
 )
+from .identity_policy import IdentityEvidenceAppendResult
 from .store import GlobalMemory
 from .review import (
     IdentityReviewDecision,
@@ -38,6 +39,7 @@ __all__ = [
     "IdentityReviewDecisionResult",
     "IdentityReviewDetail",
     "IdentityReviewError",
+    "IdentityEvidenceAppendResult",
     "IdentityReviewSummary",
     "InactiveSourceError",
     "InactiveTargetError",

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import stat
@@ -9,9 +10,13 @@ import threading
 import time
 from copy import deepcopy
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
+import numpy as np
+
+from forensics.identity_evidence import identity_evidence_key
 from forensics.person_creation.live_identity import (
     CurrentMembership,
     IdentityAssignmentResult,
@@ -63,6 +68,14 @@ def _safe_path(value: Any) -> str:
     return _CAMERA_URI_RE.sub("<camera-source>", str(value or ""))
 
 
+_STABLE_CONSECUTIVE_OUTCOMES = 2
+_STABLE_OBSERVATION_COUNT = 6
+
+
+def _rounded(value: Any) -> float | None:
+    return None if value is None else round(float(value), 4)
+
+
 def _live_number(live_id: str) -> int:
     try:
         return int(str(live_id).rsplit("_", 1)[-1])
@@ -92,6 +105,10 @@ class LiveRollingAnalysisSession:
         cluster: Callable[[dict], dict] | None = None,
         associate: Callable[[Mapping[str, Any]], Any] | None = None,
         memory_factory: Callable[[Path], Any] | None = None,
+        job_id: str | None = None,
+        identity_decisions: bool = False,
+        decision_memory_factory: Callable[[Path], Any] | None = None,
+        policy_config: Any | None = None,
     ) -> None:
         self.join_timeout_seconds = max(0.01, float(join_timeout_seconds))
         self._snapshot_provider = snapshot_provider
@@ -100,6 +117,21 @@ class LiveRollingAnalysisSession:
         self._cluster = cluster
         self._associate = associate
         self._memory_factory = memory_factory
+        self._job_id = str(job_id or "live-job")
+        self._identity_decisions_enabled = bool(identity_decisions)
+        self._decision_memory_factory = decision_memory_factory
+        self._policy_config = policy_config
+        self._decision_memory: Any | None = None
+        # Decision state is committed here the moment a Global Memory write
+        # succeeds, never through _commit_result: a stale pass is discarded by
+        # _commit_result, and re-deciding it would create a duplicate person.
+        self._identity_decision_records: dict[str, dict] = {}
+        self._identity_evidence_versions: dict[str, int] = {}
+        self._identity_evidence_signatures: dict[str, str] = {}
+        self._identity_decision_keys: set[str] = set()
+        self._identity_states: dict[str, tuple[str, int]] = {}
+        self._identity_provisional: dict[str, dict] = {}
+        self._identity_outcome_streak: dict[str, tuple[str, int]] = {}
 
         self._condition = threading.Condition(threading.Lock())
         self._wake = threading.Event()
@@ -284,6 +316,15 @@ class LiveRollingAnalysisSession:
                     cleanup_error = exc
                 except BaseException as exc:
                     cleanup_fatal = exc
+            decision_memory = self._decision_memory
+            self._decision_memory = None
+            if decision_memory is not None:
+                try:
+                    decision_memory.close()
+                except Exception as exc:
+                    cleanup_error = cleanup_error or exc
+                except BaseException as exc:
+                    cleanup_fatal = cleanup_fatal or exc
             with self._condition:
                 if cleanup_error is not None:
                     self._warning = _safe_warning(
@@ -428,22 +469,67 @@ class LiveRollingAnalysisSession:
                 for path in identity.crop_paths
                 if path in chunk_by_path
             )
-            body_count = len(
+            assignments = list(
                 getattr(association, "cluster_assignments", {}).get(
                     identity.cluster_label,
                     [],
                 )
             )
+            body_count = len(assignments)
+            face_count = len(identity.crop_paths)
+            try:
+                record = self._maybe_decide_identity(
+                    live_id=identity.session_person_id,
+                    cluster=cluster,
+                    snapshot=snapshot,
+                    crop_paths=identity.crop_paths,
+                    assignments=assignments,
+                    face_count=face_count,
+                )
+            except Exception as exc:
+                record = None
+                with self._condition:
+                    self._warning = _safe_warning(
+                        "identity decision",
+                        snapshot.version,
+                        exc,
+                    )
+            state, state_version = self._identity_state_and_version(
+                identity.session_person_id,
+                record,
+            )
             identities.append({
                 "session_person_id": identity.session_person_id,
+                "live_identity_id": identity.session_person_id,
                 "cluster_label": identity.cluster_label,
                 "status": "provisional",
-                "face_count": len(identity.crop_paths),
+                "state": state,
+                "version": state_version,
+                "face_count": face_count,
+                "body_count": body_count,
                 "associated_body_count": body_count,
                 "first_seen_chunk": chunks[0] if chunks else None,
                 "last_seen_chunk": chunks[-1] if chunks else None,
+                "first_seen": chunks[0] if chunks else None,
+                "last_seen": chunks[-1] if chunks else None,
                 "representative_face_path": representative_path,
+                "best_face_path": representative_path,
+                "best_body_path": self._best_body_path(assignments),
                 "memory_match": dict(match) if match is not None else None,
+                "candidate_person_id": (record or {}).get("candidate_person_id"),
+                "candidate_similarity": (record or {}).get("candidate_similarity"),
+                "second_candidate_person_id": (
+                    (record or {}).get("second_candidate_person_id")
+                ),
+                "second_candidate_similarity": (
+                    (record or {}).get("second_candidate_similarity")
+                ),
+                "margin": (record or {}).get("margin"),
+                "decision": (record or {}).get("decision"),
+                "provisional": bool((record or {}).get("provisional")),
+                "canonical_person_id": (record or {}).get("canonical_person_id"),
+                "suggestion_id": (record or {}).get("suggestion_id"),
+                "decision_version": (record or {}).get("decision_version"),
             })
 
         raw_events = self._build_events(
@@ -504,6 +590,483 @@ class LiveRollingAnalysisSession:
             "name": str(match["name"]),
             "similarity": round(float(match["similarity"]), 4),
         }
+
+    def identity_decisions(self) -> tuple[dict, ...]:
+        """Return every identity decision already persisted during capture."""
+        with self._condition:
+            return tuple(
+                deepcopy(record)
+                for _live_id, record in sorted(
+                    self._identity_decision_records.items(),
+                    key=lambda item: (_live_number(item[0]), item[0]),
+                )
+            )
+
+    def _policy_configuration(self) -> Any:
+        if self._policy_config is not None:
+            return self._policy_config
+        from forensics.global_memory.identity_policy import IdentityPolicyConfig
+
+        self._policy_config = IdentityPolicyConfig.from_environment()
+        return self._policy_config
+
+    def _open_decision_memory(self) -> Any | None:
+        """Open one writable Global Memory handle reused for every decision."""
+        if self._decision_memory is not None:
+            return self._decision_memory
+        if self._decision_memory_factory is not None:
+            from forensics.global_memory.config import DB_PATH
+
+            self._decision_memory = self._decision_memory_factory(
+                self._database_path or Path(DB_PATH)
+            )
+            return self._decision_memory
+        from forensics.global_memory.store import GlobalMemory
+
+        # With no explicit path, defer to GlobalMemory so FORENSICS_MEMORY_DB
+        # keeps tests and isolated deployments off the default database.
+        self._decision_memory = (
+            GlobalMemory(str(self._database_path))
+            if self._database_path is not None else GlobalMemory()
+        )
+        return self._decision_memory
+
+    @staticmethod
+    def _evidence_signature(keys) -> str:
+        digest = hashlib.sha256()
+        for key in sorted(keys):
+            digest.update(str(key).encode("utf-8", "replace"))
+            digest.update(b"\x00")
+        return digest.hexdigest()
+
+    @staticmethod
+    def _identity_evidence(
+        cluster: Mapping[str, Any],
+        assignments: list[dict],
+    ) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+        faces: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for record in cluster.get("face_records") or []:
+            path = _safe_path(record.get("crop_path"))
+            if not path:
+                continue
+            key = identity_evidence_key(path, "face")
+            if key not in seen:
+                seen.add(key)
+                faces.append((key, path))
+        bodies: list[tuple[str, str]] = []
+        for item in assignments:
+            path = _safe_path(item.get("body_crop_path"))
+            if not path:
+                continue
+            key = identity_evidence_key(path, "body")
+            if key not in seen:
+                seen.add(key)
+                bodies.append((key, path))
+        return faces, bodies
+
+    @staticmethod
+    def _face_embedding_for_evidence(
+        cluster: Mapping[str, Any],
+        evidence_keys: set[str],
+    ) -> list[float]:
+        """Build the representative from exactly the selected face crops."""
+        vectors: list[np.ndarray] = []
+        matched: set[str] = set()
+        for record in cluster.get("face_records") or []:
+            path = _safe_path(record.get("crop_path"))
+            if not path:
+                continue
+            key = identity_evidence_key(path, "face")
+            if key not in evidence_keys or key in matched:
+                continue
+            vector = np.asarray(record.get("embedding"), dtype=np.float64)
+            if vector.ndim != 1 or vector.size == 0 or not np.isfinite(vector).all():
+                raise ValueError("face evidence embedding is invalid")
+            norm = float(np.linalg.norm(vector))
+            if norm <= 0:
+                raise ValueError("face evidence embedding has zero norm")
+            vectors.append(vector / norm)
+            matched.add(key)
+        if matched != evidence_keys:
+            raise ValueError("face evidence embedding is missing")
+        mean = np.mean(np.asarray(vectors), axis=0)
+        norm = float(np.linalg.norm(mean))
+        if norm <= 0:
+            raise ValueError("face evidence mean embedding has zero norm")
+        return (mean / norm).astype(float).tolist()
+
+    def _provisional_decision(
+        self,
+        memory: Any,
+        cluster: Mapping[str, Any],
+        face_count: int,
+        policy: Any,
+    ) -> Any:
+        from forensics.global_memory.identity_policy import evaluate_identity_decision
+
+        candidates = memory.rank_identity_candidates(
+            cluster.get("representative_embedding")
+        )
+        return evaluate_identity_decision(
+            top_candidate=candidates[0] if candidates else None,
+            second_candidate=candidates[1] if len(candidates) > 1 else None,
+            observation_count=face_count,
+            low_confidence=bool(cluster.get("low_confidence")),
+            configuration=policy,
+        )
+
+    @staticmethod
+    def _best_body_path(assignments: list[dict]) -> str:
+        if not assignments:
+            return ""
+        selected = min(
+            assignments,
+            key=lambda item: (
+                -float(item.get("body_sharpness") or 0.0),
+                _safe_path(item.get("body_crop_path")),
+            ),
+        )
+        return _safe_path(selected.get("body_crop_path"))
+
+    def _live_profile(
+        self,
+        *,
+        cluster: Mapping[str, Any],
+        snapshot: FrozenAnalysisSnapshot,
+        crop_paths: frozenset[str],
+        assignments: list[dict],
+    ) -> dict:
+        face_crops = sorted(crop_paths)
+        body_crops = sorted({
+            str(item.get("body_crop_path"))
+            for item in assignments
+            if item.get("body_crop_path")
+        })
+        face_sharpness = {
+            str(record.get("crop_path")): float(record.get("sharpness") or 0.0)
+            for record in cluster.get("face_records") or []
+            if record.get("crop_path")
+        }
+        return {
+            "name": snapshot.person_name,
+            "face_embedding": cluster.get("representative_embedding"),
+            "face_crops": face_crops,
+            "body_crops": body_crops,
+            "best_body_crops": body_crops[:5],
+            "face_crop_sharpness": face_sharpness,
+            "video_sources": list(snapshot.video_paths),
+            "appearance": {"date": date.today().isoformat()},
+        }
+
+    def _maybe_decide_identity(
+        self,
+        *,
+        live_id: str,
+        cluster: Mapping[str, Any],
+        snapshot: FrozenAnalysisSnapshot,
+        crop_paths: frozenset[str],
+        assignments: list[dict],
+        face_count: int,
+    ) -> dict | None:
+        """Evaluate provisionally, persist once stable, then append new evidence."""
+        if not self._identity_decisions_enabled:
+            return None
+
+        faces, bodies = self._identity_evidence(cluster, assignments)
+        face_count = len(faces)
+        signature = self._evidence_signature(
+            key for key, _path in faces + bodies
+        )
+
+        with self._condition:
+            record = deepcopy(self._identity_decision_records.get(live_id))
+            unchanged = self._identity_evidence_signatures.get(live_id) == signature
+            version = self._identity_evidence_versions.get(live_id, 0)
+            if not unchanged:
+                version += 1
+                self._identity_evidence_signatures[live_id] = signature
+                self._identity_evidence_versions[live_id] = version
+            provisional = deepcopy(self._identity_provisional.get(live_id))
+            streak = self._identity_outcome_streak.get(live_id)
+
+        if record is not None:
+            if unchanged:
+                return record
+            return self._append_new_evidence(
+                live_id=live_id,
+                record=record,
+                faces=faces,
+                bodies=bodies,
+                cluster=cluster,
+                snapshot=snapshot,
+                version=version,
+                signature=signature,
+            )
+
+        if unchanged and provisional is not None:
+            return provisional
+
+        policy = self._policy_configuration()
+        if face_count < int(policy.minimum_face_observations):
+            return None
+        memory = self._open_decision_memory()
+        if memory is None:
+            return None
+
+        decision = self._provisional_decision(memory, cluster, face_count, policy)
+        outcome = decision.decision.value
+        consecutive = streak[1] + 1 if streak and streak[0] == outcome else 1
+        published = {
+            "live_identity_id": live_id,
+            "job_id": self._job_id,
+            "decision": outcome,
+            "reason": decision.reason.value,
+            "provisional": True,
+            "canonical_person_id": None,
+            "suggestion_id": None,
+            "candidate_person_id": decision.top_candidate_person_id,
+            "candidate_similarity": _rounded(decision.top_similarity),
+            "second_candidate_person_id": decision.second_candidate_person_id,
+            "second_candidate_similarity": _rounded(decision.second_similarity),
+            "margin": _rounded(decision.margin),
+            "decision_version": version,
+            "last_evidence_signature": signature,
+        }
+        with self._condition:
+            self._identity_outcome_streak[live_id] = (outcome, consecutive)
+            self._identity_provisional[live_id] = deepcopy(published)
+
+        stable = (
+            consecutive >= _STABLE_CONSECUTIVE_OUTCOMES
+            or face_count >= _STABLE_OBSERVATION_COUNT
+        )
+        if not stable:
+            return published
+        return self._persist_identity(
+            live_id=live_id,
+            cluster=cluster,
+            snapshot=snapshot,
+            faces=faces,
+            bodies=bodies,
+            face_count=face_count,
+            version=version,
+            signature=signature,
+            policy=policy,
+            memory=memory,
+        )
+
+    def _persist_identity(
+        self,
+        *,
+        live_id: str,
+        cluster: Mapping[str, Any],
+        snapshot: FrozenAnalysisSnapshot,
+        faces: list[tuple[str, str]],
+        bodies: list[tuple[str, str]],
+        face_count: int,
+        version: int,
+        signature: str,
+        policy: Any,
+        memory: Any,
+    ) -> dict | None:
+        key = f"{self._job_id}|{live_id}|{version}"
+        with self._condition:
+            if key in self._identity_decision_keys:
+                return deepcopy(self._identity_decision_records.get(live_id))
+
+        from forensics.person_creation.media_lifecycle import relocate_profile_media
+
+        profile = self._live_profile(
+            cluster=cluster,
+            snapshot=snapshot,
+            crop_paths=frozenset(path for _key, path in faces),
+            assignments=[],
+        )
+        profile["body_crops"] = sorted(path for _key, path in bodies)
+        profile["best_body_crops"] = profile["body_crops"][:5]
+        relocated: dict[str, Any] = {}
+
+        def prepare_for_person(person_id: str, raw_profile: dict) -> dict:
+            # Relocate retained evidence into the canonical person directory
+            # *inside* the identity transaction, so Global Memory only ever
+            # persists person_NNN relative paths - never _staging, never
+            # cluster_N, never absolute. Staging sources are deliberately left
+            # in place: the batch tail still reads them after Stop.
+            relocation = relocate_profile_media(
+                raw_profile,
+                person_id,
+                media_root=memory.media_root,
+            )
+            relocated["profile"] = relocation.profile
+            return relocation.profile
+
+        result = memory.register_with_identity_policy(
+            profile,
+            observation_count=face_count,
+            low_confidence=bool(cluster.get("low_confidence")),
+            configuration=policy,
+            prepare_profile_for_person=prepare_for_person,
+            evidence_keys=[key for key, _path in faces + bodies],
+        )
+        persisted = relocated.get("profile") or {}
+        persisted_faces = sorted(str(path) for path in persisted.get("face_crops") or [])
+        persisted_bodies = sorted(str(path) for path in persisted.get("body_crops") or [])
+        evidence_keys = sorted(key for key, _path in faces + bodies)
+        record = {
+            "live_identity_id": live_id,
+            "job_id": self._job_id,
+            "decision": result.decision.value,
+            "reason": result.reason.value,
+            "provisional": False,
+            "canonical_person_id": result.person_id,
+            "suggestion_id": result.suggestion_id,
+            "candidate_person_id": result.top_candidate_person_id,
+            "candidate_similarity": _rounded(result.top_similarity),
+            "second_candidate_person_id": result.second_candidate_person_id,
+            "second_candidate_similarity": _rounded(result.second_similarity),
+            "margin": _rounded(result.margin),
+            "decision_version": version,
+            "observation_count": face_count,
+            "evidence_keys": evidence_keys,
+            "persisted_evidence_keys": evidence_keys,
+            "persisted_observation_count": face_count,
+            "last_appended_analysis_version": snapshot.version,
+            "last_evidence_signature": signature,
+            "source_face_crops": sorted(path for _key, path in faces),
+            "source_body_crops": sorted(path for _key, path in bodies),
+            "persisted_face_crops": persisted_faces,
+            "persisted_body_crops": persisted_bodies,
+            "canonical_face_paths": persisted_faces,
+            "canonical_body_paths": persisted_bodies,
+            "persisted_face_count": len(persisted_faces),
+            "persisted_body_count": len(persisted_bodies),
+        }
+        with self._condition:
+            self._identity_decision_keys.add(key)
+            self._identity_decision_records[live_id] = record
+            self._identity_provisional.pop(live_id, None)
+        return deepcopy(record)
+
+    def _append_new_evidence(
+        self,
+        *,
+        live_id: str,
+        record: dict,
+        faces: list[tuple[str, str]],
+        bodies: list[tuple[str, str]],
+        cluster: Mapping[str, Any],
+        snapshot: FrozenAnalysisSnapshot,
+        version: int,
+        signature: str,
+    ) -> dict:
+        """Route evidence observed after persistence through the append path."""
+        persisted_keys = set(record.get("persisted_evidence_keys") or [])
+        new_faces = [(k, p) for k, p in faces if k not in persisted_keys]
+        new_bodies = [(k, p) for k, p in bodies if k not in persisted_keys]
+        canonical = str(record.get("canonical_person_id") or "")
+
+        if (not new_faces and not new_bodies) or not canonical:
+            with self._condition:
+                updated = dict(record)
+                updated["last_evidence_signature"] = signature
+                self._identity_decision_records[live_id] = updated
+            return deepcopy(updated)
+
+        memory = self._open_decision_memory()
+        if memory is None:
+            return deepcopy(record)
+
+        from forensics.person_creation.media_lifecycle import relocate_profile_media
+
+        relocation = relocate_profile_media(
+            {
+                "face_crops": [path for _key, path in new_faces],
+                "body_crops": [path for _key, path in new_bodies],
+                "best_body_crops": [path for _key, path in new_bodies][:5],
+            },
+            canonical,
+            media_root=memory.media_root,
+        )
+        relocated = relocation.profile
+        appended = memory.append_identity_evidence(
+            canonical,
+            embedding=(
+                self._face_embedding_for_evidence(
+                    cluster,
+                    {key for key, _path in new_faces},
+                )
+                if new_faces else None
+            ),
+            observation_count=len(new_faces),
+            face_crops=list(relocated.get("face_crops") or []),
+            body_crops=list(relocated.get("body_crops") or []),
+            appearance={
+                "date": date.today().isoformat(),
+                "video_sources": list(snapshot.video_paths),
+            },
+            evidence_keys=[key for key, _path in new_faces + new_bodies],
+        )
+
+        with self._condition:
+            updated = dict(record)
+            updated["persisted_evidence_keys"] = sorted(
+                persisted_keys
+                | {key for key, _path in new_faces}
+                | {key for key, _path in new_bodies}
+            )
+            updated["evidence_keys"] = sorted(
+                set(updated.get("evidence_keys") or [])
+                | {key for key, _path in faces + bodies}
+            )
+            updated["persisted_face_crops"] = sorted(
+                set(updated.get("persisted_face_crops") or [])
+                | {str(path) for path in relocated.get("face_crops") or []}
+            )
+            updated["persisted_body_crops"] = sorted(
+                set(updated.get("persisted_body_crops") or [])
+                | {str(path) for path in relocated.get("body_crops") or []}
+            )
+            updated["persisted_face_count"] = len(updated["persisted_face_crops"])
+            updated["persisted_body_count"] = len(updated["persisted_body_crops"])
+            updated["canonical_face_paths"] = list(
+                updated["persisted_face_crops"]
+            )
+            updated["canonical_body_paths"] = list(
+                updated["persisted_body_crops"]
+            )
+            updated["persisted_observation_count"] = int(
+                updated.get("persisted_observation_count") or 0
+            ) + int(
+                appended.embedding_count_after - appended.embedding_count_before
+            )
+            updated["last_appended_analysis_version"] = snapshot.version
+            updated["last_evidence_signature"] = signature
+            self._identity_decision_records[live_id] = updated
+        return deepcopy(updated)
+
+    def _identity_state_and_version(
+        self,
+        live_id: str,
+        record: Mapping[str, Any] | None,
+    ) -> tuple[str, int]:
+        """Version increments only when the identity state itself changes."""
+        if record is None:
+            state = "observing"
+        elif record.get("provisional"):
+            state = "provisional"
+        else:
+            state = str(record.get("decision"))
+        with self._condition:
+            previous = self._identity_states.get(live_id)
+            if previous is None:
+                resolved = (state, 1)
+            elif previous[0] != state:
+                resolved = (state, previous[1] + 1)
+            else:
+                resolved = previous
+            self._identity_states[live_id] = resolved
+        return resolved
 
     def _build_events(
         self,

@@ -655,14 +655,27 @@ def test_canonical_finalize_uses_policy_and_returns_without_review_blocking(
     assert review_result.suggestion_id == 42
 
 
-def test_noncanonical_live_phone_stop_and_service_paths_remain_unintegrated():
+def test_phone_stop_and_service_paths_remain_unintegrated():
+    """Only the rolling analysis lane may reach the identity policy.
+
+    Phase 4 step 1 moved Phase 3E decisions into LiveRollingAnalysisSession so
+    identities are persisted while capture is active. The phone, stream and
+    service paths must still never register an identity themselves.
+    """
     live_source = inspect.getsource(live_analysis_module)
     stream_source = inspect.getsource(live_stream_module)
     phone_source = inspect.getsource(phone_photo_module)
     service_source = inspect.getsource(service_module)
 
+    # The rolling lane keeps its read-only preview handle *and* owns the
+    # authoritative Phase 3E decision.
     assert "read_only=True" in live_source
-    assert "register_with_identity_policy" not in live_source
+    assert "register_with_identity_policy" in live_source
+    # Live decisions must relocate evidence into the canonical person directory
+    # inside the identity transaction, so no _staging path is ever persisted.
+    assert "prepare_profile_for_person" in live_source
+    assert "relocate_profile_media" in live_source
+
     assert "register_with_identity_policy" not in stream_source
     assert "register_with_identity_policy" not in phone_source
     assert "register_with_identity_policy" not in service_source

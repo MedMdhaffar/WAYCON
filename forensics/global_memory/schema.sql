@@ -53,6 +53,20 @@ CREATE TABLE IF NOT EXISTS person_gallery (
     UNIQUE(person_id, crop_type, path)
 );
 
+CREATE TABLE IF NOT EXISTS identity_evidence (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    person_id TEXT NOT NULL REFERENCES persons(person_id),
+    evidence_key TEXT NOT NULL,
+    crop_type TEXT NOT NULL CHECK (crop_type IN ('face', 'body')),
+    canonical_path TEXT NOT NULL,
+    embedding_applied INTEGER NOT NULL DEFAULT 0
+        CHECK (embedding_applied IN (0, 1)),
+    observation_weight INTEGER NOT NULL DEFAULT 0
+        CHECK (observation_weight >= 0),
+    created_at TEXT NOT NULL,
+    UNIQUE(person_id, evidence_key)
+);
+
 CREATE TABLE IF NOT EXISTS counters (
     key    TEXT PRIMARY KEY,
     value  INTEGER NOT NULL DEFAULT 0
@@ -100,6 +114,8 @@ CREATE INDEX IF NOT EXISTS idx_log_event            ON recognition_log(event_typ
 CREATE INDEX IF NOT EXISTS idx_gallery_person       ON person_gallery(person_id);
 CREATE INDEX IF NOT EXISTS idx_gallery_type         ON person_gallery(crop_type);
 CREATE INDEX IF NOT EXISTS idx_gallery_sharpness    ON person_gallery(person_id, crop_type, sharpness DESC);
+CREATE INDEX IF NOT EXISTS idx_identity_evidence_person
+ON identity_evidence(person_id);
 CREATE UNIQUE INDEX IF NOT EXISTS uq_suggestion_pending
 ON identity_match_suggestions(source_person_id, candidate_person_id)
 WHERE status = 'pending';

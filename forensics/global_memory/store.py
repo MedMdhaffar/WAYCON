@@ -12,6 +12,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 import numpy as np
 
+from forensics.identity_evidence import identity_evidence_key
 from forensics.media_paths import (
     MediaPathError,
     get_media_root,
@@ -24,6 +25,7 @@ from .identity_policy import (
     IdentityCandidate,
     IdentityDecision,
     IdentityDecisionType,
+    IdentityEvidenceAppendResult,
     IdentityPolicyConfig,
     IdentityPolicyInputError,
     IdentityRegistrationResult,
@@ -60,6 +62,8 @@ from .review import (
 
 
 SQLITE_MAX_INTEGER = 2**63 - 1
+# A drive letter or any URI scheme marks a non-canonical absolute reference.
+_ABSOLUTE_MEDIA_PREFIX = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
 MERGE_WEIGHTED_NORM_RELATIVE_MINIMUM = 1e-8
 IDENTITY_REVIEW_DEFAULT_LIMIT = 50
 IDENTITY_REVIEW_MAX_LIMIT = 100
@@ -426,6 +430,7 @@ class GlobalMemory:
         low_confidence: bool = False,
         configuration: IdentityPolicyConfig | None = None,
         prepare_profile_for_person: Callable[[str, dict], dict] | None = None,
+        evidence_keys=None,
     ) -> IdentityRegistrationResult:
         """Apply the Phase 3E policy and persist one atomic identity outcome."""
         self._require_writable("register_with_identity_policy")
@@ -503,6 +508,17 @@ class GlobalMemory:
                         best_face_crop=best_face_crop,
                         strict=True,
                     )
+                    if evidence_keys is not None:
+                        evidence = self._identity_evidence_items(
+                            person_id,
+                            stored_profile,
+                            evidence_keys=evidence_keys,
+                        )
+                        self._insert_initial_identity_evidence(
+                            person_id,
+                            evidence,
+                            created_at=appearance_date,
+                        )
                 else:
                     person_id, name = self._next_person_id()
                     stored_profile, appearance_date, best_face_crop = (
@@ -533,6 +549,17 @@ class GlobalMemory:
                         best_face_crop=best_face_crop,
                         strict=True,
                     )
+                    if evidence_keys is not None:
+                        evidence = self._identity_evidence_items(
+                            person_id,
+                            stored_profile,
+                            evidence_keys=evidence_keys,
+                        )
+                        self._insert_initial_identity_evidence(
+                            person_id,
+                            evidence,
+                            created_at=appearance_date,
+                        )
                     if (
                         identity_decision.decision
                         is IdentityDecisionType.REVIEW_REQUIRED
@@ -556,6 +583,294 @@ class GlobalMemory:
 
         self._log_identity_decision(result)
         return result
+
+    def rank_identity_candidates(self, embedding) -> tuple[IdentityCandidate, ...]:
+        """Read-only Phase 3E candidate ranking used for provisional decisions."""
+        vector = self._validated_identity_embedding(embedding)
+        with self._lock:
+            return self._rank_active_identity_candidates(vector)
+
+    def identity_evidence_keys(self, person_id: str) -> frozenset[str]:
+        """Return durable evidence keys owned by the active canonical person."""
+        person_id = self._validated_merge_text(person_id, "person_id")
+        with self._lock:
+            canonical = self._resolve_canonical_person_id_locked(person_id)
+            rows = self._conn.execute(
+                "SELECT evidence_key FROM identity_evidence WHERE person_id=?",
+                (canonical,),
+            ).fetchall()
+            return frozenset(str(row["evidence_key"]) for row in rows)
+
+    def append_identity_evidence(
+        self,
+        person_id: str,
+        embedding=None,
+        observation_count: int = 0,
+        face_crops=None,
+        body_crops=None,
+        appearance=None,
+        evidence_keys=None,
+    ) -> IdentityEvidenceAppendResult:
+        """Atomically append evidence not already present in the durable ledger."""
+        self._require_writable("append_identity_evidence")
+        person_id = self._validated_merge_text(person_id, "person_id")
+        appearance = dict(appearance or {})
+        appearance_date = str(appearance.get("date") or date.today().isoformat())
+
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                canonical = self._resolve_canonical_person_id_locked(person_id)
+                count_before = self._get_embedding_count(canonical)
+                candidate_profile = {
+                    "face_crops": list(face_crops or []),
+                    "body_crops": list(body_crops or []),
+                }
+                evidence = self._identity_evidence_items(
+                    canonical,
+                    candidate_profile,
+                    evidence_keys=evidence_keys,
+                )
+                existing = {
+                    str(row["evidence_key"])
+                    for row in self._conn.execute(
+                        "SELECT evidence_key FROM identity_evidence WHERE person_id=?",
+                        (canonical,),
+                    ).fetchall()
+                }
+                unseen = [item for item in evidence if item[0] not in existing]
+                if not unseen:
+                    self._conn.execute("COMMIT")
+                    return IdentityEvidenceAppendResult(
+                        person_id=person_id,
+                        canonical_person_id=canonical,
+                        appended=False,
+                        idempotent_replay=True,
+                        appended_evidence_keys=(),
+                        embedding_count_before=count_before,
+                        embedding_count_after=count_before,
+                        gallery_rows_added=0,
+                    )
+
+                unseen_faces = [item for item in unseen if item[1] == "face"]
+                unseen_bodies = [item for item in unseen if item[1] == "body"]
+                requested = int(observation_count or 0)
+                if requested < 0:
+                    raise IdentityPolicyInputError(
+                        "observation_count must not be negative"
+                    )
+                if unseen_faces and requested not in (0, len(unseen_faces)):
+                    raise IdentityPolicyInputError(
+                        "observation_count must equal the unseen face evidence count"
+                    )
+                new_count = len(unseen_faces)
+                if count_before > SQLITE_MAX_INTEGER - new_count:
+                    raise IdentityPolicyInputError(
+                        "appended observation count would overflow"
+                    )
+
+                for key, crop_type, canonical_path in unseen:
+                    self._conn.execute(
+                        """
+                        INSERT INTO identity_evidence (
+                            person_id, evidence_key, crop_type, canonical_path,
+                            embedding_applied, observation_weight, created_at
+                        ) VALUES (?, ?, ?, ?, 0, ?, ?)
+                        """,
+                        (
+                            canonical,
+                            key,
+                            crop_type,
+                            canonical_path,
+                            1 if crop_type == "face" else 0,
+                            appearance_date,
+                        ),
+                    )
+
+                profile = {
+                    "face_crops": [item[2] for item in unseen_faces],
+                    "body_crops": [item[2] for item in unseen_bodies],
+                    "best_body_crops": [item[2] for item in unseen_bodies],
+                    "appearance": appearance,
+                    "face_crop_sharpness": (
+                        appearance.get("face_crop_sharpness") or {}
+                    ),
+                    "body_crop_sharpness": (
+                        appearance.get("body_crop_sharpness") or {}
+                    ),
+                    "video_sources": appearance.get("video_sources") or [],
+                }
+                gallery_before = self._gallery_row_count(canonical)
+                count_after = count_before
+                if unseen_faces:
+                    new_vec = self._validated_identity_embedding(embedding)
+                    count_after = self._update_embedding(
+                        person_id=canonical,
+                        embedding=new_vec,
+                        new_count=new_count,
+                        updated_at=appearance_date,
+                        profile=profile,
+                    )
+                    face_keys = [item[0] for item in unseen_faces]
+                    placeholders = ",".join("?" for _ in face_keys)
+                    self._conn.execute(
+                        "UPDATE identity_evidence SET embedding_applied=1 "
+                        f"WHERE person_id=? AND evidence_key IN ({placeholders})",
+                        (canonical, *face_keys),
+                    )
+                self._upsert_appearance(canonical, appearance_date, profile)
+                self.update_gallery(canonical, profile)
+                gallery_added = max(
+                    0,
+                    self._gallery_row_count(canonical) - gallery_before,
+                )
+                self._log_event(
+                    person_id=canonical,
+                    event_type="evidence_appended",
+                    similarity=None,
+                    embedding_count_before=count_before,
+                    embedding_count_after=count_after,
+                    video_sources=profile["video_sources"],
+                    best_face_crop=self._best_face_crop(profile),
+                    strict=True,
+                )
+                self._conn.execute("COMMIT")
+            except BaseException:
+                if self._conn.in_transaction:
+                    self._conn.execute("ROLLBACK")
+                raise
+
+        return IdentityEvidenceAppendResult(
+            person_id=person_id,
+            canonical_person_id=canonical,
+            appended=True,
+            idempotent_replay=False,
+            appended_evidence_keys=tuple(item[0] for item in unseen),
+            embedding_count_before=count_before,
+            embedding_count_after=count_after,
+            gallery_rows_added=gallery_added,
+        )
+
+    def _gallery_row_count(self, person_id: str) -> int:
+        row = self._conn.execute(
+            "SELECT COUNT(*) FROM person_gallery WHERE person_id=?",
+            (person_id,),
+        ).fetchone()
+        return int(row[0]) if row else 0
+
+    def _validated_canonical_media(
+        self,
+        values,
+        label: str,
+        canonical_person_id: str,
+        crop_type: str,
+    ) -> tuple[str, ...]:
+        """Accept existing ``person_NNN/<type>_crops`` references only."""
+        resolved: list[str] = []
+        for raw in values or []:
+            text = str(raw or "").strip().replace("\\", "/")
+            if not text:
+                continue
+            if text.startswith("/") or _ABSOLUTE_MEDIA_PREFIX.match(text):
+                raise MediaPathError(
+                    f"{label} must contain canonical relative media paths"
+                )
+            stored = normalize_media_path(
+                text,
+                media_root=self.media_root,
+                allow_legacy_absolute=False,
+                require_exists=True,
+            )
+            parts = stored.split("/")
+            if (
+                len(parts) < 3
+                or parts[0] != canonical_person_id
+                or parts[1] != f"{crop_type}_crops"
+                or any(
+                    part == "_staging"
+                    or part == "session"
+                    or re.fullmatch(r"cluster_[0-9]+", part)
+                    for part in parts
+                )
+            ):
+                raise MediaPathError(
+                    f"{label} must contain canonical {canonical_person_id}/"
+                    f"{crop_type}_crops paths"
+                )
+            if stored not in resolved:
+                resolved.append(stored)
+        return tuple(resolved)
+
+    def _identity_evidence_items(
+        self,
+        canonical_person_id: str,
+        profile: dict,
+        *,
+        evidence_keys=None,
+    ) -> tuple[tuple[str, str, str], ...]:
+        faces = self._validated_canonical_media(
+            profile.get("face_crops"),
+            "face_crops",
+            canonical_person_id,
+            "face",
+        )
+        bodies = self._validated_canonical_media(
+            profile.get("body_crops"),
+            "body_crops",
+            canonical_person_id,
+            "body",
+        )
+        items: list[tuple[str, str, str]] = []
+        seen: set[str] = set()
+        for crop_type, paths in (("face", faces), ("body", bodies)):
+            for path in paths:
+                key = identity_evidence_key(
+                    path,
+                    crop_type,
+                    media_root=self.media_root,
+                    allow_legacy_absolute=False,
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                items.append((key, crop_type, path))
+
+        supplied = {
+            str(key).strip()
+            for key in (evidence_keys or [])
+            if str(key).strip()
+        }
+        if evidence_keys is not None and supplied != seen:
+            raise IdentityPolicyInputError(
+                "evidence_keys do not match the supplied evidence contents"
+            )
+        return tuple(items)
+
+    def _insert_initial_identity_evidence(
+        self,
+        person_id: str,
+        evidence: tuple[tuple[str, str, str], ...],
+        *,
+        created_at: str,
+    ) -> None:
+        for key, crop_type, canonical_path in evidence:
+            self._conn.execute(
+                """
+                INSERT OR IGNORE INTO identity_evidence (
+                    person_id, evidence_key, crop_type, canonical_path,
+                    embedding_applied, observation_weight, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    person_id,
+                    key,
+                    crop_type,
+                    canonical_path,
+                    1 if crop_type == "face" else 0,
+                    1 if crop_type == "face" else 0,
+                    created_at,
+                ),
+            )
 
     def resolve_canonical_person_id(self, person_id: str) -> str:
         """Resolve one active identity or one direct inactive redirect."""
@@ -1228,7 +1543,32 @@ class GlobalMemory:
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_persons_active ON persons(is_active)"
         )
+        self._ensure_identity_evidence_schema()
         self._ensure_identity_merge_audit_schema()
+
+    def _ensure_identity_evidence_schema(self) -> None:
+        """Create the Phase 4 ledger when opening a pre-Phase 4 database."""
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS identity_evidence (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                person_id TEXT NOT NULL REFERENCES persons(person_id),
+                evidence_key TEXT NOT NULL,
+                crop_type TEXT NOT NULL CHECK (crop_type IN ('face', 'body')),
+                canonical_path TEXT NOT NULL,
+                embedding_applied INTEGER NOT NULL DEFAULT 0
+                    CHECK (embedding_applied IN (0, 1)),
+                observation_weight INTEGER NOT NULL DEFAULT 0
+                    CHECK (observation_weight >= 0),
+                created_at TEXT NOT NULL,
+                UNIQUE(person_id, evidence_key)
+            )
+            """
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_identity_evidence_person "
+            "ON identity_evidence(person_id)"
+        )
 
     def _ensure_identity_merge_audit_schema(self) -> None:
         columns = {

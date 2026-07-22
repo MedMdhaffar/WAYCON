@@ -66,6 +66,17 @@ def _notify(state: dict, status: str, snapshot_update: dict | None = None) -> No
         callback(status, snapshot_update)
 
 
+def _collect_identity_decisions(analysis_session: Any | None) -> list[dict]:
+    """Return live identity receipts from any rolling-analysis implementation."""
+    collect = getattr(analysis_session, "identity_decisions", None)
+    if not callable(collect):
+        return []
+    try:
+        return [dict(record) for record in collect()]
+    except Exception:
+        return []
+
+
 def _stop_requested(stop_event: Any | None) -> bool:
     return bool(stop_event is not None and stop_event.is_set())
 
@@ -333,6 +344,8 @@ def process_live_stream(state: PersonCreationState) -> dict:
                 snapshot_provider=preprocessing_session.analysis_snapshot,
                 notify=publish_analysis,
                 join_timeout_seconds=analysis_join_timeout,
+                job_id=state.get("_job_id"),
+                identity_decisions=True,
             )
     # Evidence is intentionally not pruned here; long sessions can create many
     # crop files in _staging before the unchanged downstream graph runs once.
@@ -666,6 +679,9 @@ def process_live_stream(state: PersonCreationState) -> dict:
         "source_uri_masked": masked_uri,
         "stream_stats": stats,
         "stream_report_path": report_path,
+        # Identities already persisted to Global Memory while capture was live;
+        # finalize reuses these instead of registering a second person.
+        "live_identity_decisions": _collect_identity_decisions(analysis_session),
     }
     print("[process_live_stream] returning accumulated state", flush=True)
     return result

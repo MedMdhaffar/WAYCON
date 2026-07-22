@@ -175,6 +175,8 @@ _MEDIA_VALUE_KEYS = {
     "profile_image",
     "best_face_crop",
     "selected_body_crop",
+    "best_face_path",
+    "best_body_path",
 }
 _MEDIA_LIST_KEYS = {"face_crops", "body_crops", "best_body_crops"}
 
@@ -332,6 +334,7 @@ def _run_pipeline(job_id: str, initial_state: dict) -> None:
 
     if initial_state.get("input_type") == "camera_uri":
         initial_state["_status_callback"] = update_live_status
+        initial_state["_job_id"] = job_id
         if runtime is not None:
             initial_state["_stop_event"] = runtime.stop_event
 
