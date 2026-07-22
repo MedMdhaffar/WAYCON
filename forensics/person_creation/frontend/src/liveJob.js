@@ -40,6 +40,42 @@ const ROLLING_STATE_LABELS = {
   error: 'Error',
 }
 
+const LIVE_IDENTITY_STATES = new Set([
+  'observing', 'provisional', 'new_person', 'attach_existing', 'review_required',
+])
+const LIVE_IDENTITY_DECISIONS = new Set([
+  'new_person', 'attach_existing', 'review_required',
+])
+const LIVE_IDENTITY_STATE_RANK = {
+  observing: 0,
+  provisional: 1,
+  new_person: 2,
+  attach_existing: 2,
+  review_required: 2,
+}
+const VLM_STATES = new Set([
+  'not_started', 'queued', 'processing', 'completed', 'failed', 'timed_out',
+])
+const VLM_STATE_RANK = {
+  not_started: 0,
+  queued: 1,
+  processing: 2,
+  completed: 3,
+  failed: 3,
+  timed_out: 3,
+}
+const VLM_ERRORS = new Set([
+  'image_decode_failed', 'inference_error', 'invalid_output', 'empty_output',
+  'no_valid_body_crop', 'persistence_error', 'queue_capacity', 'timeout',
+])
+const VLM_COUNTER_FIELDS = [
+  'vlm_completed', 'vlm_failed', 'vlm_dropped', 'vlm_timed_out',
+]
+const VLM_IDENTITY_FIELDS = [
+  'vlm_status', 'clothing_description', 'clothing_diagnostics', 'vlm_error',
+  'vlm_version', 'selected_body_crop',
+]
+
 /**
  * @typedef {Object} RollingMemoryMatch
  * @property {string} personId
@@ -126,6 +162,22 @@ export function identityImageUrl(path) {
   return mediaImageUrl(path)
 }
 
+export function canonicalLiveCropPath(path, cropType) {
+  const safePath = stringValue(path)
+  const folder = cropType === 'face' ? 'face_crops' : cropType === 'body' ? 'body_crops' : ''
+  if (!folder || !mediaImageUrl(safePath)) return ''
+  const match = safePath.match(/^person_[0-9]+\/(face_crops|body_crops)\/([^/]+)$/)
+  if (!match || match[1] !== folder) return ''
+  if (!/\.(?:jpe?g|png|webp|bmp)$/i.test(match[2])) return ''
+  return safePath
+}
+
+export function sanitizeVlmError(value) {
+  const error = stringValue(value).toLowerCase()
+  if (!error) return ''
+  return VLM_ERRORS.has(error) ? error : 'inference_error'
+}
+
 export function formatSimilarity(value) {
   const similarity = finiteNumber(value)
   if (similarity === null) return null
@@ -140,18 +192,50 @@ export function normalizeRollingAnalysis(value) {
   const identities = []
   for (const rawValue of rawIdentities) {
     const raw = objectOrEmpty(rawValue)
-    const sessionPersonId = stringValue(raw.session_person_id)
-    if (!sessionPersonId || identityIds.has(sessionPersonId)) continue
-    identityIds.add(sessionPersonId)
+    const liveIdentityId = stringValue(raw.live_identity_id ?? raw.session_person_id)
+    if (!liveIdentityId || identityIds.has(liveIdentityId)) continue
+    identityIds.add(liveIdentityId)
+    const sessionPersonId = stringValue(raw.session_person_id, liveIdentityId)
+    const decisionValue = stringValue(raw.decision).toLowerCase()
+    const decision = LIVE_IDENTITY_DECISIONS.has(decisionValue) ? decisionValue : ''
+    const stateValue = stringValue(raw.state).toLowerCase()
+    const state = LIVE_IDENTITY_STATES.has(stateValue)
+      ? stateValue
+      : decision || (raw.provisional === true ? 'provisional' : 'observing')
+    const vlmValue = stringValue(raw.vlm_status, 'not_started').toLowerCase()
+    const vlmStatus = VLM_STATES.has(vlmValue) ? vlmValue : 'failed'
     identities.push({
+      liveIdentityId,
       sessionPersonId,
+      version: nonNegativeInteger(raw.version),
       clusterLabel: finiteNumber(raw.cluster_label),
       status: stringValue(raw.status, 'provisional'),
+      state,
+      decision,
+      provisional: raw.provisional === true,
+      canonicalPersonId: stringValue(raw.canonical_person_id),
       faceCount: nonNegativeInteger(raw.face_count),
-      associatedBodyCount: nonNegativeInteger(raw.associated_body_count),
+      bodyCount: nonNegativeInteger(raw.body_count ?? raw.associated_body_count),
+      associatedBodyCount: nonNegativeInteger(raw.body_count ?? raw.associated_body_count),
+      candidatePersonId: stringValue(raw.candidate_person_id),
+      candidateSimilarity: finiteNumber(raw.candidate_similarity),
+      margin: finiteNumber(raw.margin),
       firstSeenChunk: finiteNumber(raw.first_seen_chunk),
       lastSeenChunk: finiteNumber(raw.last_seen_chunk),
-      representativeFacePath: stringValue(raw.representative_face_path),
+      bestFacePath: canonicalLiveCropPath(
+        raw.best_face_path ?? raw.representative_face_path,
+        'face',
+      ),
+      representativeFacePath: canonicalLiveCropPath(
+        raw.best_face_path ?? raw.representative_face_path,
+        'face',
+      ),
+      bestBodyPath: canonicalLiveCropPath(raw.best_body_path, 'body'),
+      vlmStatus,
+      selectedBodyCrop: canonicalLiveCropPath(raw.selected_body_crop, 'body'),
+      clothingDescription: stringValue(raw.clothing_description),
+      vlmError: sanitizeVlmError(raw.vlm_error),
+      vlmVersion: finiteNumber(raw.vlm_version),
       memoryMatch: normalizeMemoryMatch(raw.memory_match),
     })
   }
@@ -193,10 +277,133 @@ export function normalizeRollingAnalysis(value) {
     analyzedEmbeddingCount: nonNegativeInteger(rolling.analyzed_embedding_count),
     lastCompletedChunk: finiteNumber(rolling.last_completed_preprocessing_chunk),
     warning: stringValue(rolling.analysis_warning),
+    vlmQueueDepth: nonNegativeInteger(rolling.vlm_queue_depth),
+    vlmQueueCapacity: nonNegativeInteger(rolling.vlm_queue_capacity, 2),
+    vlmActiveIdentity: stringValue(rolling.vlm_active_identity),
+    vlmCompleted: nonNegativeInteger(rolling.vlm_completed),
+    vlmFailed: nonNegativeInteger(rolling.vlm_failed),
+    vlmDropped: nonNegativeInteger(rolling.vlm_dropped),
+    vlmTimedOut: nonNegativeInteger(rolling.vlm_timed_out),
     identities,
     events,
     faceEvidenceCount: identities.reduce((total, identity) => total + identity.faceCount, 0),
   }
+}
+
+function rawLiveIdentityId(value) {
+  const raw = objectOrEmpty(value)
+  return stringValue(raw.live_identity_id ?? raw.session_person_id)
+}
+
+function rawStateRank(value) {
+  const raw = objectOrEmpty(value)
+  const decision = stringValue(raw.decision).toLowerCase()
+  const state = stringValue(raw.state).toLowerCase()
+  const normalized = LIVE_IDENTITY_STATES.has(state)
+    ? state
+    : LIVE_IDENTITY_DECISIONS.has(decision) ? decision : 'observing'
+  return LIVE_IDENTITY_STATE_RANK[normalized]
+}
+
+function preserveVlm(previousIdentity, incomingIdentity) {
+  const merged = { ...incomingIdentity }
+  for (const field of VLM_IDENTITY_FIELDS) {
+    if (Object.hasOwn(previousIdentity, field)) merged[field] = previousIdentity[field]
+  }
+  return merged
+}
+
+function mergeLiveIdentity(previousValue, incomingValue, staleVlm) {
+  const previous = objectOrEmpty(previousValue)
+  const incoming = objectOrEmpty(incomingValue)
+  const previousVersion = nonNegativeInteger(previous.version)
+  const incomingVersion = nonNegativeInteger(incoming.version)
+  if (incomingVersion < previousVersion) return previous
+
+  let merged = { ...previous, ...incoming }
+  if (
+    incomingVersion === previousVersion
+    && rawStateRank(incoming) < rawStateRank(previous)
+  ) {
+    for (const field of [
+      'state', 'decision', 'provisional', 'canonical_person_id', 'suggestion_id',
+      'candidate_person_id', 'candidate_similarity', 'margin',
+    ]) {
+      if (Object.hasOwn(previous, field)) merged[field] = previous[field]
+    }
+  }
+
+  const previousVlmVersion = finiteNumber(previous.vlm_version)
+  const incomingVlmVersion = finiteNumber(incoming.vlm_version)
+  const previousCrop = stringValue(previous.selected_body_crop)
+  const incomingCrop = stringValue(incoming.selected_body_crop)
+  const previousVlmState = stringValue(previous.vlm_status, 'not_started').toLowerCase()
+  const incomingVlmState = stringValue(incoming.vlm_status, 'not_started').toLowerCase()
+  const versionRegressed = (
+    previousVlmVersion !== null
+    && incomingVlmVersion !== null
+    && incomingVlmVersion < previousVlmVersion
+  )
+  const stateRegressed = (
+    previousVlmVersion === incomingVlmVersion
+    && previousCrop === incomingCrop
+    && (VLM_STATE_RANK[incomingVlmState] ?? 0) < (VLM_STATE_RANK[previousVlmState] ?? 0)
+  )
+  if (staleVlm || versionRegressed || stateRegressed) {
+    merged = preserveVlm(previous, merged)
+  }
+
+  const previousCompleted = previousVlmState === 'completed'
+  if (
+    previousCompleted
+    && !stringValue(merged.clothing_description)
+    && (incomingVlmVersion === null || incomingVlmVersion === previousVlmVersion)
+  ) {
+    merged.clothing_description = previous.clothing_description
+    if (!stringValue(incoming.vlm_status)) merged.vlm_status = previous.vlm_status
+    if (!stringValue(incoming.selected_body_crop)) {
+      merged.selected_body_crop = previous.selected_body_crop
+    }
+  }
+  return merged
+}
+
+function mergeRollingPayload(previousRolling, incomingRolling) {
+  const countersRegressed = VLM_COUNTER_FIELDS.some(field => (
+    finiteNumber(incomingRolling[field]) !== null
+    && finiteNumber(previousRolling[field]) !== null
+    && Number(incomingRolling[field]) < Number(previousRolling[field])
+  ))
+  const merged = { ...previousRolling, ...incomingRolling }
+  const previousIdentities = new Map(
+    (Array.isArray(previousRolling.live_identities) ? previousRolling.live_identities : [])
+      .map(identity => [rawLiveIdentityId(identity), identity])
+      .filter(([identityId]) => identityId),
+  )
+  if (Array.isArray(incomingRolling.live_identities)) {
+    const seen = new Set()
+    merged.live_identities = []
+    for (const identity of incomingRolling.live_identities) {
+      const identityId = rawLiveIdentityId(identity)
+      if (!identityId || seen.has(identityId)) continue
+      seen.add(identityId)
+      const previous = previousIdentities.get(identityId)
+      merged.live_identities.push(
+        previous ? mergeLiveIdentity(previous, identity, countersRegressed) : identity,
+      )
+    }
+  }
+  for (const field of VLM_COUNTER_FIELDS) {
+    const previous = finiteNumber(previousRolling[field])
+    const incoming = finiteNumber(incomingRolling[field])
+    if (previous !== null || incoming !== null) merged[field] = Math.max(previous ?? 0, incoming ?? 0)
+  }
+  if (countersRegressed) {
+    merged.vlm_queue_depth = previousRolling.vlm_queue_depth
+    merged.vlm_queue_capacity = previousRolling.vlm_queue_capacity
+    merged.vlm_active_identity = previousRolling.vlm_active_identity
+  }
+  return merged
 }
 
 export function mergeJobStatus(previous, incoming) {
@@ -206,13 +413,20 @@ export function mergeJobStatus(previous, incoming) {
   const incomingSnapshot = objectOrEmpty(incoming.snapshot)
   const previousMediaVersion = nonNegativeInteger(previous?.snapshot?.media_lifecycle_version)
   const incomingMediaVersion = nonNegativeInteger(incomingSnapshot.media_lifecycle_version)
-  if (incomingMediaVersion !== previousMediaVersion) return incoming
+  if (incomingMediaVersion < previousMediaVersion) return previous
+  if (incomingMediaVersion > previousMediaVersion) return incoming
   const incomingRolling = objectOrEmpty(incomingSnapshot.rolling_analysis)
   if (previousRolling.enabled !== true) return incoming
 
-  const previousSequence = nonNegativeInteger(previousRolling.publication_sequence)
-  const incomingSequence = nonNegativeInteger(incomingRolling.publication_sequence)
-  if (incomingRolling.enabled === true && incomingSequence < previousSequence) {
+  const monotonicRollingFields = [
+    'publication_sequence', 'requested_version', 'analysis_version',
+    'last_completed_preprocessing_chunk',
+  ]
+  if (incomingRolling.enabled === true && monotonicRollingFields.some(field => (
+    finiteNumber(incomingRolling[field]) !== null
+    && finiteNumber(previousRolling[field]) !== null
+    && Number(incomingRolling[field]) < Number(previousRolling[field])
+  ))) {
     return previous
   }
   if (incomingRolling.enabled !== true) {
@@ -222,15 +436,21 @@ export function mergeJobStatus(previous, incoming) {
     }
   }
   const state = rollingState(incomingRolling.analysis_state, true)
-  if (state !== 'warning' && state !== 'error') return incoming
+  const mergedRolling = mergeRollingPayload(previousRolling, incomingRolling)
+  if (state !== 'warning' && state !== 'error') {
+    return {
+      ...incoming,
+      snapshot: { ...incomingSnapshot, rolling_analysis: mergedRolling },
+    }
+  }
   return {
     ...incoming,
     snapshot: {
       ...incomingSnapshot,
       rolling_analysis: {
-        ...incomingRolling,
+        ...mergedRolling,
         live_identities: Array.isArray(incomingRolling.live_identities) && incomingRolling.live_identities.length
-          ? incomingRolling.live_identities
+          ? mergedRolling.live_identities
           : previousRolling.live_identities,
         live_recognition_events: Array.isArray(incomingRolling.live_recognition_events) && incomingRolling.live_recognition_events.length
           ? incomingRolling.live_recognition_events

@@ -131,29 +131,52 @@ body {
   font-size: 15px;
   overflow-wrap: anywhere;
 }
+.live-vlm-diagnostics {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: -4px 0 16px;
+  overflow-x: auto;
+  color: #8792a5;
+  font-size: 11px;
+}
+.live-vlm-diagnostics span {
+  flex: 0 0 auto;
+  border: 1px solid #252b38;
+  border-radius: 999px;
+  padding: 5px 8px;
+  background: #0f1117;
+}
+.live-vlm-diagnostics strong { color: #cbd5e1; }
 .live-identity-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(min(100%, 290px), 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 370px), 1fr));
   gap: 12px;
 }
 .live-identity-card {
-  display: grid;
-  grid-template-columns: 112px minmax(0, 1fr);
   min-width: 0;
-  min-height: 150px;
   overflow: hidden;
   border: 1px solid #2a6047;
   border-radius: 8px;
   background: #101821;
 }
 .live-identity-card.is-unknown { border-color: #596273; border-style: dashed; }
+.live-identity-media {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  height: 180px;
+  border-bottom: 1px solid #252b38;
+  background: #0b0d12;
+}
 .live-identity-image,
 .live-identity-image-placeholder {
-  width: 112px;
+  width: 100%;
   height: 100%;
-  min-height: 150px;
+  min-height: 180px;
   display: block;
 }
+.live-identity-image.is-face,
+.live-identity-image-placeholder.is-face { border-right: 1px solid #252b38; }
 .live-identity-image { object-fit: cover; background: #0b0d12; }
 .live-identity-image-placeholder {
   display: flex;
@@ -176,7 +199,31 @@ body {
 }
 .live-identity-similarity { color: #73d6a3; font-size: 12px; font-weight: 600; }
 .live-identity-id { margin-top: 5px; color: #8792a5; font: 12px ui-monospace, SFMono-Regular, Consolas, monospace; }
+.live-identity-facts {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+  margin-top: 11px;
+}
+.live-identity-facts div { min-width: 0; border: 1px solid #1e2835; border-radius: 5px; padding: 6px 7px; }
+.live-identity-facts dt { color: #64748b; font-size: 10px; }
+.live-identity-facts dd { margin-top: 2px; color: #cbd5e1; font-size: 11px; overflow-wrap: anywhere; text-transform: capitalize; }
 .live-identity-evidence { display: grid; gap: 2px; margin: 9px 0; color: #a6b0bf; font-size: 12px; }
+.live-identity-paths,
+.live-identity-selected-crop { display: grid; grid-template-columns: 82px minmax(0, 1fr); gap: 4px 7px; align-items: baseline; }
+.live-identity-paths span,
+.live-identity-selected-crop span { color: #64748b; font-size: 10px; }
+.live-identity-paths code,
+.live-identity-selected-crop code { color: #8792a5; font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.live-vlm-state { display: grid; gap: 8px; margin: 11px 0; border: 1px solid #29364a; border-radius: 6px; padding: 9px; background: #101723; }
+.live-vlm-state > div:first-child { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.live-vlm-state > div:first-child span { color: #7c9ef8; font-size: 10px; font-weight: 700; text-transform: uppercase; }
+.live-vlm-state > div:first-child strong { color: #cbd5e1; font-size: 11px; text-transform: capitalize; }
+.live-vlm-state p { color: #cbd5e1; font-size: 12px; line-height: 1.45; overflow-wrap: anywhere; }
+.live-vlm-state.is-completed { border-color: #2a6047; background: #10221b; }
+.live-vlm-state.is-failed,
+.live-vlm-state.is-timed_out { border-color: #8a641c; background: #2a2111; }
+.live-vlm-error { color: #f6c96c; font-size: 11px; text-transform: capitalize; }
 .live-identity-empty {
   padding: 22px 12px;
   border: 1px dashed #303747;
@@ -316,9 +363,9 @@ body {
   .tab-btn { flex: 0 0 auto; padding: 11px 12px; }
   .tab-content { padding: 14px; }
   .card { padding: 14px; }
-  .live-identity-card { grid-template-columns: 88px minmax(0, 1fr); }
+  .live-identity-media { height: 150px; }
   .live-identity-image,
-  .live-identity-image-placeholder { width: 88px; min-height: 160px; }
+  .live-identity-image-placeholder { min-height: 150px; }
   .live-events li { align-items: flex-start; flex-direction: column; gap: 2px; }
   .live-events small { text-align: left; }
   .identity-review-layout { grid-template-columns: 1fr; }

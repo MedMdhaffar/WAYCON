@@ -38,12 +38,20 @@ export default function LiveIdentityPanel({ rollingAnalysis, finalizing = false 
       )}
 
       <LiveIdentitySummary analysis={analysis} />
+      <div className="live-vlm-diagnostics" aria-label="Live clothing analysis diagnostics">
+        <span><strong>{analysis.vlmQueueDepth}</strong> / {analysis.vlmQueueCapacity} queued</span>
+        <span>Active: <strong>{analysis.vlmActiveIdentity || 'None'}</strong></span>
+        <span>Completed: <strong>{analysis.vlmCompleted}</strong></span>
+        <span>Failed: <strong>{analysis.vlmFailed}</strong></span>
+        <span>Dropped: <strong>{analysis.vlmDropped}</strong></span>
+        <span>Timed out: <strong>{analysis.vlmTimedOut}</strong></span>
+      </div>
       {message && <div className="live-identity-empty">{message}</div>}
 
       {!!analysis.identities.length && (
         <div className="live-identity-grid">
           {analysis.identities.map(identity => (
-            <LiveIdentityCard key={identity.sessionPersonId} identity={identity} />
+            <LiveIdentityCard key={identity.liveIdentityId} identity={identity} />
           ))}
         </div>
       )}

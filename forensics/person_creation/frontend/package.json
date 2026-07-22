@@ -8,6 +8,7 @@
     "build": "vite build",
     "preview": "vite preview",
     "test:live": "node scripts/validate-live-controls.mjs",
+    "test:live-identities": "node scripts/validate-live-identity-cards.mjs",
     "test:identity-review": "node scripts/validate-identity-review-component.mjs",
     "test:media-lifecycle": "node scripts/validate-media-lifecycle-component.mjs"
   },
