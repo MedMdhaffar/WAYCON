@@ -2,7 +2,7 @@ import { useState } from 'react'
 
 const DEFAULT_VIDEOS = ['']
 
-export default function StartForm({ onStart }) {
+export default function StartForm({ onStart, onRealtimeStart }) {
   const [name, setName] = useState('Malek')
   const [inputType, setInputType] = useState('video_file')
   const [videos, setVideos] = useState(DEFAULT_VIDEOS)
@@ -25,23 +25,33 @@ export default function StartForm({ onStart }) {
     setPathErrors([])
     setLoading(true)
     try {
-      const sourcePayload = inputType === 'camera_uri'
-        ? {
-            input_type: 'camera_uri',
+      if (inputType === 'camera_uri') {
+        // Camera capture is continuous, not a one-shot job -- runs as a
+        // background realtime processor until explicitly stopped, see
+        // /api/realtime/start in service.py.
+        const res = await fetch('/api/realtime/start', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
             camera_uri: cameraUri.trim(),
             camera_id: cameraId.trim() || undefined,
-            duration_seconds: Number(durationSeconds),
-          }
-        : {
-            input_type: 'video_file',
-            video_paths: videos.filter(v => v.trim()),
-          }
+            output_dir: outputDir,
+            process_every_n: everyN,
+          }),
+        })
+        const data = await res.json()
+        if (!res.ok || data.error) throw new Error(data.error || `HTTP ${res.status}`)
+        onRealtimeStart(data.camera_id)
+        return
+      }
+
       const res = await fetch('/api/person/start', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           name,
-          ...sourcePayload,
+          input_type: 'video_file',
+          video_paths: videos.filter(v => v.trim()),
           output_dir: outputDir,
           every_n: everyN,
         }),
@@ -117,26 +127,13 @@ export default function StartForm({ onStart }) {
                 required
               />
               <div style={{ color: '#64748b', fontSize: 12, marginTop: 6 }}>
-                RTSP/HTTP camera URI. Passwords are masked in backend logs.
+                RTSP/HTTP camera URI. Passwords are masked in backend logs. Capture
+                runs continuously (presence-gated) until stopped -- not a fixed duration.
               </div>
             </div>
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
-              <div>
-                <label style={labelStyle}>Camera ID (optional)</label>
-                <input style={inputStyle} value={cameraId} onChange={e => setCameraId(e.target.value)} placeholder="103" />
-              </div>
-              <div>
-                <label style={labelStyle}>Duration (seconds)</label>
-                <input
-                  style={inputStyle}
-                  type="number"
-                  min={5}
-                  max={300}
-                  value={durationSeconds}
-                  onChange={e => setDurationSeconds(Number(e.target.value))}
-                  required
-                />
-              </div>
+            <div>
+              <label style={labelStyle}>Camera ID (optional, defaults to "default")</label>
+              <input style={inputStyle} value={cameraId} onChange={e => setCameraId(e.target.value)} placeholder="cam1" />
             </div>
           </>
         )}

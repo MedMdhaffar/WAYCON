@@ -2,20 +2,23 @@ import { useState, useEffect, useRef, useCallback } from 'react'
 import StartForm from './components/StartForm.jsx'
 import ProgressTracker from './components/ProgressTracker.jsx'
 import LiveStreamStats from './components/LiveStreamStats.jsx'
+import RealtimeMonitor from './components/RealtimeMonitor.jsx'
 import CropsGrid from './components/CropsGrid.jsx'
 import AssociationsView from './components/AssociationsView.jsx'
 import ClothingPanel from './components/ClothingPanel.jsx'
 import ReviewPanel from './components/ReviewPanel.jsx'
 import ProfileManager from './components/ProfileManager.jsx'
 import MemoryTab from './components/MemoryTab.jsx'
+import DebugPanel from './components/DebugPanel.jsx'
 
-const TABS = ['Setup', 'Progress & Crops', 'Results', 'Memory']
+const TABS = ['Setup', 'Progress & Crops', 'Results', 'Memory', 'Debug']
 
 export default function App() {
   const [mode, setMode] = useState('enroll')   // 'enroll' | 'manage'
   const [tab, setTab] = useState(0)
   const [jobId, setJobId] = useState(null)
   const [jobStatus, setJobStatus] = useState(null)
+  const [realtimeCameraId, setRealtimeCameraId] = useState(null)
   const pollRef = useRef(null)
 
   const fetchStatus = useCallback(async (id) => {
@@ -42,8 +45,16 @@ export default function App() {
   }, [jobId, fetchStatus])
 
   const handleStart = (id) => {
+    setRealtimeCameraId(null)
     setJobId(id)
     setJobStatus(null)
+    setTab(1)
+  }
+
+  const handleRealtimeStart = (cameraId) => {
+    setJobId(null)
+    setJobStatus(null)
+    setRealtimeCameraId(cameraId)
     setTab(1)
   }
 
@@ -62,6 +73,9 @@ export default function App() {
         <h1>Forensics — Person Creation</h1>
         {mode === 'enroll' && jobStatus && (
           <span>Job: {jobId?.slice(0, 8)} · {jobStatus.status}</span>
+        )}
+        {mode === 'enroll' && realtimeCameraId && (
+          <span>Camera: {realtimeCameraId} · live</span>
         )}
         <div style={{ marginLeft: 'auto', display: 'flex', gap: 4 }}>
           <button
@@ -93,7 +107,7 @@ export default function App() {
                 key={label}
                 className={`tab-btn${tab === i ? ' active' : ''}`}
                 onClick={() => setTab(i)}
-                disabled={i > 0 && i !== 3 && !jobId}
+                disabled={i > 0 && i !== 3 && i !== 4 && !jobId && !realtimeCameraId}
               >
                 {label}
               </button>
@@ -101,9 +115,16 @@ export default function App() {
           </div>
 
           <div className="tab-content">
-            {tab === 0 && <StartForm onStart={handleStart} />}
+            {tab === 0 && <StartForm onStart={handleStart} onRealtimeStart={handleRealtimeStart} />}
 
-        {tab === 1 && (
+        {tab === 1 && realtimeCameraId && (
+          <RealtimeMonitor
+            cameraId={realtimeCameraId}
+            onStopped={() => setRealtimeCameraId(null)}
+          />
+        )}
+
+        {tab === 1 && jobId && (
           <>
             <ProgressTracker
               status={jobStatus?.status}
@@ -144,6 +165,8 @@ export default function App() {
         )}
 
         {tab === 3 && <MemoryTab />}
+
+        {tab === 4 && <DebugPanel />}
           </div>
         </>
       )}

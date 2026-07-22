@@ -1,36 +1,34 @@
-"""HTTP service: monitoring/query API in front of Postgres, plus offline
-video-file enrollment job launching.
+"""HTTP service: single entry point for both offline video-file enrollment and
+realtime camera capture, plus monitoring/query endpoints in front of Postgres.
 
-Camera ingestion is NOT triggered from here anymore -- it's realtime_main.py's
-job, a separate long-lived process that continuously consumes one camera via
-GStreamer, presence-gated segmentation, and the same LangGraph pipeline this
-module used to spin up per HTTP request. That per-request threading.Thread +
-in-memory `_jobs` dict model never mapped onto "one resident process
-continuously consuming one camera" -- a request-scoped job that opens an RTSP
-connection, captures for a fixed duration, and tears back down doesn't compose
-with continuous presence-gated capture, and `_jobs` living only in this
-process's memory meant every job's status was lost on restart with no
-persistence or locking around concurrent access.
+Camera ingestion runs as a RealtimeProcessor (realtime_main.py) started as a
+background thread *inside this same process* via RealtimeManager -- not a
+separate `python -m realtime_main` OS process. That per-request
+threading.Thread + in-memory `_jobs` dict model for offline jobs doesn't map
+onto "continuously consume one camera", so realtime cameras get their own
+lifecycle (/api/realtime/start|stop|status|list) instead of /api/person/start's
+one-shot job-status polling. A camera keeps running across requests until
+explicitly stopped; each closed segment runs the same LangGraph pipeline
+offline jobs use, bookkept via GlobalMemory segments/camera_events rather than
+the in-memory `_jobs` dict.
 
-What's left here:
+What's here:
+  - /api/person/start(+status) -- offline video-file enrollment
+    (input_type=video_file), request/response job model, in-memory `_jobs`.
+  - /api/realtime/start|stop|status|list -- camera capture lifecycle, backed by
+    RealtimeManager (realtime_main.RealtimeManager), one entry per camera_id.
+    Running a dedicated `python -m forensics.person_creation.realtime_main` OS
+    process per camera remains supported for anyone who wants full process
+    isolation; this is the in-process alternative for the common single-camera
+    case, sharing this process's already-resident models.
   - Monitoring/query endpoints reading straight from GlobalMemory (Postgres) --
-    /api/segments*, /api/clothing-jobs, /api/memory/* -- these were always
-    stateless reads/writes against the DB, not pipeline-dependent, so they're
-    unaffected by any of this.
-  - /api/person/start still exists, but ONLY for offline video-file enrollment
-    (input_type=video_file) -- kept because PERSON_CREATION_DOC.md documents
-    offline enrollment as a prerequisite step, and a video file is naturally a
-    bounded, one-shot unit of work that a request/response job model fits fine
-    (unlike a continuous camera feed). It keeps the per-request
-    threading.Thread + in-memory `_jobs` dict for this narrower purpose --
-    losing an in-progress *offline enrollment* job's status on a service
-    restart is an acceptable, rare tradeoff for what's now a secondary/dev
-    workflow, not the realtime path.
-  - Models load lazily (not eagerly at process startup) since this process's
-    primary job is now lightweight monitoring, not holding GPU models
-    resident. The async VLM worker is NOT started here either -- run it via
-    realtime_main.py (which starts one by default) or standalone via
-    `python -m forensics.person_creation.vlm_worker`.
+    /api/segments*, /api/clothing-jobs, /api/memory/*, /api/debug/* -- these
+    are stateless reads/writes against the DB or process introspection, not
+    tied to which capture path is active.
+  - Models load lazily on first use (first offline job OR first realtime
+    start), not eagerly at process startup -- load_models() is idempotent, so
+    whichever path runs first pays the load cost and both then share the same
+    resident models.
 """
 
 import json
@@ -170,6 +168,17 @@ _graph = None
 _graph_lock = threading.Lock()
 _gm = None
 _gm_lock = threading.Lock()
+_realtime_manager = None
+_realtime_manager_lock = threading.Lock()
+
+
+def _get_realtime_manager():
+    global _realtime_manager
+    with _realtime_manager_lock:
+        if _realtime_manager is None:
+            from forensics.person_creation.realtime_main import RealtimeManager
+            _realtime_manager = RealtimeManager()
+    return _realtime_manager
 
 
 def _get_graph():
@@ -356,6 +365,69 @@ def crops(job_id: str):
         "body_crops": snap.get("quality_body_crops", []),
         "face_crops": snap.get("quality_face_crops", []),
     })
+
+
+@app.post("/api/realtime/start")
+def realtime_start():
+    """Start continuous presence-gated capture for one camera as a background
+    thread in this process. Runs until /api/realtime/stop is called.
+    """
+    body = request.get_json(force=True) or {}
+    camera_uri = str(body.get("camera_uri") or "").strip()
+    if not camera_uri:
+        return jsonify({"error": "camera_uri required"}), 400
+    camera_id = str(body.get("camera_id") or "").strip() or "default"
+
+    kwargs = {}
+    for key, cast in (
+        ("codec", str), ("decoder", str), ("output_dir", str),
+        ("process_every_n", int), ("sample_interval_seconds", float),
+        ("open_debounce_count", int), ("close_debounce_seconds", float),
+        ("max_segment_seconds", float), ("buffer_max_size", int),
+        ("stall_timeout_seconds", float), ("pipeline_version", str),
+    ):
+        if body.get(key) is not None:
+            try:
+                kwargs[key] = cast(body[key])
+            except (TypeError, ValueError):
+                return jsonify({"error": f"{key} has an invalid value"}), 400
+
+    manager = _get_realtime_manager()
+    try:
+        stats = manager.start(
+            camera_uri,
+            camera_id=camera_id,
+            start_vlm_worker=bool(body.get("start_vlm_worker", True)),
+            **kwargs,
+        )
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 409
+    return jsonify(stats)
+
+
+@app.post("/api/realtime/stop/<camera_id>")
+def realtime_stop(camera_id: str):
+    manager = _get_realtime_manager()
+    try:
+        stats = manager.stop(camera_id)
+    except KeyError as exc:
+        return jsonify({"error": str(exc)}), 404
+    return jsonify(stats)
+
+
+@app.get("/api/realtime/status/<camera_id>")
+def realtime_status(camera_id: str):
+    manager = _get_realtime_manager()
+    stats = manager.status(camera_id)
+    if stats is None:
+        return jsonify({"error": "camera_id not running"}), 404
+    return jsonify(stats)
+
+
+@app.get("/api/realtime/list")
+def realtime_list():
+    manager = _get_realtime_manager()
+    return jsonify({"cameras": manager.list()})
 
 
 @app.get("/api/images")
@@ -724,6 +796,72 @@ def person_pipeline_status(person_id: str):
     if gm.get_person(person_id) is None:
         return jsonify({"error": "person not found"}), 404
     return jsonify(gm.get_person_pipeline_status(person_id))
+
+
+# ─── Debugging tools ───────────────────────────────────────────────────────────
+#
+# Read-only introspection into process/GPU/model state and camera outage
+# history -- for diagnosing "why isn't this camera producing segments" /
+# "is the GPU actually resident" without shelling in.
+
+@app.get("/api/debug/camera-events")
+def debug_camera_events():
+    limit = _as_int(request.args.get("limit", 100), "limit")
+    gm = _get_gm()
+    return jsonify({"camera_events": gm.list_camera_events(limit=limit)})
+
+
+@app.get("/api/debug/system")
+def debug_system():
+    import sys
+    import threading as _threading
+
+    info: dict = {
+        "python_version": sys.version,
+        "thread_count": _threading.active_count(),
+        "thread_names": sorted(t.name for t in _threading.enumerate()),
+        "offline_jobs": {
+            "total": len(_jobs),
+            "by_status": {},
+        },
+        "realtime_cameras": _get_realtime_manager().list(),
+    }
+    for job in _jobs.values():
+        info["offline_jobs"]["by_status"][job.status] = info["offline_jobs"]["by_status"].get(job.status, 0) + 1
+
+    try:
+        import torch
+        info["torch"] = {
+            "cuda_available": torch.cuda.is_available(),
+        }
+        if torch.cuda.is_available():
+            info["torch"]["device_name"] = torch.cuda.get_device_name(0)
+            info["torch"]["memory_allocated_mb"] = round(torch.cuda.memory_allocated(0) / 1024 / 1024, 1)
+            info["torch"]["memory_reserved_mb"] = round(torch.cuda.memory_reserved(0) / 1024 / 1024, 1)
+    except Exception as exc:
+        info["torch"] = {"error": str(exc)}
+
+    try:
+        from forensics.person_creation.models.person_detector import get_person_detector
+        info["person_detector_loaded"] = get_person_detector().is_loaded()
+    except Exception:
+        info["person_detector_loaded"] = None
+
+    return jsonify(info)
+
+
+@app.get("/api/debug/jobs")
+def debug_jobs():
+    """Full dump of in-memory offline-job state (job status/node/error, no
+    snapshot payload -- use /api/person/status/<job_id> for that) for
+    inspecting every job this process has run since startup, not just one.
+    """
+    return jsonify({
+        "jobs": [
+            {"job_id": job_id, "status": job.status, "node": job.node, "error": job.error}
+            for job_id, job in _jobs.items()
+        ]
+    })
 
 
 if __name__ == "__main__":

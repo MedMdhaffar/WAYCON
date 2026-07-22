@@ -15,6 +15,7 @@ einops
 timm
 scipy
 numpy
+python-dotenv
 
 # GStreamer bindings (PyGObject/gi) for realtime RTSP ingestion
 # (forensics/person_creation/gst_stream.py). PyGObject itself is a pip package,

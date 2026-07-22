@@ -16,9 +16,15 @@ long-lived OS process, separate from:
     the common case), but runnable standalone too if you'd rather split it out.
 
 Usage:
-    python -m forensics.person_creation.realtime_main \\
-        --camera-uri "rtsp://admin:pass@10.0.0.104:554/Streaming/Channels/101" \\
+    python -m forensics.person_creation.realtime_main \
+        --camera-uri "rtsp://admin:Waycon2026@10.0.0.104:554/Streaming/Channels/101" \
         --camera-id cam1
+
+    python -m forensics.person_creation.realtime_main \
+        --camera-uri "rtsp://localhost:8554/test" \
+        --camera-id cam1
+
+            
 """
 
 from __future__ import annotations
@@ -120,6 +126,12 @@ class RealtimeProcessor:
         self._ingestion: PresenceGatedIngestion | None = None
         self._graph = None
         self._gm_instance = None
+        # Guards gm close-vs-in-flight-use: stop() can be called from another
+        # thread (e.g. an HTTP request via RealtimeManager) while run_forever's
+        # thread is still inside process_segment() using self._gm_instance --
+        # without this, stop() closing the connection pool mid-query raised
+        # psycopg_pool.PoolClosed and crashed the processing thread.
+        self._gm_close_lock = threading.Lock()
         self._reid_result: dict = {}
 
         self.segments_processed = 0
@@ -201,38 +213,43 @@ class RealtimeProcessor:
         """
         from forensics.global_memory import config as gm_config
 
-        gm = self._get_gm()
-        gm.set_segment_status(segment.segment_id, gm_config.SEGMENT_STATUS_PROCESSING)
+        # Held for the whole segment (not just the gm calls) so stop() -- which
+        # acquires this same lock before closing the pool -- always waits for an
+        # in-flight segment to finish its own bookkeeping first, instead of
+        # racing to close the pool underneath it.
+        with self._gm_close_lock:
+            gm = self._get_gm()
+            gm.set_segment_status(segment.segment_id, gm_config.SEGMENT_STATUS_PROCESSING)
 
-        initial_state = _build_initial_state(
-            segment,
-            camera_id=self.camera_id,
-            camera_uri_masked=mask_camera_uri(self.camera_uri),
-            output_dir=self.output_dir,
-            process_every_n=self.process_every_n,
-            reid_result=self._reid_result,
-            pipeline_version=self.pipeline_version,
-        )
-
-        try:
-            graph = self._get_graph()
-            for _event in graph.stream(initial_state, stream_mode="updates"):
-                pass
-            gm.set_segment_status(segment.segment_id, gm_config.SEGMENT_STATUS_SUCCEEDED)
-            self.segments_processed += 1
-            print(f"[realtime_main] segment={segment.segment_id} -> SUCCEEDED")
-        except Exception:
-            error = traceback.format_exc()
-            current = gm.get_segment(segment.segment_id)
-            retry_count = int(current["retry_count"]) if current else 0
-            next_status = (
-                gm_config.SEGMENT_STATUS_FAILED_FINAL
-                if retry_count + 1 >= gm_config.SEGMENT_MAX_RETRIES
-                else gm_config.SEGMENT_STATUS_FAILED_RETRYABLE
+            initial_state = _build_initial_state(
+                segment,
+                camera_id=self.camera_id,
+                camera_uri_masked=mask_camera_uri(self.camera_uri),
+                output_dir=self.output_dir,
+                process_every_n=self.process_every_n,
+                reid_result=self._reid_result,
+                pipeline_version=self.pipeline_version,
             )
-            gm.set_segment_status(segment.segment_id, next_status, error=error[-2000:], increment_retry=True)
-            self.segments_failed += 1
-            print(f"[realtime_main] segment={segment.segment_id} -> {next_status}\n{error}")
+
+            try:
+                graph = self._get_graph()
+                for _event in graph.stream(initial_state, stream_mode="updates"):
+                    pass
+                gm.set_segment_status(segment.segment_id, gm_config.SEGMENT_STATUS_SUCCEEDED)
+                self.segments_processed += 1
+                print(f"[realtime_main] segment={segment.segment_id} -> SUCCEEDED")
+            except Exception:
+                error = traceback.format_exc()
+                current = gm.get_segment(segment.segment_id)
+                retry_count = int(current["retry_count"]) if current else 0
+                next_status = (
+                    gm_config.SEGMENT_STATUS_FAILED_FINAL
+                    if retry_count + 1 >= gm_config.SEGMENT_MAX_RETRIES
+                    else gm_config.SEGMENT_STATUS_FAILED_RETRYABLE
+                )
+                gm.set_segment_status(segment.segment_id, next_status, error=error[-2000:], increment_retry=True)
+                self.segments_failed += 1
+                print(f"[realtime_main] segment={segment.segment_id} -> {next_status}\n{error}")
 
     # -- lifecycle --------------------------------------------------------------
 
@@ -241,7 +258,7 @@ class RealtimeProcessor:
 
         self._reid_result = load_models()
 
-        self._buffer = self._frame_source_factory()
+        self._buffer = self._frame_source_factory()   #this is an object from the class  GstFrameBuffer
         self._ingestion = PresenceGatedIngestion(
             frame_source=self._buffer,
             detect_person_fn=self._detect_person_fn,
@@ -261,8 +278,12 @@ class RealtimeProcessor:
             self._ingestion.stop()
         if self._buffer is not None:
             self._buffer.stop()
-        if self._gm_instance is not None:
-            self._gm_instance.close()
+        # Wait for any in-flight process_segment() to finish its own gm calls
+        # (see the lock in process_segment) before closing the pool underneath it.
+        with self._gm_close_lock:
+            if self._gm_instance is not None:
+                self._gm_instance.close()
+                self._gm_instance = None
 
     def run_forever(self) -> None:
         self.start()
@@ -275,6 +296,104 @@ class RealtimeProcessor:
                 self.process_segment(segment)
         finally:
             self.stop()
+
+    # -- debugging / monitoring ---------------------------------------------------
+
+    def stats(self) -> dict:
+        """Snapshot for /api/realtime/status -- safe to call from another thread
+        (only reads plain attributes / thread-safe sub-objects, no locking needed
+        since every field here is either append-only counters or an Enum/str set
+        atomically by its owning thread).
+        """
+        buffer_stats = self._buffer.stats(0) if self._buffer is not None else {}
+        presence_state = self._ingestion.gate.state.value if self._ingestion is not None else "unknown"
+        queue_depth = self._ingestion.output_queue.qsize() if self._ingestion is not None else 0
+        frames_seen = self._ingestion.frames_seen if self._ingestion is not None else 0
+        samples_taken = self._ingestion.samples_taken if self._ingestion is not None else 0
+        return {
+            "camera_id": self.camera_id,
+            "camera_uri_masked": mask_camera_uri(self.camera_uri),
+            "running": not self._stop_event.is_set(),
+            "connection_state": buffer_stats.get("connection_state"),
+            "reconnect_count": buffer_stats.get("reconnect_count"),
+            "last_disconnect_reason": buffer_stats.get("last_disconnect_reason"),
+            "presence_state": presence_state,
+            "segment_queue_depth": queue_depth,
+            "frames_seen": frames_seen,
+            "samples_taken": samples_taken,
+            "segments_processed": self.segments_processed,
+            "segments_failed": self.segments_failed,
+        }
+
+
+class RealtimeManager:
+    """In-process registry of running RealtimeProcessors, keyed by camera_id.
+
+    Lets service.py start/stop/inspect camera realtime capture as background
+    threads inside the same long-lived process instead of requiring a separate
+    `python -m realtime_main` OS process per camera -- one process, one set of
+    resident models (load_models() is idempotent/cached, see load_models.py),
+    shared by both offline video-file jobs and any number of realtime cameras.
+    A dedicated OS process (this module's __main__/main()) remains available for
+    anyone who wants a camera fully isolated from the monitoring API's process.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._entries: dict[str, dict[str, Any]] = {}
+
+    def start(self, camera_uri: str, *, camera_id: str, start_vlm_worker: bool = True, **kwargs) -> dict:
+        with self._lock:
+            existing = self._entries.get(camera_id)
+            if existing is not None and existing["thread"].is_alive():
+                raise ValueError(f"camera_id '{camera_id}' is already running")
+
+            processor = RealtimeProcessor(camera_uri, camera_id=camera_id, **kwargs)
+            vlm_worker = None
+            if start_vlm_worker:
+                from forensics.person_creation.vlm_worker import VLMWorker
+
+                vlm_worker = VLMWorker()
+                vlm_worker.start()
+
+            thread = threading.Thread(
+                target=processor.run_forever,
+                name=f"realtime-{camera_id}",
+                daemon=True,
+            )
+            self._entries[camera_id] = {
+                "processor": processor,
+                "thread": thread,
+                "vlm_worker": vlm_worker,
+            }
+            thread.start()
+            return processor.stats()
+
+    def stop(self, camera_id: str, *, timeout: float = 10.0) -> dict:
+        with self._lock:
+            entry = self._entries.get(camera_id)
+        if entry is None:
+            raise KeyError(f"camera_id '{camera_id}' is not running")
+        stats = entry["processor"].stats()
+        entry["processor"].stop()
+        if entry["vlm_worker"] is not None:
+            entry["vlm_worker"].stop()
+        entry["thread"].join(timeout=timeout)
+        with self._lock:
+            self._entries.pop(camera_id, None)
+        return stats
+
+    def status(self, camera_id: str) -> dict | None:
+        with self._lock:
+            entry = self._entries.get(camera_id)
+        if entry is None:
+            return None
+        return entry["processor"].stats()
+
+    def list(self) -> list[dict]:
+        with self._lock:
+            entries = list(self._entries.items())
+        return [entry["processor"].stats() for _camera_id, entry in entries]
 
 
 def main() -> None:

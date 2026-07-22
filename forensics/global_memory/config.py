@@ -1,7 +1,15 @@
 import os
 
+
+
 # ─── Postgres connection ───────────────────────────────────────────────────────
-#
+import os
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+load_dotenv(PROJECT_ROOT / ".env")
 # GLOBAL_MEMORY_DSN, if set, overrides everything else below (a full
 # postgresql://user:pass@host:port/dbname URI or libpq keyword string). Otherwise
 # the individual GLOBAL_MEMORY_* parts are assembled into a DSN. See
