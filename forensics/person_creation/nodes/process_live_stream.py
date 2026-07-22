@@ -295,6 +295,33 @@ def process_live_stream(state: PersonCreationState) -> dict:
     analysis_session = None
     analysis_started = False
     final_analysis_snapshot = None
+    vlm_session = None
+    vlm_closed = False
+    vlm_drain_timeout = max(
+        0.0,
+        float(config.get("vlm_drain_timeout_seconds", 5.0)),
+    )
+
+    def close_vlm() -> dict | None:
+        nonlocal vlm_closed
+        if vlm_session is None:
+            return None
+        if not vlm_closed:
+            vlm_closed = True
+            return vlm_session.close(vlm_drain_timeout)
+        return vlm_session.public_snapshot()
+
+    def current_analysis_snapshot() -> dict | None:
+        if analysis_session is None:
+            return None
+        snapshot = analysis_session.public_snapshot()
+        if vlm_session is not None:
+            snapshot = vlm_session.observe(
+                snapshot,
+                _collect_identity_decisions(analysis_session),
+            )
+        return snapshot
+
     if overlap_enabled:
         from forensics.person_creation.live_session import LivePreprocessingSession
 
@@ -336,9 +363,23 @@ def process_live_stream(state: PersonCreationState) -> dict:
             )
 
             def publish_analysis(snapshot: dict) -> None:
+                if vlm_session is not None:
+                    snapshot = vlm_session.observe(
+                        snapshot,
+                        _collect_identity_decisions(analysis_session),
+                    )
                 _notify(state, "processing_live_frames", {
                     "rolling_analysis": snapshot,
                 })
+
+            def publish_vlm(snapshot: dict) -> None:
+                _notify(state, "processing_live_frames", {
+                    "rolling_analysis": snapshot,
+                })
+
+            from forensics.person_creation.live_vlm import (
+                LiveIdentityVLMCoordinator,
+            )
 
             analysis_session = LiveRollingAnalysisSession(
                 snapshot_provider=preprocessing_session.analysis_snapshot,
@@ -346,6 +387,11 @@ def process_live_stream(state: PersonCreationState) -> dict:
                 join_timeout_seconds=analysis_join_timeout,
                 job_id=state.get("_job_id"),
                 identity_decisions=True,
+            )
+            vlm_session = LiveIdentityVLMCoordinator(
+                job_id=str(state.get("_job_id") or "live-job"),
+                queue_capacity=max(1, int(config.get("vlm_queue_capacity", 2))),
+                notify=publish_vlm,
             )
     # Evidence is intentionally not pruned here; long sessions can create many
     # crop files in _staging before the unchanged downstream graph runs once.
@@ -381,14 +427,14 @@ def process_live_stream(state: PersonCreationState) -> dict:
                     "live_preprocessing": preprocessing_session.public_snapshot(),
                 } if preprocessing_session is not None else {}),
                 **({
-                    "rolling_analysis": analysis_session.public_snapshot(),
+                    "rolling_analysis": current_analysis_snapshot(),
                 } if analysis_session is not None else {}),
             },
             **({
                 "live_preprocessing": preprocessing_session.public_snapshot(),
             } if preprocessing_session is not None else {}),
             **({
-                "rolling_analysis": analysis_session.public_snapshot(),
+                "rolling_analysis": current_analysis_snapshot(),
             } if analysis_session is not None else {}),
         })
         chunk_index = 0
@@ -532,7 +578,7 @@ def process_live_stream(state: PersonCreationState) -> dict:
                     "live_preprocessing": preprocessing_session.public_snapshot(),
                 } if preprocessing_session is not None else {}),
                 **({
-                    "rolling_analysis": analysis_session.public_snapshot(),
+                    "rolling_analysis": current_analysis_snapshot(),
                 } if analysis_session is not None else {}),
             })
             print(
@@ -577,6 +623,10 @@ def process_live_stream(state: PersonCreationState) -> dict:
                     analysis_session.abort()
             except Exception as exc:
                 cleanup_errors.append(type(exc).__name__)
+            try:
+                close_vlm()
+            except Exception as exc:
+                cleanup_errors.append(type(exc).__name__)
             if cleanup_errors:
                 reader_lifecycle_error.add_note(
                     "Additional live worker cleanup failed: "
@@ -602,6 +652,7 @@ def process_live_stream(state: PersonCreationState) -> dict:
         except Exception:
             if analysis_session is not None and analysis_started:
                 analysis_session.abort()
+            close_vlm()
             raise
         else:
             if analysis_session is not None and analysis_started:
@@ -609,12 +660,18 @@ def process_live_stream(state: PersonCreationState) -> dict:
                     "[process_live_stream] before rolling analysis drain",
                     flush=True,
                 )
-                analysis_session.finish(preprocessing_session.accumulator_version)
-                final_analysis_snapshot = analysis_session.public_snapshot()
+                try:
+                    analysis_session.finish(
+                        preprocessing_session.accumulator_version
+                    )
+                finally:
+                    final_analysis_snapshot = close_vlm()
                 print(
                     "[process_live_stream] after rolling analysis drain",
                     flush=True,
                 )
+            else:
+                final_analysis_snapshot = close_vlm()
 
     if not _stop_requested(stop_event):
         raise RuntimeError(

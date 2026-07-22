@@ -179,6 +179,16 @@ _MEDIA_VALUE_KEYS = {
     "best_body_path",
 }
 _MEDIA_LIST_KEYS = {"face_crops", "body_crops", "best_body_crops"}
+_PUBLIC_VLM_ERRORS = {
+    "image_decode_failed",
+    "inference_error",
+    "invalid_output",
+    "empty_output",
+    "no_valid_body_crop",
+    "persistence_error",
+    "queue_capacity",
+    "timeout",
+}
 
 
 def _public_media_reference(value: Any) -> str | None:
@@ -200,6 +210,14 @@ def _sanitize_media_references(value: Any, parent_key: str = "") -> Any:
         for key, item in value.items():
             if key in _MEDIA_VALUE_KEYS:
                 sanitized[key] = _public_media_reference(item)
+            elif key == "vlm_error":
+                sanitized[key] = (
+                    item if item in _PUBLIC_VLM_ERRORS else "inference_error"
+                ) if item else None
+            elif key == "failure_reason" and parent_key == "clothing_diagnostics":
+                sanitized[key] = (
+                    item if item in _PUBLIC_VLM_ERRORS else "inference_error"
+                ) if item else None
             elif key in _MEDIA_LIST_KEYS and isinstance(item, list):
                 sanitized[key] = [
                     reference
@@ -212,6 +230,37 @@ def _sanitize_media_references(value: Any, parent_key: str = "") -> Any:
     if isinstance(value, list):
         return [_sanitize_media_references(item, parent_key) for item in value]
     return value
+
+
+def _live_vlm_status(rolling: Any) -> Any:
+    """Reject non-canonical media references in versioned live identities."""
+    if not isinstance(rolling, dict):
+        return rolling
+    result = deepcopy(rolling)
+    identities = result.get("live_identities")
+    if not isinstance(identities, list):
+        return result
+    for identity in identities:
+        if not isinstance(identity, dict):
+            continue
+        person_id = str(identity.get("canonical_person_id") or "")
+        for key, crop_type in (
+            ("representative_face_path", "face"),
+            ("best_face_path", "face"),
+            ("best_body_path", "body"),
+            ("selected_body_crop", "body"),
+        ):
+            if key not in identity:
+                continue
+            reference = _public_media_reference(identity.get(key))
+            parts = reference.split("/") if reference else []
+            identity[key] = reference if (
+                len(parts) == 3
+                and re.fullmatch(r"person_[0-9]+", parts[0])
+                and parts[0] == person_id
+                and parts[1] == f"{crop_type}_crops"
+            ) else None
+    return result
 
 
 @dataclass
@@ -488,7 +537,7 @@ def status(job_id: str):
         "continuous":         snap.get("continuous", False),
         "duration_seconds_per_chunk": snap.get("duration_seconds_per_chunk"),
         "live_preprocessing": snap.get("live_preprocessing", {}),
-        "rolling_analysis": snap.get("rolling_analysis", {}),
+        "rolling_analysis": _live_vlm_status(snap.get("rolling_analysis", {})),
         "media_lifecycle_version": snap.get("media_lifecycle_version", 0),
         "media_cleanup_warning": snap.get("media_cleanup_warning", ""),
     }

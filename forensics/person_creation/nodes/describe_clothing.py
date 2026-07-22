@@ -10,6 +10,8 @@ from pathlib import Path
 
 import cv2
 
+from forensics.media_paths import resolve_media_path
+
 
 _FAILURE_CATEGORIES = {
     "timeout",
@@ -71,7 +73,15 @@ def _read_crops(paths: list[str]) -> tuple[list, list[dict]]:
     metadata = []
     for raw in paths:
         try:
-            image = cv2.imread(str(Path(raw).resolve()))
+            source = Path(raw)
+            if not source.is_absolute():
+                source = resolve_media_path(
+                    raw,
+                    allow_legacy_absolute=False,
+                    require_exists=True,
+                    image_only=True,
+                )
+            image = cv2.imread(str(source.resolve()))
         except Exception:
             image = None
         if image is None or not getattr(image, "size", 0):
