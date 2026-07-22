@@ -9,7 +9,7 @@ from typing import Any, Mapping
 class QualityFilterConfig:
     face_min_width: int = 50
     face_min_height: int = 50
-    face_min_sharpness: float = 50.0
+    face_min_sharpness: float = 20.0
     body_min_height: int = 80
     body_min_area: int = 3000
     body_min_sharpness: float = 50.0

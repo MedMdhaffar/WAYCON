@@ -48,7 +48,7 @@ def test_default_configuration_preserves_production_thresholds(monkeypatch):
     assert load_quality_filter_config().to_dict() == {
         "face_min_width": 50,
         "face_min_height": 50,
-        "face_min_sharpness": 50.0,
+        "face_min_sharpness": 20.0,
         "body_min_height": 80,
         "body_min_area": 3000,
         "body_min_sharpness": 50.0,
@@ -99,8 +99,8 @@ def test_face_dimension_boundary_is_inclusive(monkeypatch, tmp_path, minimum):
 
 
 def test_face_sharpness_boundary_is_inclusive(tmp_path):
-    accepted = _face(tmp_path, 60, 60, 50.0)
-    rejected = _face(tmp_path, 60, 60, 49.999)
+    accepted = _face(tmp_path, 60, 60, 20.0)
+    rejected = _face(tmp_path, 60, 60, 19.999)
 
     result = filter_quality({"body_crops": [], "face_crops": [accepted, rejected]})
 
