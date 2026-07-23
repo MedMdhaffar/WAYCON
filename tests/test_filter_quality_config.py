@@ -46,9 +46,9 @@ def test_default_configuration_preserves_production_thresholds(monkeypatch):
         monkeypatch.delenv(f"PERSON_CREATION_{name}", raising=False)
 
     assert load_quality_filter_config().to_dict() == {
-        "face_min_width": 50,
-        "face_min_height": 50,
-        "face_min_sharpness": 20.0,
+        "face_min_width": 48,
+        "face_min_height": 48,
+        "face_min_sharpness": 45.0,
         "body_min_height": 80,
         "body_min_area": 3000,
         "body_min_sharpness": 50.0,
@@ -98,13 +98,39 @@ def test_face_dimension_boundary_is_inclusive(monkeypatch, tmp_path, minimum):
     assert result["face_rejection_counts"]["too_small"] == 2
 
 
+def test_default_face_dimension_boundary_is_48_by_48(tmp_path):
+    rejected_width = _face(tmp_path, 47, 48)
+    rejected_height = _face(tmp_path, 48, 47)
+    rejected_both = _face(tmp_path, 47, 47)
+    accepted_boundary = _face(tmp_path, 48, 48)
+    accepted_above = _face(tmp_path, 49, 49)
+
+    result = filter_quality({
+        "body_crops": [],
+        "face_crops": [
+            rejected_width,
+            rejected_height,
+            rejected_both,
+            accepted_boundary,
+            accepted_above,
+        ],
+    })
+
+    assert result["quality_face_crops"] == [accepted_boundary, accepted_above]
+    assert result["face_rejection_counts"]["too_small"] == 3
+
+
 def test_face_sharpness_boundary_is_inclusive(tmp_path):
-    accepted = _face(tmp_path, 60, 60, 20.0)
-    rejected = _face(tmp_path, 60, 60, 19.999)
+    rejected = _face(tmp_path, 60, 60, 44.999)
+    accepted = _face(tmp_path, 60, 60, 45.0)
+    above = _face(tmp_path, 60, 60, 45.001)
 
-    result = filter_quality({"body_crops": [], "face_crops": [accepted, rejected]})
+    result = filter_quality({
+        "body_crops": [],
+        "face_crops": [rejected, accepted, above],
+    })
 
-    assert result["quality_face_crops"] == [accepted]
+    assert result["quality_face_crops"] == [accepted, above]
     assert result["face_rejection_counts"]["low_sharpness"] == 1
 
 

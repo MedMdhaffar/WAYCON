@@ -16,6 +16,10 @@ env/
 forensics/person_creation/frontend/dist/
 forensics/person_creation/frontend/node_modules/
 forensics/person_creation/frontend/.vite/
+forensics/global_memory.db
+forensics/global_memory.db-wal
+forensics/global_memory.db-shm
+forensics/global_memory.db-x-persons-1-embedding.bin
 forensics/person_creation/output/
 forensics/person_creation/videos/
 forensics/person_db/

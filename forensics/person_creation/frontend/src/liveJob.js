@@ -212,14 +212,25 @@ export function normalizeRollingAnalysis(value) {
       status: stringValue(raw.status, 'provisional'),
       state,
       decision,
+      reason: stringValue(raw.reason),
       provisional: raw.provisional === true,
+      persisted: raw.persisted === true || (
+        raw.provisional === false && Boolean(raw.canonical_person_id)
+      ),
       canonicalPersonId: stringValue(raw.canonical_person_id),
       faceCount: nonNegativeInteger(raw.face_count),
+      observationCount: nonNegativeInteger(raw.observation_count ?? raw.face_count),
       bodyCount: nonNegativeInteger(raw.body_count ?? raw.associated_body_count),
       associatedBodyCount: nonNegativeInteger(raw.body_count ?? raw.associated_body_count),
       candidatePersonId: stringValue(raw.candidate_person_id),
       candidateSimilarity: finiteNumber(raw.candidate_similarity),
+      secondCandidatePersonId: stringValue(raw.second_candidate_person_id),
+      secondCandidateSimilarity: finiteNumber(raw.second_candidate_similarity),
       margin: finiteNumber(raw.margin),
+      evidenceVersion: nonNegativeInteger(raw.evidence_version ?? raw.decision_version),
+      evidenceSignature: stringValue(
+        raw.evidence_signature ?? raw.last_evidence_signature,
+      ),
       firstSeenChunk: finiteNumber(raw.first_seen_chunk),
       lastSeenChunk: finiteNumber(raw.last_seen_chunk),
       bestFacePath: canonicalLiveCropPath(
@@ -327,7 +338,9 @@ function mergeLiveIdentity(previousValue, incomingValue, staleVlm) {
   ) {
     for (const field of [
       'state', 'decision', 'provisional', 'canonical_person_id', 'suggestion_id',
-      'candidate_person_id', 'candidate_similarity', 'margin',
+      'persisted', 'reason', 'candidate_person_id', 'candidate_similarity',
+      'second_candidate_person_id', 'second_candidate_similarity', 'margin',
+      'observation_count', 'evidence_version', 'evidence_signature',
     ]) {
       if (Object.hasOwn(previous, field)) merged[field] = previous[field]
     }
@@ -391,6 +404,11 @@ function mergeRollingPayload(previousRolling, incomingRolling) {
       merged.live_identities.push(
         previous ? mergeLiveIdentity(previous, identity, countersRegressed) : identity,
       )
+    }
+    for (const [identityId, identity] of previousIdentities) {
+      if (seen.has(identityId)) continue
+      seen.add(identityId)
+      merged.live_identities.push(identity)
     }
   }
   for (const field of VLM_COUNTER_FIELDS) {

@@ -14,6 +14,10 @@ import pytest
 import numpy as np
 
 from forensics.global_memory import GlobalMemory
+from forensics.global_memory.identity_policy import (
+    IdentityCandidate,
+    IdentityPolicyConfig,
+)
 from forensics.identity_evidence import identity_evidence_key
 from forensics.media_paths import MediaPathError
 from forensics.person_creation.live_analysis import LiveRollingAnalysisSession
@@ -212,6 +216,19 @@ def _identity(snapshot: dict) -> dict:
     return identities[0]
 
 
+class _RankingMemory:
+    def __init__(self, candidates):
+        self.candidates = list(candidates)
+        self.rank_calls = 0
+
+    def rank_identity_candidates(self, _embedding):
+        self.rank_calls += 1
+        return list(self.candidates)
+
+    def close(self):
+        return None
+
+
 # --- live rolling identity decision -------------------------------------------
 
 
@@ -241,17 +258,197 @@ def test_live_rolling_identity_decision_publishes_phase3e_fields(media_root, dat
         assert field in identity
 
 
-def test_decision_is_withheld_until_minimum_observations(media_root, database):
-    paths = _face_paths(media_root, 2)
+def test_first_valid_embedded_face_publishes_provisional_comparison(
+    media_root,
+    database,
+):
+    seeded = _seed_person(
+        database,
+        [1.0, 0.0],
+        _face_paths(media_root, 3, prefix="first-face-seed"),
+    )
+    paths = _face_paths(media_root, 1, prefix="first-face")
     state = {"snapshot": _snapshot(1, paths)}
-    session = _session(database, lambda: state["snapshot"])
+    session = LiveRollingAnalysisSession(
+        snapshot_provider=lambda: state["snapshot"],
+        join_timeout_seconds=5.0,
+        database_path=database,
+        associate=_association,
+        job_id="job-real-singleton-cluster",
+        identity_decisions=True,
+    )
 
     snapshot = _run(session, state, [(1, _snapshot(1, paths))])
     identity = _identity(snapshot)
 
+    assert identity["decision"] == "review_required"
+    assert identity["reason"] == "low_confidence_cluster"
+    assert identity["state"] == "provisional"
+    assert identity["provisional"] is True
+    assert identity["persisted"] is False
+    assert identity["observation_count"] == 1
+    assert identity["candidate_person_id"] == seeded
+    assert identity["candidate_similarity"] == 1.0
+    assert identity["decision_version"] == 1
+    assert identity["evidence_version"] == 1
+    assert identity["evidence_signature"]
+    assert identity["canonical_person_id"] is None
+    assert _person_count(database) == 1
+    assert len(session.identity_decisions()) == 0
+
+
+def test_one_face_publishes_second_candidate_and_margin(media_root, database):
+    paths = _face_paths(media_root, 1, prefix="ranked-first-face")
+    state = {"snapshot": _snapshot(1, paths)}
+    ranked = _RankingMemory([
+        IdentityCandidate("person_010", 0.91),
+        IdentityCandidate("person_011", 0.72),
+    ])
+    session = _session(
+        database,
+        lambda: state["snapshot"],
+        decision_memory_factory=lambda _path: ranked,
+    )
+
+    identity = _identity(_run(session, state, [(1, state["snapshot"])]))
+
+    assert ranked.rank_calls == 1
+    assert identity["observation_count"] == 1
+    assert identity["candidate_person_id"] == "person_010"
+    assert identity["candidate_similarity"] == 0.91
+    assert identity["second_candidate_person_id"] == "person_011"
+    assert identity["second_candidate_similarity"] == 0.72
+    assert identity["margin"] == 0.19
+    assert identity["provisional"] is True
+    assert identity["persisted"] is False
+
+
+def test_zero_embedded_faces_performs_no_comparison(media_root, database):
+    state = {"snapshot": _snapshot(1, ())}
+    opened = []
+    session = _session(
+        database,
+        lambda: state["snapshot"],
+        decision_memory_factory=lambda _path: opened.append(True),
+    )
+
+    snapshot = _run(session, state, [(1, state["snapshot"])])
+
+    assert snapshot["live_identities"] == []
+    assert opened == []
+    assert _person_count(database) == 0
+
+
+def test_distinct_face_recompares_but_replay_and_body_only_update_do_not(
+    media_root,
+    database,
+):
+    first = _face_paths(media_root, 1, prefix="comparison-version")
+    second = first + _face_paths(media_root, 1, prefix="comparison-version-next")
+    body_path = media_root / "session" / "_staging" / "body_crops" / "body.jpg"
+    body_path.parent.mkdir(parents=True)
+    body_path.write_bytes(b"body-evidence")
+    state = {"snapshot": _snapshot(1, first)}
+    ranked = _RankingMemory([
+        IdentityCandidate("person_010", 0.91),
+        IdentityCandidate("person_011", 0.72),
+    ])
+    association_calls = 0
+
+    def association(_state):
+        nonlocal association_calls
+        association_calls += 1
+        assignments = [] if association_calls < 4 else [{
+            "body_crop_path": str(body_path),
+            "body_sharpness": 100.0,
+        }]
+        return SimpleNamespace(cluster_assignments={0: assignments})
+
+    session = LiveRollingAnalysisSession(
+        snapshot_provider=lambda: state["snapshot"],
+        join_timeout_seconds=5.0,
+        database_path=database,
+        cluster=_cluster_all,
+        associate=association,
+        job_id="job-comparison-signature",
+        identity_decisions=True,
+        decision_memory_factory=lambda _path: ranked,
+        policy_config=IdentityPolicyConfig(minimum_face_observations=2),
+    )
+    session.start()
+    try:
+        session.request_version(1)
+        first_result = _identity(_wait_for(session, 1))
+        assert ranked.rank_calls == 1
+        assert first_result["evidence_version"] == 1
+
+        state["snapshot"] = _snapshot(2, first)
+        session.request_version(2)
+        replay = _identity(_wait_for(session, 2))
+        assert ranked.rank_calls == 1
+        assert replay["evidence_version"] == 1
+
+        state["snapshot"] = _snapshot(3, second)
+        session.request_version(3)
+        distinct = _identity(_wait_for(session, 3))
+        assert ranked.rank_calls == 2
+        assert distinct["evidence_version"] == 2
+        assert distinct["observation_count"] == 2
+
+        state["snapshot"] = _snapshot(4, second)
+        session.request_version(4)
+        body_only = _identity(_wait_for(session, 4))
+        assert ranked.rank_calls == 2
+        assert body_only["evidence_version"] == 2
+        assert body_only["observation_count"] == 2
+    finally:
+        session.finish(4)
+
+
+def test_weak_first_face_does_not_create_new_person(media_root, database):
+    paths = _face_paths(media_root, 1, prefix="weak-first")
+    state = {"snapshot": _snapshot(1, paths)}
+    session = _session(database, lambda: state["snapshot"])
+
+    identity = _identity(_run(session, state, [(1, state["snapshot"])]))
+
+    assert identity["decision"] == "new_person"
+    assert identity["provisional"] is True
+    assert identity["persisted"] is False
+    assert identity["observation_count"] == 1
+    assert _person_count(database) == 0
+
+
+def test_non_finite_embedding_performs_no_comparison(media_root, database):
+    paths = _face_paths(media_root, 1, prefix="non-finite")
+    state = {"snapshot": _snapshot(1, paths)}
+    ranked = _RankingMemory([IdentityCandidate("person_010", 0.91)])
+
+    def invalid_cluster(node_state):
+        result = _cluster_all(node_state)
+        result["identity_clusters"][0]["representative_embedding"] = [
+            float("nan"),
+            0.0,
+        ]
+        return result
+
+    session = LiveRollingAnalysisSession(
+        snapshot_provider=lambda: state["snapshot"],
+        join_timeout_seconds=5.0,
+        database_path=database,
+        cluster=invalid_cluster,
+        associate=_association,
+        job_id="job-invalid-embedding",
+        identity_decisions=True,
+        decision_memory_factory=lambda _path: ranked,
+    )
+
+    identity = _identity(_run(session, state, [(1, state["snapshot"])]))
+
+    assert ranked.rank_calls == 0
     assert identity["decision"] is None
     assert identity["state"] == "observing"
-    assert identity["canonical_person_id"] is None
+    assert identity["candidate_person_id"] is None
     assert _person_count(database) == 0
 
 

@@ -203,10 +203,12 @@ export default function App() {
             />
             <LiveStreamStats snapshot={snapshot} status={jobStatus?.status} node={jobStatus?.node} sourceType={sourceType} />
             {shouldShowRollingIdentityPanel(jobStatus?.status) && (
-              <LiveIdentityPanel
-                rollingAnalysis={snapshot.rolling_analysis}
-                finalizing={finalizingCanonical}
-              />
+              <div className="live-identities-section">
+                <LiveIdentityPanel
+                  rollingAnalysis={snapshot.rolling_analysis}
+                  finalizing={finalizingCanonical}
+                />
+              </div>
             )}
             <CropsGrid
               jobId={jobId}
@@ -226,7 +228,9 @@ export default function App() {
               </div>
             )}
             {jobStatus?.status === 'error' && (
-              <LiveIdentityPanel rollingAnalysis={snapshot.rolling_analysis} />
+              <div className="live-identities-section">
+                <LiveIdentityPanel rollingAnalysis={snapshot.rolling_analysis} />
+              </div>
             )}
             <LiveStreamStats snapshot={snapshot} status={jobStatus?.status} node={jobStatus?.node} sourceType={sourceType} />
             <AssociationsView

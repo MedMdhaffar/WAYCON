@@ -70,7 +70,7 @@ process_video        Frame loop: every 5 frames, run person + face detect,
   │
   ▼
 filter_quality       Body: h≥80px, area≥3000px², sharpness≥50.0
-                     Face: w≥60px, h≥60px, sharpness≥50.0
+                     Face: w≥50px, h≥50px, sharpness≥45.0
   │
   ▼
 embed_faces          FaceNet embed all quality face crops → mean L2-normalized
@@ -128,7 +128,7 @@ The pipeline pauses again after VLM description. The user reviews the assembled 
 
 Removes unusable crops before any expensive model runs:
 - Body minimum: height 80px, area 3000px², sharpness 50.0
-- Face minimum: 60×60px, sharpness 50.0
+- Face minimum: 50×50px, sharpness 45.0
 
 ### 3. Face Embedding (`embed_faces.py`)
 

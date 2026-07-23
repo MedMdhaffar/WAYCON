@@ -22,7 +22,9 @@ export default function LiveIdentityPanel({ rollingAnalysis, finalizing = false 
     <section className="card live-identity-panel" aria-labelledby="live-identity-title">
       <div className="live-identity-heading">
         <div>
-          <div className="card-title" id="live-identity-title">Live Identity Analysis</div>
+          <div className="card-title" id="live-identity-title">
+            Live Identities — {analysis.identities.length}
+          </div>
           <p>Provisional session identities from accumulated live evidence</p>
         </div>
         {analysis.analysisInProgress && <span className="live-analysis-indicator">Analyzing</span>}

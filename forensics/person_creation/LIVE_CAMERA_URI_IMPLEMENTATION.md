@@ -103,8 +103,8 @@ The raw camera URI exists only in in-memory graph state while OpenCV connects. U
 For example:
 
 ```text
-rtsp://admin:secret@192.168.1.64:554/Streaming/Channels/101
-→ rtsp://admin:****@192.168.1.64:554/Streaming/Channels/101
+rtsp://example-user:example-password@camera.example.invalid:554/live
+→ rtsp://****@camera.example.invalid:554/live
 ```
 
 ## Run the project

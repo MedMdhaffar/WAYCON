@@ -1,5 +1,6 @@
 import json
 import re
+import sqlite3
 import threading
 import traceback
 import uuid
@@ -158,6 +159,34 @@ _ALLOWED_PROFILE_IMAGE_EXTENSIONS = {"jpg", "jpeg", "png"}
 
 app = Flask(__name__)
 CORS(app)
+
+
+def initialize_global_memory() -> None:
+    """Run schema creation/migrations through one writable startup handle."""
+    from forensics.global_memory import GlobalMemory
+
+    memory = GlobalMemory()
+    memory.close()
+
+
+def _is_sqlite_busy_error(error: BaseException) -> bool:
+    if not isinstance(error, sqlite3.OperationalError):
+        return False
+    error_code = getattr(error, "sqlite_errorcode", None)
+    if isinstance(error_code, int) and (error_code & 0xFF) in {
+        sqlite3.SQLITE_BUSY,
+        sqlite3.SQLITE_LOCKED,
+    }:
+        return True
+    message = str(error).lower()
+    return "database is locked" in message or "database table is locked" in message
+
+
+@app.errorhandler(sqlite3.OperationalError)
+def _sqlite_operational_error_response(error: sqlite3.OperationalError):
+    if _is_sqlite_busy_error(error):
+        return jsonify({"error": "global memory is temporarily busy"}), 503
+    return jsonify({"error": "database operation failed"}), 500
 
 
 def _allowed_profile_image(filename: str) -> bool:
@@ -649,7 +678,7 @@ def memory_persons():
         "yes",
         "on",
     }
-    gm = GlobalMemory()
+    gm = GlobalMemory(read_only=True)
     try:
         return jsonify(gm.list_all(include_inactive=include_inactive))
     finally:
@@ -660,7 +689,7 @@ def memory_persons():
 def memory_person_detail(person_id):
     from forensics.global_memory import GlobalMemory
 
-    gm = GlobalMemory()
+    gm = GlobalMemory(read_only=True)
     try:
         person = gm.get_person(person_id)
         if person is None:
@@ -793,7 +822,7 @@ def memory_person_gallery(person_id):
     if crop_type and crop_type not in {"face", "body"}:
         return jsonify({"error": "type must be face or body"}), 400
 
-    gm = GlobalMemory()
+    gm = GlobalMemory(read_only=True)
     try:
         if gm.get_person(person_id) is None:
             return jsonify({"error": f"{person_id} not found"}), 404
@@ -807,7 +836,7 @@ def memory_log():
     from forensics.global_memory import GlobalMemory
 
     person_id = request.args.get("person_id")
-    gm = GlobalMemory()
+    gm = GlobalMemory(read_only=True)
     try:
         return jsonify(gm.get_recognition_history(person_id=person_id, limit=100))
     finally:
@@ -819,7 +848,7 @@ def memory_search():
     from forensics.global_memory import GlobalMemory
 
     q = request.args.get("q", "").strip().lower()
-    gm = GlobalMemory()
+    gm = GlobalMemory(read_only=True)
     try:
         persons = gm.list_all()
         if not q:
@@ -837,11 +866,13 @@ def memory_search():
 
 # --- Supervisor identity-review endpoints ---------------------------------------
 
-def _identity_review_memory():
+def _identity_review_memory(*, read_only: bool = False):
     from forensics.global_memory import GlobalMemory
 
     return GlobalMemory(
-        read_only=bool(app.config.get("GLOBAL_MEMORY_READ_ONLY", False))
+        read_only=(
+            read_only or bool(app.config.get("GLOBAL_MEMORY_READ_ONLY", False))
+        )
     )
 
 
@@ -857,6 +888,8 @@ def _identity_review_error(error: BaseException):
     )
     from forensics.global_memory.store import ReadOnlyGlobalMemoryError
 
+    if _is_sqlite_busy_error(error):
+        return jsonify({"error": "global memory is temporarily busy"}), 503
     if isinstance(error, ReviewSuggestionNotFoundError):
         return jsonify({"error": str(error)}), 404
     if isinstance(error, InvalidReviewRequestError):
@@ -954,7 +987,7 @@ def identity_review_queue():
     gm = None
     try:
         limit, offset = _identity_review_pagination()
-        gm = _identity_review_memory()
+        gm = _identity_review_memory(read_only=True)
         reviews = gm.list_pending_identity_reviews(limit=limit, offset=offset)
         return jsonify({
             "reviews": [review.as_dict() for review in reviews],
@@ -973,7 +1006,7 @@ def identity_review_queue():
 def identity_review_detail(suggestion_id):
     gm = None
     try:
-        gm = _identity_review_memory()
+        gm = _identity_review_memory(read_only=True)
         detail = gm.get_identity_review(suggestion_id)
         return jsonify(_sanitize_media_references(detail.as_dict()))
     except Exception as exc:
@@ -1133,4 +1166,5 @@ def profile_add_face_photos(name: str):
 
 
 if __name__ == "__main__":
+    initialize_global_memory()
     app.run(host="0.0.0.0", port=5009, debug=False)

@@ -237,6 +237,35 @@ def test_status_exposes_only_compact_rolling_analysis(client):
     assert "database_path" not in serialized
 
 
+def test_status_does_not_truncate_live_identities(client):
+    job_id = _start_camera(client)
+    rolling = _rolling_publication(8, 8, 8, 7)
+    rolling["live_identities"] = [
+        {
+            "live_identity_id": f"live_{index:04d}",
+            "session_person_id": f"live_{index:04d}",
+            "status": "provisional",
+            "face_count": index,
+            "associated_body_count": 0,
+            "memory_match": None,
+        }
+        for index in range(1, 9)
+    ]
+    with service._jobs_lock:
+        service._merge_job_snapshot(
+            service._jobs[job_id],
+            {"rolling_analysis": rolling},
+        )
+
+    snapshot = client.get(f"/api/person/status/{job_id}").get_json()["snapshot"]
+    identities = snapshot["rolling_analysis"]["live_identities"]
+
+    assert len(identities) == 8
+    assert [item["live_identity_id"] for item in identities] == [
+        f"live_{index:04d}" for index in range(1, 9)
+    ]
+
+
 def _rolling_publication(sequence: int, requested: int, analyzed: int, chunk: int):
     return {
         "enabled": True,

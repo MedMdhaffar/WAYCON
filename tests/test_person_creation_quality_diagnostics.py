@@ -179,9 +179,9 @@ def test_keep_staging_defaults_to_disabled(monkeypatch):
 
 def test_quality_thresholds_are_unchanged():
     assert DEFAULT_QUALITY_FILTER_CONFIG.to_dict() == {
-        "face_min_width": 50,
-        "face_min_height": 50,
-        "face_min_sharpness": 20.0,
+        "face_min_width": 48,
+        "face_min_height": 48,
+        "face_min_sharpness": 45.0,
         "body_min_height": 80,
         "body_min_area": 3000,
         "body_min_sharpness": 50.0,

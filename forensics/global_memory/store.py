@@ -71,6 +71,17 @@ IDENTITY_REVIEW_MAX_OFFSET = SQLITE_MAX_INTEGER
 IDENTITY_REVIEW_GALLERY_LIMIT_PER_TYPE = 6
 IDENTITY_REVIEW_APPEARANCE_LIMIT = 10
 IDENTITY_REVIEW_RECOGNITION_LIMIT = 10
+SQLITE_BUSY_TIMEOUT_MS = 5000
+
+
+# Schema setup is a database lifecycle operation, not a connection lifecycle
+# operation.  Keep the registry keyed by the resolved database path so tests and
+# standalone callers can use independent databases in the same process.  The
+# file identity prevents a database replaced at the same path from inheriting a
+# stale initialized marker.
+_SCHEMA_INITIALIZATION_REGISTRY_LOCK = threading.Lock()
+_SCHEMA_INITIALIZATION_LOCKS: dict[Path, threading.Lock] = {}
+_INITIALIZED_DATABASES: dict[Path, tuple[int, int]] = {}
 
 
 class ReadOnlyGlobalMemoryError(RuntimeError):
@@ -94,7 +105,7 @@ class GlobalMemory:
             self._conn.row_factory = sqlite3.Row
             self._configure_connection()
             if not self.read_only:
-                self._initialize_schema()
+                self._initialize_database_once()
         except BaseException:
             self._conn.close()
             raise
@@ -105,12 +116,14 @@ class GlobalMemory:
             return sqlite3.connect(
                 uri,
                 uri=True,
+                timeout=SQLITE_BUSY_TIMEOUT_MS / 1000,
                 check_same_thread=False,
                 isolation_level=None,
             )
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         return sqlite3.connect(
             str(self.db_path),
+            timeout=SQLITE_BUSY_TIMEOUT_MS / 1000,
             check_same_thread=False,
             isolation_level=None,
         )
@@ -118,16 +131,46 @@ class GlobalMemory:
     def _configure_connection(self) -> None:
         if self.read_only:
             self._conn.execute("PRAGMA query_only=ON")
-            self._conn.execute("PRAGMA busy_timeout=5000")
+            self._conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
             return
         self._conn.execute("PRAGMA foreign_keys=ON")
-        self._conn.execute("PRAGMA busy_timeout=5000")
+        self._conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
+
+    def _initialize_database_once(self) -> None:
+        database_key = self.db_path.expanduser().resolve(strict=False)
+        if str(self.db_path) == ":memory:":
+            self._initialize_database()
+            return
+
+        with _SCHEMA_INITIALIZATION_REGISTRY_LOCK:
+            initialization_lock = _SCHEMA_INITIALIZATION_LOCKS.setdefault(
+                database_key,
+                threading.Lock(),
+            )
+
+        with initialization_lock:
+            file_identity = self._database_file_identity()
+            with _SCHEMA_INITIALIZATION_REGISTRY_LOCK:
+                if _INITIALIZED_DATABASES.get(database_key) == file_identity:
+                    return
+
+            self._initialize_database()
+            initialized_identity = self._database_file_identity()
+            with _SCHEMA_INITIALIZATION_REGISTRY_LOCK:
+                _INITIALIZED_DATABASES[database_key] = initialized_identity
+
+    def _database_file_identity(self) -> tuple[int, int]:
+        stat = self.db_path.stat()
+        return int(stat.st_dev), int(stat.st_ino)
+
+    def _initialize_database(self) -> None:
         journal_mode = self._conn.execute("PRAGMA journal_mode=WAL").fetchone()
         if journal_mode is None or str(journal_mode[0]).lower() != "wal":
             actual = "unknown" if journal_mode is None else str(journal_mode[0])
             raise RuntimeError(
                 f"Global Memory requires WAL journal mode; SQLite returned {actual!r}."
             )
+        self._initialize_schema()
 
     def _initialize_schema(self) -> None:
         schema_path = Path(__file__).with_name("schema.sql")

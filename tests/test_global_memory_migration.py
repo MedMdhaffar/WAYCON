@@ -634,8 +634,12 @@ def test_all_active_registration_behavior_is_unchanged(tmp_path):
 
 def test_memory_persons_api_include_inactive(monkeypatch):
     calls: list[bool] = []
+    read_only_connections: list[bool] = []
 
     class FakeMemory:
+        def __init__(self, *, read_only=False):
+            read_only_connections.append(read_only)
+
         def list_all(self, include_inactive=False):
             calls.append(include_inactive)
             return []
@@ -650,6 +654,7 @@ def test_memory_persons_api_include_inactive(monkeypatch):
     assert client.get("/api/memory/persons").status_code == 200
     assert client.get("/api/memory/persons?include_inactive=true").status_code == 200
     assert calls == [False, True]
+    assert read_only_connections == [True, True]
 
 
 def test_two_writers_and_busy_timeout_serialize(tmp_path):

@@ -23,9 +23,10 @@ function pathValue(value) {
 }
 
 export default function LiveIdentityCard({ identity }) {
-  const known = Boolean(identity.canonicalPersonId || identity.memoryMatch)
+  const known = identity.persisted && Boolean(identity.canonicalPersonId)
   const name = identity.memoryMatch?.name || identity.canonicalPersonId || 'Known person'
   const candidateSimilarity = formatSimilarity(identity.candidateSimilarity)
+  const secondCandidateSimilarity = formatSimilarity(identity.secondCandidateSimilarity)
   const margin = formatSimilarity(identity.margin)
   const bodyImagePath = identity.selectedBodyCrop || identity.bestBodyPath
   const imageAlt = known
@@ -55,20 +56,30 @@ export default function LiveIdentityCard({ identity }) {
         />
       </div>
       <div className="live-identity-card-body">
-        <div className="live-identity-kind">{known ? 'Known person detected' : 'Unknown person detected'}</div>
-        <h3>{known ? name : 'Unknown person'}</h3>
+        <div className="live-identity-kind">
+          {identity.state === 'observing'
+            ? 'Waiting for valid face'
+            : identity.provisional
+            ? 'Provisional comparison'
+            : known ? 'Known person detected' : 'Unknown person detected'}
+        </div>
+        <h3>{known ? name : identity.candidatePersonId || 'Unknown person'}</h3>
         <div className="live-identity-id">{identity.liveIdentityId}</div>
         <dl className="live-identity-facts">
           <div><dt>Canonical person</dt><dd>{identity.canonicalPersonId || 'Pending'}</dd></div>
           <div><dt>State</dt><dd>{readable(identity.state)}</dd></div>
           <div><dt>Decision</dt><dd>{readable(identity.decision)}</dd></div>
-          <div><dt>Provisional</dt><dd>{identity.provisional ? 'Yes' : 'No'}</dd></div>
+          <div><dt>Comparison</dt><dd>{identity.provisional ? 'Provisional' : 'Durable'}</dd></div>
+          <div><dt>Persisted</dt><dd>{identity.persisted ? 'Yes' : 'No'}</dd></div>
+          <div><dt>Reason</dt><dd>{readable(identity.reason)}</dd></div>
           <div><dt>Candidate</dt><dd>{identity.candidatePersonId || 'None'}</dd></div>
           <div><dt>Similarity</dt><dd>{candidateSimilarity || 'Unavailable'}</dd></div>
+          <div><dt>Second candidate</dt><dd>{identity.secondCandidatePersonId || 'None'}</dd></div>
+          <div><dt>Second similarity</dt><dd>{secondCandidateSimilarity || 'Unavailable'}</dd></div>
           <div><dt>Margin</dt><dd>{margin || 'Unavailable'}</dd></div>
         </dl>
         <div className="live-identity-evidence">
-          <span>{observationLabel(identity.faceCount, 'face observation', 'face observations')}</span>
+          <span>{observationLabel(identity.observationCount, 'face observation', 'face observations')}</span>
           <span>{observationLabel(identity.bodyCount, 'body observation', 'body observations')}</span>
           <span>{seenRange(identity)}</span>
         </div>

@@ -70,6 +70,7 @@ def _safe_path(value: Any) -> str:
 
 _STABLE_CONSECUTIVE_OUTCOMES = 2
 _STABLE_OBSERVATION_COUNT = 6
+_MINIMUM_FACE_OBSERVATIONS_FOR_COMPARISON = 1
 
 
 def _rounded(value: Any) -> float | None:
@@ -128,6 +129,7 @@ class LiveRollingAnalysisSession:
         self._identity_decision_records: dict[str, dict] = {}
         self._identity_evidence_versions: dict[str, int] = {}
         self._identity_evidence_signatures: dict[str, str] = {}
+        self._identity_all_evidence_signatures: dict[str, str] = {}
         self._identity_decision_keys: set[str] = set()
         self._identity_states: dict[str, tuple[str, int]] = {}
         self._identity_provisional: dict[str, dict] = {}
@@ -526,10 +528,17 @@ class LiveRollingAnalysisSession:
                 ),
                 "margin": (record or {}).get("margin"),
                 "decision": (record or {}).get("decision"),
+                "reason": (record or {}).get("reason"),
                 "provisional": bool((record or {}).get("provisional")),
+                "persisted": bool((record or {}).get("persisted")),
                 "canonical_person_id": (record or {}).get("canonical_person_id"),
                 "suggestion_id": (record or {}).get("suggestion_id"),
                 "decision_version": (record or {}).get("decision_version"),
+                "evidence_version": (record or {}).get("evidence_version"),
+                "evidence_signature": (record or {}).get("evidence_signature"),
+                "observation_count": (
+                    (record or {}).get("observation_count", face_count)
+                ),
             })
 
         raw_events = self._build_events(
@@ -705,9 +714,18 @@ class LiveRollingAnalysisSession:
     ) -> Any:
         from forensics.global_memory.identity_policy import evaluate_identity_decision
 
-        candidates = memory.rank_identity_candidates(
-            cluster.get("representative_embedding")
+        embedding = np.asarray(
+            cluster.get("representative_embedding"),
+            dtype=np.float64,
         )
+        if (
+            embedding.ndim != 1
+            or embedding.size == 0
+            or not np.isfinite(embedding).all()
+            or float(np.linalg.norm(embedding)) <= 0
+        ):
+            raise ValueError("representative face embedding is invalid")
+        candidates = memory.rank_identity_candidates(embedding.tolist())
         return evaluate_identity_decision(
             top_candidate=candidates[0] if candidates else None,
             second_candidate=candidates[1] if len(candidates) > 1 else None,
@@ -775,23 +793,33 @@ class LiveRollingAnalysisSession:
 
         faces, bodies = self._identity_evidence(cluster, assignments)
         face_count = len(faces)
-        signature = self._evidence_signature(
+        face_signature = self._evidence_signature(
+            key for key, _path in faces
+        )
+        all_signature = self._evidence_signature(
             key for key, _path in faces + bodies
         )
 
         with self._condition:
             record = deepcopy(self._identity_decision_records.get(live_id))
-            unchanged = self._identity_evidence_signatures.get(live_id) == signature
+            face_unchanged = (
+                self._identity_evidence_signatures.get(live_id) == face_signature
+            )
+            all_unchanged = (
+                self._identity_all_evidence_signatures.get(live_id)
+                == all_signature
+            )
             version = self._identity_evidence_versions.get(live_id, 0)
-            if not unchanged:
+            if not face_unchanged:
                 version += 1
-                self._identity_evidence_signatures[live_id] = signature
+                self._identity_evidence_signatures[live_id] = face_signature
                 self._identity_evidence_versions[live_id] = version
+            self._identity_all_evidence_signatures[live_id] = all_signature
             provisional = deepcopy(self._identity_provisional.get(live_id))
             streak = self._identity_outcome_streak.get(live_id)
 
         if record is not None:
-            if unchanged:
+            if all_unchanged:
                 return record
             return self._append_new_evidence(
                 live_id=live_id,
@@ -801,14 +829,14 @@ class LiveRollingAnalysisSession:
                 cluster=cluster,
                 snapshot=snapshot,
                 version=version,
-                signature=signature,
+                signature=all_signature,
             )
 
-        if unchanged and provisional is not None:
+        if face_unchanged and provisional is not None:
             return provisional
 
         policy = self._policy_configuration()
-        if face_count < int(policy.minimum_face_observations):
+        if face_count < _MINIMUM_FACE_OBSERVATIONS_FOR_COMPARISON:
             return None
         memory = self._open_decision_memory()
         if memory is None:
@@ -823,6 +851,7 @@ class LiveRollingAnalysisSession:
             "decision": outcome,
             "reason": decision.reason.value,
             "provisional": True,
+            "persisted": False,
             "canonical_person_id": None,
             "suggestion_id": None,
             "candidate_person_id": decision.top_candidate_person_id,
@@ -831,7 +860,10 @@ class LiveRollingAnalysisSession:
             "second_candidate_similarity": _rounded(decision.second_similarity),
             "margin": _rounded(decision.margin),
             "decision_version": version,
-            "last_evidence_signature": signature,
+            "evidence_version": version,
+            "evidence_signature": face_signature,
+            "observation_count": face_count,
+            "last_evidence_signature": all_signature,
         }
         with self._condition:
             self._identity_outcome_streak[live_id] = (outcome, consecutive)
@@ -851,7 +883,7 @@ class LiveRollingAnalysisSession:
             bodies=bodies,
             face_count=face_count,
             version=version,
-            signature=signature,
+            signature=all_signature,
             policy=policy,
             memory=memory,
         )
@@ -919,6 +951,7 @@ class LiveRollingAnalysisSession:
             "decision": result.decision.value,
             "reason": result.reason.value,
             "provisional": False,
+            "persisted": True,
             "canonical_person_id": result.person_id,
             "suggestion_id": result.suggestion_id,
             "candidate_person_id": result.top_candidate_person_id,
@@ -927,6 +960,10 @@ class LiveRollingAnalysisSession:
             "second_candidate_similarity": _rounded(result.second_similarity),
             "margin": _rounded(result.margin),
             "decision_version": version,
+            "evidence_version": version,
+            "evidence_signature": self._evidence_signature(
+                key for key, _path in faces
+            ),
             "observation_count": face_count,
             "evidence_keys": evidence_keys,
             "persisted_evidence_keys": evidence_keys,
