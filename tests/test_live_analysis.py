@@ -5,6 +5,7 @@ import sqlite3
 import threading
 import time
 from copy import deepcopy
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -21,11 +22,23 @@ from forensics.person_creation.live_session import (
     FrozenRecord,
     LivePreprocessingSession,
 )
+from forensics.person_creation.nodes.identity_config import load_identity_config
 from forensics.person_creation.nodes.process_live_stream import LiveChunkResult
 
 
 def _record(value: dict) -> FrozenRecord:
     return FrozenRecord.from_mapping(value)
+
+
+def test_dbscan_defaults_remain_unchanged(monkeypatch):
+    for name in ("EPS", "MIN_SAMPLES", "MIN_CLUSTER_FACE_COUNT"):
+        monkeypatch.delenv(f"PERSON_CREATION_IDENTITY_{name}", raising=False)
+
+    assert load_identity_config({}) == {
+        "eps": 0.4,
+        "min_samples": 3,
+        "min_cluster_face_count": 3,
+    }
 
 
 def _snapshot(version: int, paths: tuple[str, ...], *, chunk: int | None = None):
@@ -132,6 +145,9 @@ def test_successful_analysis_publishes_compact_embedding_free_status(tmp_path):
     session.finish(1)
 
     assert status["analysis_state"] == "ready"
+    assert status["evidence_version"] == 1
+    assert status["publication_sequence"] >= 0
+    assert status["generated_at"]
     assert status["analyzed_embedding_count"] == 1
     assert status["last_completed_preprocessing_chunk"] == 3
     assert status["live_identities"][0]["session_person_id"] == "live_0001"
@@ -139,6 +155,25 @@ def test_successful_analysis_publishes_compact_embedding_free_status(tmp_path):
     assert "all_face_embeddings" not in serialized
     assert "[1.0, 0.0]" not in serialized
     assert "database" not in serialized
+
+
+def test_committed_live_state_contains_production_final_stages(tmp_path):
+    session = LiveRollingAnalysisSession(
+        snapshot_provider=lambda: _snapshot(1, ("face-a.jpg",), chunk=3),
+        cluster=_cluster_all,
+        associate=_association,
+        database_path=tmp_path / "missing.db",
+    )
+    session.start()
+    session.request_version(1)
+    _wait_for(session, 1)
+    session.finish(1)
+
+    canonical = session.canonical_state()
+    assert canonical["identity_clusters"][0]["face_count"] == 1
+    assert canonical["per_cluster_best_body_crops"] == {0: []}
+    assert canonical["reid_reasons"][0] == "no_reid_model_configured"
+    assert canonical["per_cluster_profiles"][0]["cluster_id"] == 0
 
 
 def test_rolling_dbscan_exception_is_fail_open_and_final_pass_can_exit(tmp_path):
@@ -319,6 +354,50 @@ def test_no_new_embeddings_advance_progress_without_rerun_or_duplicate_events(tm
     assert calls == [1]
     assert second["last_completed_preprocessing_chunk"] == 1
     assert second["live_recognition_events"] == first["live_recognition_events"]
+
+
+def test_body_only_update_reuses_unchanged_dbscan_but_refreshes_association(
+    tmp_path,
+):
+    current = [_snapshot(1, ("face-a.jpg",), chunk=0)]
+    cluster_calls = 0
+    association_calls = 0
+
+    def cluster(state):
+        nonlocal cluster_calls
+        cluster_calls += 1
+        return _cluster_all(state)
+
+    def associate(_state):
+        nonlocal association_calls
+        association_calls += 1
+        return SimpleNamespace(cluster_assignments={0: []})
+
+    session = LiveRollingAnalysisSession(
+        snapshot_provider=lambda: current[0],
+        cluster=cluster,
+        associate=associate,
+        database_path=tmp_path / "missing.db",
+    )
+    session.start()
+    session.request_version(1)
+    _wait_for(session, 1)
+    current[0] = replace(
+        _snapshot(2, ("face-a.jpg",), chunk=1),
+        quality_body_crops=(_record({
+            "path": str(tmp_path / "body.jpg"),
+            "frame_idx": 2,
+            "video": "camera-source",
+            "bbox": [0, 0, 80, 160],
+            "sharpness": 100.0,
+        }),),
+    )
+    session.request_version(2)
+    _wait_for(session, 2)
+    session.finish(2)
+
+    assert cluster_calls == 1
+    assert association_calls == 2
 
 
 def test_semantic_events_are_not_repeated_at_newer_analysis_version(tmp_path):
@@ -812,3 +891,76 @@ def test_connection_cleanup_failure_wakes_shutdown_waiters(tmp_path):
     assert status["analysis_state"] == "shutdown_warning"
     assert "Global Memory cleanup" in status["analysis_warning"]
     assert "close details" not in status["analysis_warning"]
+
+
+def test_intermediate_versions_are_conflated_to_newest_pending_version(tmp_path):
+    current = {"version": 0}
+    first_run_started = threading.Event()
+    release_first_run = threading.Event()
+    cluster_counts = []
+
+    def snapshot_provider():
+        version = current["version"]
+        embeddings = tuple(
+            FrozenRecord.from_mapping({
+                "crop_path": f"face-{index}.jpg",
+                "embedding": [1.0, 0.0],
+                "sharpness": 100.0,
+            })
+            for index in range(version)
+        )
+        return FrozenAnalysisSnapshot(
+            version=version,
+            last_completed_preprocessing_chunk=version,
+            person_name="",
+            video_paths=(),
+            identity_clustering_config=FrozenRecord.from_mapping({
+                "eps": 0.4,
+                "min_samples": 3,
+                "min_cluster_face_count": 3,
+            }),
+            quality_body_crops=(),
+            quality_face_crops=(),
+            face_embeddings=embeddings,
+            face_chunk_membership=tuple(
+                (f"face-{index}.jpg", version) for index in range(version)
+            ),
+        )
+
+    def cluster(state):
+        cluster_counts.append(len(state["all_face_embeddings"]))
+        if len(cluster_counts) == 1:
+            first_run_started.set()
+            assert release_first_run.wait(2.0)
+        return {"identity_clusters": [], "unresolved_faces": []}
+
+    session = LiveRollingAnalysisSession(
+        snapshot_provider=snapshot_provider,
+        database_path=tmp_path / "missing.db",
+        cluster=cluster,
+        associate=lambda _state: SimpleNamespace(
+            associations=[],
+            cluster_assignments={},
+            unattached_bodies=[],
+            frame_groups=[],
+            rejected_pairs=[],
+        ),
+        debounce_seconds=0.5,
+        minimum_new_versions=3,
+    )
+    session.start()
+    for version in (1, 2, 3):
+        current["version"] = version
+        session.request_version(version)
+    assert first_run_started.wait(1.0)
+    for version in (4, 5, 6, 7):
+        current["version"] = version
+        session.request_version(version)
+    release_first_run.set()
+    session.finish(7)
+
+    snapshot = session.public_snapshot()
+    assert cluster_counts == [3, 7]
+    assert snapshot["analysis_runs_started"] == 2
+    assert snapshot["analysis_versions_conflated"] >= 5
+    assert snapshot["analysis_version"] == 7

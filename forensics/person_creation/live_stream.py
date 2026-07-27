@@ -62,6 +62,7 @@ class BufferedFrame:
     frame_idx: int
     timestamp: str
     frame: Any
+    captured_monotonic: float | None = None
 
 
 class LiveFrameBuffer:
@@ -332,7 +333,12 @@ class LiveFrameBuffer:
                     self._last_frame_monotonic = frame_monotonic
                     self.stream_state = "connected"
                     self.stream_warning = None
-                item = BufferedFrame(frame_idx=frame_idx, timestamp=timestamp, frame=frame)
+                item = BufferedFrame(
+                    frame_idx=frame_idx,
+                    timestamp=timestamp,
+                    frame=frame,
+                    captured_monotonic=frame_monotonic,
+                )
                 if self._queue.full():
                     try:
                         self._queue.get_nowait()
@@ -373,9 +379,21 @@ class LiveFrameBuffer:
         return self._queue.empty()
 
     def stop(self) -> None:
+        self.request_stop()
+        self.join(self.shutdown_timeout_seconds)
+
+    def request_stop(self) -> None:
+        """Signal the sole reader owner without waiting for native I/O."""
         with self._stop_lock:
             print("[LiveFrameBuffer] stop requested", flush=True)
             self._stop_event.set()
+
+    def join(self, timeout_seconds: float | None = None) -> None:
+        """Join the reader for a bounded interval after ``request_stop``."""
+        timeout = self.shutdown_timeout_seconds if timeout_seconds is None else max(
+            0.0, float(timeout_seconds)
+        )
+        with self._stop_lock:
             with self._state_lock:
                 thread = self._thread
 
@@ -383,11 +401,11 @@ class LiveFrameBuffer:
                 return
 
             print("[LiveFrameBuffer] waiting for reader thread", flush=True)
-            thread.join(timeout=self.shutdown_timeout_seconds)
+            thread.join(timeout=timeout)
             if thread.is_alive():
                 raise LiveFrameBufferLifecycleError(
                     "Live camera reader did not stop within "
-                    f"{self.shutdown_timeout_seconds:g} seconds; "
+                    f"{timeout:g} seconds; "
                     "staging must be preserved."
                 )
 

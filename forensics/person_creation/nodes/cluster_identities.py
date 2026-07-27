@@ -68,6 +68,44 @@ def _confidence(unit_vecs: np.ndarray) -> float:
     return round(float(np.mean(off_diagonal)), 4)
 
 
+def _robust_representative(
+    unit_vecs: np.ndarray,
+    records: list[dict],
+) -> tuple[np.ndarray, dict]:
+    """Choose the observed medoid; one poor vector cannot replace the group."""
+    if len(unit_vecs) == 1:
+        index = 0
+        pairwise = np.asarray([], dtype=np.float64)
+    else:
+        similarities = unit_vecs @ unit_vecs.T
+        mean_similarity = (similarities.sum(axis=1) - 1.0) / (len(unit_vecs) - 1)
+        index = max(
+            range(len(records)),
+            key=lambda item: (
+                float(mean_similarity[item]),
+                float(records[item].get("sharpness") or 0.0),
+                str(records[item].get("crop_path") or ""),
+            ),
+        )
+        pairwise = similarities[np.triu_indices(len(unit_vecs), k=1)]
+    return unit_vecs[index], {
+        "representative_strategy": "normalized_medoid",
+        "representative_quality": (
+            records[index].get("face_quality") or {}
+        ).get("quality_class", "standard"),
+        "intra_cluster_similarity_min": (
+            round(float(pairwise.min()), 4) if pairwise.size else 1.0
+        ),
+        "intra_cluster_similarity_median": (
+            round(float(np.median(pairwise)), 4) if pairwise.size else 1.0
+        ),
+        "intra_cluster_similarity_max": (
+            round(float(pairwise.max()), 4) if pairwise.size else 1.0
+        ),
+        "outlier_count": 0,
+    }
+
+
 def cluster_identities(state: dict) -> dict:
     """Cluster every face embedding into identities with DBSCAN.
 
@@ -88,9 +126,10 @@ def cluster_identities(state: dict) -> dict:
 
     embeddings = _l2_normalize(np.asarray([r["embedding"] for r in records], dtype=np.float64))
 
-    # Cosine-distance DBSCAN. min_samples is clamped so a run with very few
-    # faces still forms its single cluster instead of labelling everything noise.
-    min_samples = max(1, min(int(cfg["min_samples"]), len(records)))
+    # Keep the configured DBSCAN density rule intact even for short live runs.
+    # A singleton is noise when min_samples=3; publication policy, not a hidden
+    # min_samples clamp, decides whether a strong known-person match is visible.
+    min_samples = int(cfg["min_samples"])
     labels = _dbscan_cosine(embeddings, float(cfg["eps"]), min_samples)
 
     min_faces = int(cfg["min_cluster_face_count"])
@@ -104,7 +143,15 @@ def cluster_identities(state: dict) -> dict:
             continue
 
         member_vecs = embeddings[members]
-        representative = _l2_normalize(member_vecs.mean(axis=0, keepdims=True))[0]
+        member_records = [records[i] for i in members]
+        representative, consistency = _robust_representative(
+            member_vecs,
+            member_records,
+        )
+        distinct_frames = {
+            (record.get("video"), record.get("frame_idx"))
+            for record in member_records
+        }
         clusters.append({
             "cluster_id": int(label),
             "face_records": [records[i] for i in members],
@@ -112,7 +159,47 @@ def cluster_identities(state: dict) -> dict:
             "face_count": len(members),
             "confidence": _confidence(member_vecs),
             "low_confidence": len(members) < min_faces,
+            "distinct_evidence_count": len({
+                str(record.get("crop_path") or "") for record in member_records
+            }),
+            "distinct_frame_count": len(distinct_frames),
+            "temporal_frame_min": min(
+                (int(record["frame_idx"]) for record in member_records
+                 if record.get("frame_idx") is not None),
+                default=None,
+            ),
+            "temporal_frame_max": max(
+                (int(record["frame_idx"]) for record in member_records
+                 if record.get("frame_idx") is not None),
+                default=None,
+            ),
+            **consistency,
         })
+
+    for cluster in clusters:
+        representative = np.asarray(
+            cluster["representative_embedding"],
+            dtype=np.float64,
+        )
+        other_similarities = [
+            float(representative @ np.asarray(
+                other["representative_embedding"],
+                dtype=np.float64,
+            ))
+            for other in clusters
+            if other is not cluster
+        ]
+        nearest = max(other_similarities) if other_similarities else None
+        cluster["nearest_cluster_similarity"] = (
+            round(nearest, 4) if nearest is not None else None
+        )
+        cluster["nearest_cluster_separation_margin"] = (
+            round(
+                float(cluster["intra_cluster_similarity_median"]) - nearest,
+                4,
+            )
+            if nearest is not None else None
+        )
 
     print(
         f"[cluster_identities] {len(clusters)} identity cluster(s) from "

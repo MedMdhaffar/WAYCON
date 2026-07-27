@@ -393,10 +393,10 @@ def test_preview_outputs_match_existing_quality_and_embedding_nodes(
 def test_quality_and_embedding_algorithm_source_hashes_are_unchanged():
     expected = {
         "filter_quality.py": (
-            "44EA350A1C4DE54AB67AA71251FE66944BCDCF49F46553E7200B8DD3DA2E9304"
+            "4EF5548BA056EB7CE4FD36880093FF2A2366B52B088B9D2A3592845E661346A0"
         ),
         "embed_all_faces.py": (
-            "976F2DBFF099E7A7EB65FD8227D39BFD6A86AFE5ECA039E2E2C85A76412CE138"
+            "FF74FD59CF6F9CF905275FA5E227118987F00E32F0C91BCC7304DB29EC71DF4A"
         ),
     }
     nodes_dir = Path(processing.__file__).parent / "nodes"

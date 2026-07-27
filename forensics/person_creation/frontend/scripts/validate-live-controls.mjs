@@ -13,6 +13,7 @@ import {
   isStopPending,
   liveProgress,
   mediaImageUrl,
+  markStatusResponseReceived,
   mergeJobStatus,
   normalizeRollingAnalysis,
   postStopRequest,
@@ -99,13 +100,14 @@ const rollingPayload = {
       associated_body_count: 7,
       first_seen_chunk: 2,
       last_seen_chunk: 9,
-      representative_face_path: 'folder/face one.jpg',
+      representative_face_path: 'session/_staging/face_crops/face-one.jpg',
       memory_match: { person_id: 'person_006', name: 'Malek', similarity: 0.84 },
     },
     {
       session_person_id: 'live_0002',
       face_count: 4,
       associated_body_count: 3,
+      representative_face_path: 'session/_staging/face_crops/face-two.jpg',
       memory_match: null,
     },
   ],
@@ -127,6 +129,7 @@ const missingName = normalizeRollingAnalysis({
   enabled: true,
   live_identities: [{
     session_person_id: 'live_0003',
+    representative_face_path: 'session/_staging/face_crops/face-three.jpg',
     memory_match: { person_id: 'person_009', similarity: 0.7 },
   }],
 })
@@ -241,38 +244,90 @@ let scheduledPoll
 let cleared = 0
 let terminalCalls = 0
 const statuses = ['stop_requested', 'stopping', 'done']
+let nextTimerId = 6
 const cleanup = startStatusPolling({
   fetchStatus: async () => ({ status: statuses.shift() }),
   onTerminal: () => { terminalCalls += 1 },
-  setIntervalFn: (callback, interval) => {
-    assert.equal(interval, 2000)
+  setTimeoutFn: (callback, interval) => {
+    assert.equal(interval, statuses.length === 0 ? 2000 : 500)
     scheduledPoll = callback
-    return 7
+    nextTimerId += 1
+    return nextTimerId
   },
-  clearIntervalFn: id => { assert.equal(id, 7); cleared += 1 },
+  clearTimeoutFn: id => { assert.equal(id, nextTimerId); cleared += 1 },
 })
 await new Promise(resolve => setTimeout(resolve, 0))
 assert.equal(cleared, 0)
-await scheduledPoll()
+scheduledPoll()
+await new Promise(resolve => setTimeout(resolve, 0))
 assert.equal(cleared, 0)
-await scheduledPoll()
-assert.equal(cleared, 1)
+scheduledPoll()
+await new Promise(resolve => setTimeout(resolve, 0))
+assert.equal(cleared, 0)
 assert.equal(terminalCalls, 1)
 cleanup()
+assert.equal(cleared, 1)
 
 let resolvePendingPoll
 let terminalAfterCleanup = 0
 const pendingCleanup = startStatusPolling({
   fetchStatus: () => new Promise(resolve => { resolvePendingPoll = resolve }),
   onTerminal: () => { terminalAfterCleanup += 1 },
-  setIntervalFn: () => 9,
-  clearIntervalFn: () => {},
+  setTimeoutFn: () => 9,
+  clearTimeoutFn: () => {},
 })
 await Promise.resolve()
 pendingCleanup()
 resolvePendingPoll({ status: 'done' })
 await new Promise(resolve => setTimeout(resolve, 0))
 assert.equal(terminalAfterCleanup, 0)
+
+let pollingCalls = 0
+let releaseSingleFlight
+const singleFlightTimers = []
+const singleFlightCleanup = startStatusPolling({
+  fetchStatus: () => {
+    pollingCalls += 1
+    return new Promise(resolve => { releaseSingleFlight = resolve })
+  },
+  setTimeoutFn: (callback, interval) => {
+    assert.equal(interval, 500)
+    singleFlightTimers.push(callback)
+    return singleFlightTimers.length
+  },
+  clearTimeoutFn: () => {},
+})
+assert.deepEqual(singleFlightCleanup.diagnostics, {
+  activeIntervalMs: 500,
+  terminalIntervalMs: 2000,
+  singleFlight: true,
+})
+await Promise.resolve()
+assert.equal(pollingCalls, 1)
+assert.equal(singleFlightTimers.length, 0)
+releaseSingleFlight({ status: 'processing_live_frames' })
+await new Promise(resolve => setTimeout(resolve, 0))
+assert.equal(singleFlightTimers.length, 1)
+singleFlightTimers[0]()
+singleFlightTimers[0]()
+await Promise.resolve()
+assert.equal(pollingCalls, 2)
+singleFlightCleanup()
+releaseSingleFlight({ status: 'processing_live_frames' })
+
+const received = {
+  snapshot: {
+    rolling_analysis: {
+      live_identities: [{ live_identity_id: 'live_0001' }],
+    },
+  },
+}
+markStatusResponseReceived(received, 125.5, 1000)
+assert.equal(
+  received.snapshot.rolling_analysis.live_identities[0]
+    .latency_metrics.frontend_received_monotonic,
+  125.5,
+)
 
 const privateUri = 'rtsp://private-user:private-password@camera.local/live?token=secret'
 const safeMessage = safeErrorMessage(`Failed to stop ${privateUri}`)
@@ -317,6 +372,9 @@ assert.match(clothingSource, /Clothing description unavailable for this identity
 assert.match(streamStatsSource, /Camera connection interrupted\. Reconnecting/)
 assert.match(streamStatsSource, /streamReconnectCount/)
 assert.match(streamStatsSource, /lastFrameAgeSeconds/)
+assert.match(streamStatsSource, /samplingIntervalFrames/)
+assert.match(streamStatsSource, /unresolvedEmbeddings/)
+assert.match(streamStatsSource, /maximumQueueDepth/)
 assert.equal(/console\.(log|error|warn)\s*\(/.test(`${appSource}\n${formSource}`), false)
 
 console.log('live camera frontend validation: rolling identity and polling behaviors passed')

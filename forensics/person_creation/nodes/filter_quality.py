@@ -1,4 +1,5 @@
 from pathlib import Path
+import math
 
 import cv2
 
@@ -21,6 +22,7 @@ _FACE_REJECTION_REASONS = (
     "too_small",
     "low_sharpness",
     "bad_brightness",
+    "invalid_bbox",
     "other",
 )
 
@@ -83,19 +85,56 @@ def _face_diagnostic(
     diagnostic["height"] = int(height)
     diagnostic["brightness"] = float(image.mean())
     try:
-        x1, y1, x2, y2 = crop["bbox"]
-        bbox_width = float(x2) - float(x1)
-        bbox_height = float(y2) - float(y1)
+        bbox = [float(value) for value in crop["bbox"]]
+        if len(bbox) != 4 or not all(math.isfinite(value) for value in bbox):
+            raise ValueError
+        x1, y1, x2, y2 = bbox
+        if x2 <= x1 or y2 <= y1:
+            return "invalid_bbox", diagnostic
         sharpness = float(crop["sharpness"])
     except (KeyError, TypeError, ValueError):
-        return "other", diagnostic
+        return "invalid_bbox", diagnostic
 
-    if bbox_width < config.face_min_width or bbox_height < config.face_min_height:
+    # The persisted crop is the image sent to the embedder. Detector bboxes
+    # describe the source-frame detection and can differ because crop padding
+    # and boundary clipping are applied before cv2.imwrite.
+    if width < config.face_min_width or height < config.face_min_height:
         return "too_small", diagnostic
     if sharpness < config.face_min_sharpness:
         return "low_sharpness", diagnostic
     # There is no brightness rejection threshold in the current algorithm.
     return None, diagnostic
+
+
+def _confirmation_eligible(crop: dict) -> tuple[bool, str]:
+    """Use only existing metadata; do not invent a detector threshold."""
+    try:
+        confidence = float(crop["confidence"])
+    except (KeyError, TypeError, ValueError):
+        return False, "detector_confidence_unavailable"
+    if not math.isfinite(confidence) or not 0.0 <= confidence <= 1.0:
+        return False, "detector_confidence_invalid"
+    return True, "accepted"
+
+
+def _quality_result(crop: dict, diagnostic: dict) -> dict:
+    eligible, reason = _confirmation_eligible(crop)
+    return {
+        "acceptance_state": (
+            "confirmation_eligible" if eligible else "embedding_eligible"
+        ),
+        "accepted_for_embedding": True,
+        "immediate_confirmation_eligible": eligible,
+        "reason": reason,
+        "quality_class": "high" if eligible else "standard",
+        "measurements": {
+            "width": diagnostic.get("width"),
+            "height": diagnostic.get("height"),
+            "sharpness": diagnostic.get("sharpness"),
+            "brightness": diagnostic.get("brightness"),
+            "detector_confidence": crop.get("confidence"),
+        },
+    }
 
 
 def _print_face_rejection_sample(diagnostic: dict, reason: str) -> None:
@@ -119,6 +158,7 @@ def filter_quality(state: dict) -> dict:
     for crop in state["face_crops"]:
         reason, diagnostic = _face_diagnostic(crop, config)
         if reason is None:
+            crop["_face_quality"] = _quality_result(crop, diagnostic)
             quality_face.append(crop)
             continue
         rejected_counts[reason] += 1

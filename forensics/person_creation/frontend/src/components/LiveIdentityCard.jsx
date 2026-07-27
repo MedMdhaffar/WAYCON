@@ -1,4 +1,4 @@
-import { formatSimilarity } from '../liveJob.js'
+import { completeCardLatency, formatSimilarity } from '../liveJob.js'
 import SafeImage from './SafeImage.jsx'
 
 function observationLabel(count, singular, plural) {
@@ -24,12 +24,14 @@ function pathValue(value) {
 
 export default function LiveIdentityCard({ identity }) {
   const known = identity.persisted && Boolean(identity.canonicalPersonId)
+  const strongKnown = identity.reason === 'strong_clear_match' && Boolean(identity.candidatePersonId)
   const name = identity.memoryMatch?.name || identity.canonicalPersonId || 'Known person'
   const candidateSimilarity = formatSimilarity(identity.candidateSimilarity)
   const secondCandidateSimilarity = formatSimilarity(identity.secondCandidateSimilarity)
   const margin = formatSimilarity(identity.margin)
   const bodyImagePath = identity.selectedBodyCrop || identity.bestBodyPath
-  const imageAlt = known
+  const latency = completeCardLatency(identity.latencyMetrics)
+  const imageAlt = known || strongKnown
     ? `Best face for ${name}`
     : `Best face for ${identity.liveIdentityId}`
 
@@ -38,6 +40,9 @@ export default function LiveIdentityCard({ identity }) {
       className={`live-identity-card ${known ? 'is-known' : 'is-unknown'}`}
       data-live-identity-id={identity.liveIdentityId}
       data-vlm-status={identity.vlmStatus}
+      data-clustering-state={identity.clusteringState}
+      data-status-to-card-ms={latency.statusToCardMs ?? ''}
+      data-capture-to-card-ms={latency.captureToCardMs ?? ''}
     >
       <div className="live-identity-media">
         <SafeImage
@@ -57,7 +62,9 @@ export default function LiveIdentityCard({ identity }) {
       </div>
       <div className="live-identity-card-body">
         <div className="live-identity-kind">
-          {identity.state === 'observing'
+          {strongKnown
+            ? 'Strong known-person match'
+            : identity.state === 'observing'
             ? 'Waiting for valid face'
             : identity.provisional
             ? 'Provisional comparison'
@@ -68,6 +75,7 @@ export default function LiveIdentityCard({ identity }) {
         <dl className="live-identity-facts">
           <div><dt>Canonical person</dt><dd>{identity.canonicalPersonId || 'Pending'}</dd></div>
           <div><dt>State</dt><dd>{readable(identity.state)}</dd></div>
+          <div><dt>Clustering</dt><dd>{readable(identity.clusteringState)}</dd></div>
           <div><dt>Decision</dt><dd>{readable(identity.decision)}</dd></div>
           <div><dt>Comparison</dt><dd>{identity.provisional ? 'Provisional' : 'Durable'}</dd></div>
           <div><dt>Persisted</dt><dd>{identity.persisted ? 'Yes' : 'No'}</dd></div>
@@ -77,6 +85,8 @@ export default function LiveIdentityCard({ identity }) {
           <div><dt>Second candidate</dt><dd>{identity.secondCandidatePersonId || 'None'}</dd></div>
           <div><dt>Second similarity</dt><dd>{secondCandidateSimilarity || 'Unavailable'}</dd></div>
           <div><dt>Margin</dt><dd>{margin || 'Unavailable'}</dd></div>
+          <div><dt>Capture to embedding</dt><dd>{latency.captureToEmbeddingMs === null ? 'Unavailable' : `${Math.round(latency.captureToEmbeddingMs)} ms`}</dd></div>
+          <div><dt>Capture to card</dt><dd>{latency.captureToCardMs === null ? 'Unavailable' : `${Math.round(latency.captureToCardMs)} ms`}</dd></div>
         </dl>
         <div className="live-identity-evidence">
           <span>{observationLabel(identity.observationCount, 'face observation', 'face observations')}</span>

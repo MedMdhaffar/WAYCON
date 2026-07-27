@@ -17,10 +17,21 @@ from forensics.person_creation.nodes.compute_reid import compute_reid
 from forensics.person_creation.nodes.describe_clothing import describe_clothing
 from forensics.person_creation.nodes.build_profile import build_profile
 from forensics.person_creation.nodes.finalize import cleanup_finalized_media, finalize
+from forensics.person_creation.nodes.finalize_live_canonical import (
+    finalize_live_canonical,
+)
 
 
 def route_ingestion(state: PersonCreationState) -> str:
     return "process_live_stream" if state.get("input_type") == "camera_uri" else "process_video"
+
+
+def route_after_live_capture(state: PersonCreationState) -> str:
+    return (
+        "finalize_live_canonical"
+        if state.get("_canonical_live_state")
+        else "filter_quality"
+    )
 
 
 def build_graph():
@@ -41,6 +52,7 @@ def build_graph():
     builder.add_node("build_profile",       build_profile)
     builder.add_node("finalize",            finalize)
     builder.add_node("cleanup_finalized_media", cleanup_finalized_media)
+    builder.add_node("finalize_live_canonical", finalize_live_canonical)
 
     builder.add_edge(START,                 "load_models")
     builder.add_conditional_edges(
@@ -52,7 +64,15 @@ def build_graph():
         },
     )
     builder.add_edge("process_video",       "filter_quality")
-    builder.add_edge("process_live_stream", "filter_quality")
+    builder.add_conditional_edges(
+        "process_live_stream",
+        route_after_live_capture,
+        {
+            "finalize_live_canonical": "finalize_live_canonical",
+            "filter_quality": "filter_quality",
+        },
+    )
+    builder.add_edge("finalize_live_canonical", END)
     builder.add_edge("filter_quality",      "embed_all_faces")
     builder.add_edge("embed_all_faces",     "cluster_identities")
     builder.add_edge("cluster_identities",  "assign_bodies_to_clusters")

@@ -45,7 +45,7 @@ export default function StartForm({ onStart, activeJob = false }) {
           name,
           ...sourcePayload,
           output_dir: outputDir,
-          every_n: everyN,
+          ...(inputType === 'video_file' ? { every_n: everyN } : {}),
         }),
       })
       const data = await res.json()
@@ -74,10 +74,10 @@ export default function StartForm({ onStart, activeJob = false }) {
       <div className="card-title">New Person Profile</div>
       <form onSubmit={handleSubmit} style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
 
-        <div>
+        {inputType === 'video_file' && <div>
           <label style={labelStyle}>Person Name</label>
           <input style={inputStyle} value={name} onChange={e => setName(e.target.value)} required placeholder="Malek" />
-        </div>
+        </div>}
 
         <div>
           <label style={labelStyle}>Input Source</label>

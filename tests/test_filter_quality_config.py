@@ -62,40 +62,18 @@ def test_explicit_configuration_overrides_environment(monkeypatch):
     assert config.face_min_width == 40
 
 
-def test_environment_configuration_is_used(monkeypatch):
-    monkeypatch.setenv("PERSON_CREATION_FACE_MIN_WIDTH", "50")
-    monkeypatch.setenv("PERSON_CREATION_FACE_MIN_HEIGHT", "50")
+def test_stale_environment_cannot_restore_old_face_boundary(monkeypatch):
+    monkeypatch.setenv("PERSON_CREATION_FACE_MIN_WIDTH", "60")
+    monkeypatch.setenv("PERSON_CREATION_FACE_MIN_HEIGHT", "60")
+    monkeypatch.setenv("PERSON_CREATION_FACE_MIN_SHARPNESS", "90")
 
     config = load_quality_filter_config()
 
-    assert (config.face_min_width, config.face_min_height) == (50, 50)
-
-
-def test_environment_configuration_changes_filter_boundary(monkeypatch, tmp_path):
-    monkeypatch.setenv("PERSON_CREATION_FACE_MIN_WIDTH", "50")
-    monkeypatch.setenv("PERSON_CREATION_FACE_MIN_HEIGHT", "50")
-    face = _face(tmp_path, 50, 50)
-
-    result = filter_quality({"body_crops": [], "face_crops": [face]})
-
-    assert result["quality_face_crops"] == [face]
-
-
-@pytest.mark.parametrize("minimum", [60, 50, 40])
-def test_face_dimension_boundary_is_inclusive(monkeypatch, tmp_path, minimum):
-    monkeypatch.setenv("PERSON_CREATION_FACE_MIN_WIDTH", str(minimum))
-    monkeypatch.setenv("PERSON_CREATION_FACE_MIN_HEIGHT", str(minimum))
-    accepted = _face(tmp_path, minimum, minimum)
-    rejected_width = _face(tmp_path, minimum - 1, minimum)
-    rejected_height = _face(tmp_path, minimum, minimum - 1)
-    state = {
-        "body_crops": [],
-        "face_crops": [accepted, rejected_width, rejected_height],
-    }
-    result = filter_quality(state)
-
-    assert result["quality_face_crops"] == [accepted]
-    assert result["face_rejection_counts"]["too_small"] == 2
+    assert (
+        config.face_min_width,
+        config.face_min_height,
+        config.face_min_sharpness,
+    ) == (48, 48, 45.0)
 
 
 def test_default_face_dimension_boundary_is_48_by_48(tmp_path):
@@ -134,16 +112,26 @@ def test_face_sharpness_boundary_is_inclusive(tmp_path):
     assert result["face_rejection_counts"]["low_sharpness"] == 1
 
 
-def test_controlled_60_50_40_comparison_uses_identical_crops(monkeypatch, tmp_path):
-    crops = [_face(tmp_path, size, size, 80.0) for size in (39, 40, 49, 50, 59, 60)]
-    accepted = {}
-    for minimum in (60, 50, 40):
-        monkeypatch.setenv("PERSON_CREATION_FACE_MIN_WIDTH", str(minimum))
-        monkeypatch.setenv("PERSON_CREATION_FACE_MIN_HEIGHT", str(minimum))
-        result = filter_quality({"body_crops": [], "face_crops": crops})
-        accepted[minimum] = len(result["quality_face_crops"])
+def test_decoded_crop_dimensions_are_authoritative_not_bbox(tmp_path):
+    crop = _face(tmp_path, 51, 81, 80.0)
+    crop["bbox"] = [10, 10, 50, 50]
 
-    assert accepted == {60: 1, 50: 3, 40: 5}
+    result = filter_quality({"body_crops": [], "face_crops": [crop]})
+
+    assert result["quality_face_crops"] == [crop]
+    assert result["face_rejection_counts"]["too_small"] == 0
+
+
+def test_embedding_and_confirmation_eligibility_are_distinct(tmp_path):
+    crop = _face(tmp_path, 60, 60, 80.0)
+    crop.pop("confidence")
+
+    result = filter_quality({"body_crops": [], "face_crops": [crop]})
+
+    quality = result["quality_face_crops"][0]["_face_quality"]
+    assert quality["accepted_for_embedding"] is True
+    assert quality["immediate_confirmation_eligible"] is False
+    assert quality["reason"] == "detector_confidence_unavailable"
 
 
 def test_body_boundaries_and_defaults_are_unchanged():

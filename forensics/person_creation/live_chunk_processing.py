@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import re
 import time
 from typing import Any, Callable, Mapping
@@ -53,6 +53,7 @@ class PreprocessedLiveChunk:
     failed_face_embeddings: list[dict]
     warnings: list[str]
     processing_elapsed_seconds: float
+    face_rejection_counts: dict[str, int] = field(default_factory=dict)
 
 
 def _camera_safe(value: Any) -> Any:
@@ -135,9 +136,10 @@ def preprocess_live_chunk(
     chunk: LiveChunkResult,
     base_state: Mapping[str, Any],
     notify: NotifyCallback | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> PreprocessedLiveChunk:
     """Run preview-only quality filtering and face embedding for one chunk."""
-    started = time.perf_counter()
+    started = monotonic()
     warnings = [_camera_safe(str(item)) for item in chunk.warnings]
     body_crops = _copy_crop_records(chunk.body_crops, "body")
     face_crops = _copy_crop_records(chunk.face_crops, "face")
@@ -158,8 +160,16 @@ def preprocess_live_chunk(
         warnings.append("captured chunk contains no crops")
 
     quality = _run_stage("quality filtering", filter_quality, local_state)
+    quality_completed = monotonic()
     quality_body = list(quality.get("quality_body_crops") or [])
     quality_face = list(quality.get("quality_face_crops") or [])
+    timing_by_path = {}
+    for crop in quality_face:
+        timing = dict(crop.get("_latency_timing") or {})
+        if timing:
+            timing["quality_accepted_monotonic"] = float(quality_completed)
+            timing_by_path[str(crop.get("path"))] = timing
+        crop.pop("_latency_timing", None)
     if (body_crops or face_crops) and not quality_body and not quality_face:
         warnings.append("all captured crops were rejected by quality filtering")
     _notify(notify, "chunk_quality_filter_completed", {
@@ -174,12 +184,21 @@ def preprocess_live_chunk(
         embedded = {"all_face_embeddings": [], "failed_face_embeddings": []}
     face_embeddings = list(embedded.get("all_face_embeddings") or [])
     failed_embeddings = list(embedded.get("failed_face_embeddings") or [])
+    embedding_completed = monotonic()
+    for record in face_embeddings:
+        timing = dict(timing_by_path.get(str(record.get("crop_path"))) or {})
+        if not timing:
+            continue
+        timing["embedding_completed_monotonic"] = float(embedding_completed)
+        record["_latency_timing"] = timing
+        if timing.get("source_frame_timestamp"):
+            record["source_frame_timestamp"] = timing["source_frame_timestamp"]
     if quality_face and not face_embeddings:
         warnings.append("no valid face embeddings were produced")
     if failed_embeddings:
         warnings.append(f"face embedding failed for {len(failed_embeddings)} crop(s)")
 
-    elapsed = max(0.0, time.perf_counter() - started)
+    elapsed = max(0.0, monotonic() - started)
     result = PreprocessedLiveChunk(
         chunk_index=int(chunk.chunk_index),
         capture_summary=_camera_safe(chunk.report_metrics()),
@@ -189,6 +208,9 @@ def preprocess_live_chunk(
         failed_face_embeddings=deepcopy(failed_embeddings),
         warnings=warnings,
         processing_elapsed_seconds=elapsed,
+        face_rejection_counts=deepcopy(
+            quality.get("face_rejection_counts") or {}
+        ),
     )
     _notify(notify, "chunk_preprocessing_completed", {
         "chunk_index": chunk.chunk_index,

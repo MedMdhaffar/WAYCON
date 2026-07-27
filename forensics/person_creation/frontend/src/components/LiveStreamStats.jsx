@@ -32,6 +32,7 @@ export default function LiveStreamStats({ snapshot, status, node, sourceType }) 
     ['Completed windows', displayMetric(progress.completedWindows)],
     ['Current / last window', displayMetric(progress.windowIndex)],
     ['Window duration', displayMetric(progress.windowDuration, ' s')],
+    ['Sample every', displayMetric(progress.samplingIntervalFrames, ' frames')],
     ['Frames read', displayMetric(progress.windowFramesRead)],
     ['Frames processed', displayMetric(progress.windowFramesProcessed)],
     ['Body detections', displayMetric(progress.windowBodyDetections)],
@@ -42,6 +43,12 @@ export default function LiveStreamStats({ snapshot, status, node, sourceType }) 
     ['Total frames processed', displayMetric(progress.totalFramesProcessed)],
     ['Total body detections', displayMetric(progress.totalBodyDetections)],
     ['Total face detections', displayMetric(progress.totalFaceDetections)],
+    ['Dropped frames', displayMetric(progress.totalDroppedFrames)],
+    ['Accepted faces', displayMetric(progress.acceptedFaces)],
+    ['Embedded faces', displayMetric(progress.embeddedFaces)],
+    ['Unresolved embeddings', displayMetric(progress.unresolvedEmbeddings)],
+    ['Resolved clusters', displayMetric(progress.resolvedClusters)],
+    ['Maximum queue depth', displayMetric(progress.maximumQueueDepth)],
   ]
 
   return (

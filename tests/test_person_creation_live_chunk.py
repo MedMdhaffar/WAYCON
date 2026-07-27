@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import threading
 from copy import deepcopy
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -127,6 +128,166 @@ def test_normal_chunk_exits_after_duration_without_busy_spin():
     assert all(0 < timeout <= 1.0 for timeout in buffer.get_timeouts)
 
 
+def test_live_chunk_duration_environment_is_centralized(monkeypatch):
+    monkeypatch.delenv("PERSON_CREATION_LIVE_CHUNK_SECONDS", raising=False)
+    assert live_node.live_chunk_duration_seconds(10) == 10.0
+
+    monkeypatch.setenv("PERSON_CREATION_LIVE_CHUNK_SECONDS", "2")
+    assert live_node.live_chunk_duration_seconds(10) == 2.0
+
+
+def test_live_sampling_defaults_to_every_third_frame(monkeypatch):
+    monkeypatch.delenv(
+        "PERSON_CREATION_LIVE_PROCESS_EVERY_N_FRAMES",
+        raising=False,
+    )
+    assert live_node.live_process_every_n_frames() == 3
+
+    monkeypatch.setenv(
+        "PERSON_CREATION_LIVE_PROCESS_EVERY_N_FRAMES",
+        "1",
+    )
+    assert live_node.live_process_every_n_frames() == 1
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "3.0", "invalid", ""])
+def test_invalid_live_sampling_value_fails_clearly(monkeypatch, value):
+    monkeypatch.setenv(
+        "PERSON_CREATION_LIVE_PROCESS_EVERY_N_FRAMES",
+        value,
+    )
+    with pytest.raises(
+        ValueError,
+        match="PERSON_CREATION_LIVE_PROCESS_EVERY_N_FRAMES",
+    ):
+        live_node.live_process_every_n_frames()
+
+
+def test_live_start_uses_three_by_default_and_accepts_explicit_override(
+    monkeypatch,
+    tmp_path,
+):
+    from forensics.person_creation import service
+
+    monkeypatch.setenv("PERSON_CREATION_MEDIA_ROOT", str(tmp_path))
+    base = {
+        "name": "Live",
+        "input_type": "camera_uri",
+        "camera_uri": "rtsp://camera.local/live",
+        "output_dir": "session",
+    }
+
+    assert service.build_initial_state(base)["process_every_n"] == 3
+    assert service.build_initial_state({**base, "every_n": 1})[
+        "process_every_n"
+    ] == 1
+
+
+@pytest.mark.parametrize("value", ["", "3.0", 3.0, 0, -1, "nan", "inf"])
+def test_live_start_rejects_invalid_sampling_values(
+    monkeypatch,
+    tmp_path,
+    value,
+):
+    from forensics.person_creation import service
+
+    monkeypatch.setenv("PERSON_CREATION_MEDIA_ROOT", str(tmp_path))
+    with pytest.raises(service.StartRequestError, match="must be"):
+        service.build_initial_state({
+            "name": "Live",
+            "input_type": "camera_uri",
+            "camera_uri": "rtsp://camera.local/live",
+            "output_dir": "session",
+            "every_n": value,
+        })
+
+
+@pytest.mark.parametrize("value", ["", "invalid", "nan", "inf", "0.999"])
+def test_invalid_live_chunk_duration_fails_clearly(monkeypatch, value):
+    monkeypatch.setenv("PERSON_CREATION_LIVE_CHUNK_SECONDS", value)
+    if value == "":
+        assert live_node.live_chunk_duration_seconds(5) == 5.0
+        return
+    with pytest.raises(
+        ValueError,
+        match="PERSON_CREATION_LIVE_CHUNK_SECONDS",
+    ):
+        live_node.live_chunk_duration_seconds(5)
+
+
+def test_face_fast_flush_ends_regular_chunk_before_duration(monkeypatch):
+    monkeypatch.setattr(
+        live_node,
+        "detect_and_save_frame",
+        lambda *_args, **_kwargs: (
+            [],
+            [{
+                "path": "face.jpg",
+                "frame_idx": 0,
+                "video": "camera-source",
+                "bbox": [0, 0, 48, 48],
+                "sharpness": 100.0,
+            }],
+        ),
+    )
+
+    baseline_clock = FakeClock()
+    baseline = _capture(
+        FakeBuffer(baseline_clock, [_frame(0)]),
+        baseline_clock,
+        duration_seconds=5.0,
+        fast_flush_on_face=False,
+    )
+
+    clock = FakeClock()
+    buffer = FakeBuffer(clock, [_frame(0), _frame(1)])
+    result = _capture(
+        buffer,
+        clock,
+        duration_seconds=5.0,
+        fast_flush_on_face=True,
+    )
+
+    assert baseline.elapsed_seconds == pytest.approx(5.0)
+    assert result.fast_flushed is True
+    assert result.elapsed_seconds == pytest.approx(0.1)
+    assert baseline.elapsed_seconds - result.elapsed_seconds == pytest.approx(4.9)
+    assert result.frames_processed == 1
+    assert len(result.face_crops) == 1
+    assert len(buffer.items) == 1
+    assert buffer.items[0].frame_idx == 1
+    timing = result.face_crops[0]["_latency_timing"]
+    assert timing["source_frame_timestamp"] == "t0"
+    assert timing["face_detected_monotonic"] >= timing["capture_monotonic"]
+
+
+def test_immediate_face_evidence_does_not_close_regular_chunk(monkeypatch):
+    monkeypatch.setattr(
+        live_node,
+        "detect_and_save_frame",
+        lambda *_args, **_kwargs: (
+            [{"path": "body-0.jpg"}],
+            [{"path": "face-0.jpg"}],
+        ),
+    )
+    clock = FakeClock()
+    immediate = []
+
+    result = _capture(
+        FakeBuffer(clock, [_frame(0)]),
+        clock,
+        duration_seconds=5.0,
+        fast_flush_on_face=False,
+        immediate_evidence_callback=immediate.append,
+    )
+
+    assert result.elapsed_seconds == pytest.approx(5.0)
+    assert result.fast_flushed is False
+    assert len(immediate) == 1
+    assert immediate[0].face_crops[0]["path"] == "face-0.jpg"
+    assert result.immediate_face_paths == ["face-0.jpg"]
+
+
 def test_reconnecting_empty_window_is_nonterminal_and_publishes_status():
     clock = FakeClock()
     notifications = []
@@ -197,6 +358,24 @@ def test_crops_and_counters_are_returned(monkeypatch):
     assert result.body_detection_count == 2
     assert result.face_detection_count == 2
     assert [crop["path"] for crop in result.body_crops] == ["body-0", "body-2"]
+
+
+def test_every_third_frame_sampling_processes_expected_frames(monkeypatch):
+    clock = FakeClock()
+    buffer = FakeBuffer(clock, [_frame(index) for index in range(7)])
+    detected = []
+
+    def fake_detect(_frame_value, **kwargs):
+        detected.append(kwargs["frame_idx"])
+        return ([], [])
+
+    monkeypatch.setattr(live_node, "detect_and_save_frame", fake_detect)
+    result = _capture(buffer, clock, duration_seconds=1.0, every_n=3)
+
+    assert detected == [0, 3, 6]
+    assert result.frames_processed == 3
+    assert result.frames_skipped == 4
+    assert result.sampling_interval_frames == 3
 
 
 def test_nonzero_chunk_uses_collision_safe_source_stem(monkeypatch):
@@ -426,6 +605,34 @@ def test_continuous_capture_accumulates_until_stop_without_fixed_limit(
     assert "private-user" not in public_text
     assert "private-password" not in public_text
     assert raw_uri not in public_text
+
+
+def test_two_second_environment_value_reaches_live_capture(monkeypatch, tmp_path):
+    clock = FakeClock()
+    buffer = FakeBuffer(clock)
+    stop_event = threading.Event()
+    received_durations = []
+    _install_continuous_dependencies(monkeypatch, tmp_path, buffer)
+    monkeypatch.setenv("PERSON_CREATION_LIVE_CHUNK_SECONDS", "2")
+
+    def fake_capture(**kwargs):
+        received_durations.append(kwargs["duration_seconds"])
+        assert kwargs["every_n"] == 1
+        stop_event.set()
+        return _chunk_result(kwargs["chunk_index"], stop=True, empty=True)
+
+    monkeypatch.setattr(live_node, "capture_live_chunk", fake_capture)
+    result = live_node.process_live_stream({
+        "camera_uri": "rtsp://camera.local/live",
+        "duration_seconds": 30,
+        "process_every_n": 1,
+        "live_stream_config": {},
+        "output_dir": str(tmp_path),
+        "_stop_event": stop_event,
+    })
+
+    assert received_durations == [2.0]
+    assert result["stream_stats"]["duration_seconds_per_chunk"] == 2.0
 
 
 def test_returned_accumulated_state_can_enter_next_graph_node(monkeypatch, tmp_path):
@@ -872,11 +1079,10 @@ def test_disabled_overlap_does_not_construct_preprocessing_session(
     assert "live_preprocessing" not in result["stream_stats"]
 
 
-def test_preprocessing_failure_stops_capture_and_prevents_return(
+def test_preprocessing_failure_returns_terminal_completed_state(
     monkeypatch, tmp_path
 ):
     from forensics.person_creation import live_session
-    from forensics.person_creation.live_session import LivePreprocessingSessionError
 
     clock = FakeClock()
     buffer = FakeBuffer(clock)
@@ -894,19 +1100,24 @@ def test_preprocessing_failure_stops_capture_and_prevents_return(
         lambda **kwargs: _chunk_result(kwargs["chunk_index"], stop=True),
     )
 
-    with pytest.raises(LivePreprocessingSessionError, match="embedding failed"):
-        live_node.process_live_stream({
-            "camera_uri": "rtsp://camera.local/live",
-            "duration_seconds": 10,
-            "process_every_n": 1,
-            "live_stream_config": {},
-            "output_dir": str(tmp_path),
-            "_stop_event": stop_event,
-        })
+    result = live_node.process_live_stream({
+        "camera_uri": "rtsp://camera.local/live",
+        "duration_seconds": 10,
+        "process_every_n": 1,
+        "live_stream_config": {},
+        "output_dir": str(tmp_path),
+        "_stop_event": stop_event,
+    })
 
     assert stop_event.is_set()
     assert buffer.stop_calls == 1
-    assert not (tmp_path / "stream_report.json").exists()
+    assert result["_canonical_live_state"] is True
+    assert result["stream_stats"]["stop_requested"] is True
+    assert any(
+        "Preprocessing drain incomplete" in warning
+        for warning in result["stream_stats"]["warnings"]
+    )
+    assert (tmp_path / "stream_report.json").is_file()
 
 
 @pytest.mark.parametrize(
@@ -997,6 +1208,8 @@ def test_live_embeddings_reach_rolling_identity_decision_and_async_vlm_before_st
     second_identity_ready = threading.Event()
     no_face_update_ready = threading.Event()
     vlm_received_identity = threading.Event()
+    allow_vlm_completion = threading.Event()
+    vlm_completed_ready = threading.Event()
     session_root = tmp_path / "person_db" / "session"
     staging_faces = session_root / "_staging" / "face_crops"
     staging_bodies = session_root / "_staging" / "body_crops"
@@ -1005,6 +1218,8 @@ def test_live_embeddings_reach_rolling_identity_decision_and_async_vlm_before_st
     database = tmp_path / "memory.db"
     job_id = "job-live-integration"
     rolling_updates = []
+    canonical_updates = []
+    terminal_updates = []
     described_jobs = []
     persisted_jobs = []
 
@@ -1108,6 +1323,7 @@ def test_live_embeddings_reach_rolling_identity_decision_and_async_vlm_before_st
     def describe(job):
         described_jobs.append(job)
         vlm_received_identity.set()
+        assert allow_vlm_completion.wait(5.0)
         return {
             "per_cluster_clothing": {0: {
                 "status": "ok",
@@ -1155,9 +1371,12 @@ def test_live_embeddings_reach_rolling_identity_decision_and_async_vlm_before_st
             job = service._jobs[job_id]
             job.status = status
             service._merge_job_snapshot(job, update)
+        if status == "stopping":
+            terminal_updates.append(deepcopy(update))
         rolling = update.get("rolling_analysis")
         if not isinstance(rolling, dict):
             return
+        canonical_updates.append((stop_event.is_set(), deepcopy(update)))
         rolling_updates.append((stop_event.is_set(), deepcopy(rolling)))
         identities = rolling.get("live_identities") or []
         if not identities:
@@ -1174,17 +1393,23 @@ def test_live_embeddings_reach_rolling_identity_decision_and_async_vlm_before_st
                 no_face_update_ready.set()
             else:
                 second_identity_ready.set()
+        if (
+            identity.get("vlm_status") == "completed"
+            and identity.get("clothing_description")
+        ):
+            vlm_completed_ready.set()
 
     def fake_capture(**kwargs):
         index = kwargs["chunk_index"]
+        assert kwargs["fast_flush_on_face"] is False
         if index == 1:
             second_capture_started.set()
             assert first_identity_ready.wait(5.0)
             assert vlm_received_identity.wait(5.0)
         elif index == 2:
             assert second_identity_ready.wait(5.0)
-        elif index == 3:
-            assert no_face_update_ready.wait(5.0)
+            allow_vlm_completion.set()
+            assert vlm_completed_ready.wait(5.0)
             stop_event.set()
             return _chunk_result(index, stop=True, empty=True)
         return _chunk_result(index, empty=index >= 2)
@@ -1218,12 +1443,37 @@ def test_live_embeddings_reach_rolling_identity_decision_and_async_vlm_before_st
     }
     assert any(item["live_identities"][0]["face_count"] == 6 for item in before_stop)
     assert any(item["live_identities"][0]["face_count"] == 7 for item in before_stop)
-    no_face_snapshot = next(
-        item for item in before_stop
-        if int(item.get("analysis_version") or 0) >= 3
+    assert max(
+        int(item.get("analysis_version") or 0) for item in before_stop
+    ) == 2
+    before_stop_canonical = [
+        update for stopped, update in canonical_updates
+        if not stopped and update.get("identity_clusters")
+    ]
+    assert before_stop_canonical
+    latest_canonical = before_stop_canonical[-1]
+    assert latest_canonical["identity_clusters"]
+    assert latest_canonical["per_cluster_profiles"]
+    assert latest_canonical["per_cluster_best_body_crops"]
+    assert (
+        latest_canonical["rolling_analysis"]["live_identities"][0][
+            "live_identity_id"
+        ]
+        == "live_0001"
     )
-    assert no_face_snapshot["live_identities"][0]["live_identity_id"] == "live_0001"
-    assert no_face_snapshot["live_identities"][0]["face_count"] == 7
+    delayed_enrichment = next(
+        update
+        for update in before_stop_canonical
+        if update["rolling_analysis"]["live_identities"][0].get(
+            "vlm_status"
+        ) == "completed"
+    )
+    assert delayed_enrichment["rolling_analysis"]["evidence_version"] >= 2
+    assert delayed_enrichment["identity_clusters"][0]["face_count"] == 7
+    assert delayed_enrichment["rolling_analysis"]["live_identities"][0][
+        "clothing_description"
+    ] == "black jacket, blue jeans, white shoes"
+    assert delayed_enrichment["per_cluster_clothing"][0]["status"] == "ok"
 
     decisions = result["live_identity_decisions"]
     assert decisions and decisions[0]["live_identity_id"] == "live_0001"
@@ -1233,10 +1483,45 @@ def test_live_embeddings_reach_rolling_identity_decision_and_async_vlm_before_st
     assert described_jobs[0].canonical_person_id == decisions[0]["canonical_person_id"]
 
     rolling = payload["snapshot"]["rolling_analysis"]
-    assert rolling["live_identities"][0]["live_identity_id"] == "live_0001"
-    assert rolling["live_identities"][0]["decision"] == "new_person"
+    assert [
+        identity["live_identity_id"]
+        for identity in rolling["live_identities"]
+    ] == ["live_0001"]
+    final_identity = rolling["live_identities"][0]
+    assert final_identity["decision"] == "new_person"
+    assert final_identity["vlm_status"] == "completed"
+    assert final_identity["vlm_state"] == "completed"
+    assert (
+        final_identity["clothing_description"]
+        == "black jacket, blue jeans, white shoes"
+    )
     assert rolling["vlm_completed"] >= 1
+    assert rolling["analysis_state"] == "ready"
+    assert payload["snapshot"]["identity_clusters"]
+    assert payload["snapshot"]["per_cluster_profiles"]
+    assert payload["snapshot"]["per_cluster_best_body_crops"]
+    assert payload["snapshot"]["profile"]
+    assert payload["snapshot"]["per_cluster_clothing"]["0"]["status"] == "ok"
     assert payload["snapshot"]["live_preprocessing"]["embedded_faces"] == 7
+    assert terminal_updates
+    terminal = terminal_updates[-1]
+    assert terminal["identity_clusters"]
+    assert terminal["per_cluster_profiles"]
+    assert terminal["per_cluster_best_body_crops"]
+    assert terminal["profile"]
+    assert terminal["per_cluster_clothing"][0]["status"] == "ok"
+    assert terminal["rolling_analysis"]["analysis_state"] == "ready"
+    assert terminal["rolling_analysis"]["publication_sequence"] == rolling[
+        "publication_sequence"
+    ]
+    assert terminal["rolling_analysis"]["publication_sequence"] > max(
+        int(item.get("publication_sequence") or 0)
+        for item in before_stop
+    )
+    assert terminal["rolling_analysis"]["evidence_version"] >= max(
+        int(item.get("evidence_version") or 0)
+        for item in before_stop
+    )
 
 
 def test_rolling_without_overlap_is_rejected_before_camera_or_staging(
@@ -1258,6 +1543,51 @@ def test_rolling_without_overlap_is_rejected_before_camera_or_staging(
             "process_every_n": 1,
             "output_dir": str(tmp_path),
         })
+
+
+def test_overlap_and_rolling_configuration_is_explicitly_valid():
+    assert live_node.validate_live_architecture_configuration(
+        overlap_enabled=True,
+        rolling_enabled=True,
+    ) == (True, True)
+
+
+def test_rolling_without_overlap_has_a_clear_configuration_error():
+    with pytest.raises(
+        ValueError,
+        match=(
+            "Invalid live configuration: "
+            "PERSON_CREATION_LIVE_ROLLING_ANALYSIS=1 requires "
+            "PERSON_CREATION_LIVE_OVERLAP=1"
+        ),
+    ):
+        live_node.validate_live_architecture_configuration(
+            overlap_enabled=False,
+            rolling_enabled=True,
+        )
+
+
+def test_documented_live_environment_combination_is_valid(monkeypatch):
+    env_path = Path(live_node.__file__).resolve().parents[3] / ".env.example"
+    documented = {}
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        documented[key] = value
+
+    assert documented["PERSON_CREATION_LIVE_OVERLAP"] == "1"
+    assert documented["PERSON_CREATION_LIVE_ROLLING_ANALYSIS"] == "1"
+    monkeypatch.setenv(
+        "PERSON_CREATION_LIVE_OVERLAP",
+        documented["PERSON_CREATION_LIVE_OVERLAP"],
+    )
+    monkeypatch.setenv(
+        "PERSON_CREATION_LIVE_ROLLING_ANALYSIS",
+        documented["PERSON_CREATION_LIVE_ROLLING_ANALYSIS"],
+    )
+    assert live_node.validate_live_architecture_configuration() == (True, True)
 
 
 def test_rolling_disabled_does_not_construct_analysis_worker(monkeypatch, tmp_path):
@@ -1295,7 +1625,9 @@ def test_rolling_disabled_does_not_construct_analysis_worker(monkeypatch, tmp_pa
     assert "rolling_analysis" not in result
 
 
-def test_hung_analysis_worker_prevents_live_node_return(monkeypatch, tmp_path):
+def test_hung_analysis_worker_is_bounded_and_preserves_completed_state(
+    monkeypatch, tmp_path
+):
     from forensics.person_creation import live_analysis, live_session
 
     clock = FakeClock()
@@ -1361,16 +1693,21 @@ def test_hung_analysis_worker_prevents_live_node_return(monkeypatch, tmp_path):
         ),
     )
 
-    with pytest.raises(live_analysis.LiveAnalysisLifecycleError, match="staging"):
-        live_node.process_live_stream({
-            "camera_uri": "rtsp://camera.local/live",
-            "duration_seconds": 5,
-            "process_every_n": 1,
-            "output_dir": str(tmp_path),
-            "_stop_event": stop_event,
-        })
+    result = live_node.process_live_stream({
+        "camera_uri": "rtsp://camera.local/live",
+        "duration_seconds": 5,
+        "process_every_n": 1,
+        "output_dir": str(tmp_path),
+        "_stop_event": stop_event,
+    })
 
-    assert not (tmp_path / "stream_report.json").exists()
+    assert result["_canonical_live_state"] is True
+    assert result["stream_stats"]["stop_requested"] is True
+    assert any(
+        "Rolling analysis drain incomplete" in warning
+        for warning in result["stream_stats"]["warnings"]
+    )
+    assert (tmp_path / "stream_report.json").is_file()
     assert marker.exists()
 
 
@@ -1463,7 +1800,11 @@ def test_dead_analysis_worker_waits_for_real_user_stop(monkeypatch, tmp_path):
         if index == 1:
             capture_continued.set()
             assert allow_user_stop.wait(2.0)
-        return _chunk_result(index, stop=stop_event.is_set(), empty=True)
+        return _chunk_result(
+            index,
+            stop=stop_event.is_set(),
+            empty=index != 0,
+        )
 
     monkeypatch.setattr(live_node, "capture_live_chunk", fake_capture)
 

@@ -29,6 +29,8 @@ def _snapshot(live_id: str, version: int, selected: str, *, sequence=None) -> di
             "live_identity_id": live_id,
             "session_person_id": live_id,
             "version": version,
+            "cluster_label": 0,
+            "clustering_state": "resolved",
             "canonical_person_id": "person_001",
             "representative_face_path": "_staging/face_crops/face.jpg",
             "best_face_path": "_staging/face_crops/face.jpg",
@@ -102,6 +104,99 @@ def _wait_for(coordinator, predicate, *, timeout: float = 2.0) -> dict:
             return snapshot
         time.sleep(0.005)
     raise AssertionError("timed out waiting for live VLM state")
+
+
+def test_vlm_defers_while_core_inference_has_pending_work(tmp_path):
+    root = tmp_path / "person_db"
+    core_busy = threading.Event()
+    core_busy.set()
+    described = threading.Event()
+    source = _write(root, "_staging/live/body_crops/body.jpg", b"body")
+    canonical = _write(root, "person_001/body_crops/body.jpg", b"body")
+
+    coordinator = LiveIdentityVLMCoordinator(
+        job_id="job-vlm",
+        media_root=root,
+        queue_capacity=2,
+        describe=lambda _job: (described.set() or _success()),
+        persist=lambda *_args: None,
+        core_work_pending=core_busy.is_set,
+    )
+    try:
+        coordinator.observe(
+            _snapshot("live_0001", 1, source),
+            [_receipt("live_0001", canonical)],
+        )
+        assert not described.wait(0.1)
+        deferred = coordinator.public_snapshot()
+        assert deferred["vlm_jobs_deferred_for_core_work"] > 0
+        assert deferred["vlm_queue_depth"] == 1
+        assert deferred["vlm_queue_peak"] == 1
+
+        core_busy.clear()
+        assert described.wait(1.0)
+        completed = _wait_for(
+            coordinator,
+            lambda item: item.get("vlm_completed") == 1,
+        )
+        assert completed["vlm_active_jobs"] == 0
+    finally:
+        core_busy.clear()
+        coordinator.close(1.0)
+
+
+def test_continuous_core_activity_has_bounded_vlm_fairness_and_metrics(tmp_path):
+    root = tmp_path / "person_db"
+    source = _write(root, "_staging/live/body_crops/body.jpg", b"body")
+    canonical = _write(root, "person_001/body_crops/body.jpg", b"body")
+    started = threading.Event()
+    release = threading.Event()
+
+    def describe(_job):
+        started.set()
+        assert release.wait(1.0)
+        return _success("green coat")
+
+    coordinator = LiveIdentityVLMCoordinator(
+        job_id="job-vlm",
+        media_root=root,
+        describe=describe,
+        persist=lambda *_args: None,
+        core_work_pending=lambda: True,
+        core_queue_depth=lambda: 1,
+        maximum_core_deferral_seconds=0.05,
+    )
+    try:
+        pending = coordinator.observe(
+            _snapshot("live_0001", 1, source),
+            [_receipt("live_0001", canonical)],
+        )
+        assert _identity(pending)["vlm_state"] == "pending"
+        assert started.wait(0.5)
+        running = coordinator.public_snapshot()
+        assert _identity(running)["vlm_state"] == "running"
+        assert running["vlm_jobs_deferred_for_core_work"] > 0
+        assert running["vlm_jobs_started"] == 1
+
+        release.set()
+        completed = _wait_for(
+            coordinator,
+            lambda snap: _identity(snap)["vlm_state"] == "completed",
+        )
+        identity = _identity(completed)
+        assert identity["live_identity_id"] == "live_0001"
+        assert identity["clothing_description"].startswith("green coat")
+        assert completed["per_cluster_clothing"][0]["top"] == "green coat"
+        assert completed["vlm_observations_received"] == 1
+        assert completed["vlm_jobs_eligible"] == 1
+        assert completed["vlm_jobs_submitted"] == 1
+        assert completed["vlm_jobs_completed"] == 1
+        assert completed["vlm_results_merged"] == 1
+        assert completed["vlm_max_deferral_ms"] >= 40
+        assert completed["vlm_last_error"] is None
+    finally:
+        release.set()
+        coordinator.close(1.0)
 
 
 def test_vlm_never_blocks_observe_and_queue_stays_bounded(tmp_path):

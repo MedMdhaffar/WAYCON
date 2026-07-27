@@ -10,7 +10,7 @@ import threading
 import time
 from copy import deepcopy
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
@@ -36,6 +36,7 @@ class LiveAnalysisLifecycleError(RuntimeError):
 @dataclass(frozen=True)
 class _CommittedInputs:
     active_memberships: tuple[tuple[str, frozenset[str]], ...]
+    membership_history: tuple[tuple[str, frozenset[str]], ...]
     retired_live_ids: frozenset[str]
     next_live_number: int
     memory_matches: tuple[tuple[str, dict | None], ...]
@@ -48,15 +49,20 @@ class _CommittedInputs:
 class _AnalysisResult:
     version: int
     embedding_count: int
+    body_count: int
+    unresolved_embedding_count: int
+    resolved_cluster_count: int
     last_completed_chunk: int | None
     live_identities: tuple[dict, ...]
     active_memberships: tuple[tuple[str, frozenset[str]], ...]
+    membership_history: tuple[tuple[str, frozenset[str]], ...]
     retired_live_ids: frozenset[str]
     next_live_number: int
     memory_matches: tuple[tuple[str, dict | None], ...]
     events: tuple[dict, ...]
     event_keys: tuple[str, ...]
     next_event_number: int
+    canonical_state: dict
 
 
 def _safe_warning(stage: str, version: int, error: BaseException) -> str:
@@ -110,6 +116,8 @@ class LiveRollingAnalysisSession:
         identity_decisions: bool = False,
         decision_memory_factory: Callable[[Path], Any] | None = None,
         policy_config: Any | None = None,
+        debounce_seconds: float = 0.5,
+        minimum_new_versions: int = 3,
     ) -> None:
         self.join_timeout_seconds = max(0.01, float(join_timeout_seconds))
         self._snapshot_provider = snapshot_provider
@@ -122,6 +130,8 @@ class LiveRollingAnalysisSession:
         self._identity_decisions_enabled = bool(identity_decisions)
         self._decision_memory_factory = decision_memory_factory
         self._policy_config = policy_config
+        self._debounce_seconds = max(0.0, min(float(debounce_seconds), 0.5))
+        self._minimum_new_versions = max(1, int(minimum_new_versions))
         self._decision_memory: Any | None = None
         # Decision state is committed here the moment a Global Memory write
         # succeeds, never through _commit_result: a stale pass is discarded by
@@ -142,26 +152,37 @@ class LiveRollingAnalysisSession:
         self._accepting = True
         self._shutdown_requested = False
         self._requested_version = 0
+        self._pending_since: float | None = None
         self._completed_version = 0
         self._analysis_version = 0
         self._publication_sequence = 0
+        self._generated_at = datetime.now(timezone.utc).isoformat()
         self._analysis_in_progress = False
         self._analysis_state = "idle"
         self._analyzed_embedding_count = 0
+        self._unresolved_embedding_count = 0
+        self._resolved_cluster_count = 0
         self._last_attempted_embedding_count: int | None = None
         self._last_successful_embedding_count = 0
+        self._last_successful_body_count = 0
         self._has_valid_result = True
         self._last_completed_chunk: int | None = None
         self._warning: str | None = None
         self._worker_error: str | None = None
         self._live_identities: tuple[dict, ...] = ()
         self._active_memberships: dict[str, frozenset[str]] = {}
+        self._membership_history: dict[str, frozenset[str]] = {}
         self._retired_live_ids: frozenset[str] = frozenset()
         self._next_live_number = 1
         self._memory_matches: dict[str, dict | None] = {}
         self._events: tuple[dict, ...] = ()
         self._event_keys: tuple[str, ...] = ()
         self._next_event_number = 1
+        self._canonical_state: dict = {}
+        self._discard_late_results = False
+        self._analysis_runs_started = 0
+        self._analysis_versions_conflated = 0
+        self._analysis_versions_skipped_unchanged = 0
 
     def start(self) -> None:
         with self._condition:
@@ -185,12 +206,17 @@ class LiveRollingAnalysisSession:
             if not self._accepting or self._worker_error is not None:
                 return False
             if version > self._requested_version:
+                if self._requested_version > self._completed_version:
+                    self._analysis_versions_conflated += (
+                        version - self._requested_version
+                    )
                 self._requested_version = version
+                if self._pending_since is None:
+                    self._pending_since = time.monotonic()
                 if not self._analysis_in_progress:
                     self._analysis_state = "scheduled"
             self._wake.set()
             self._condition.notify_all()
-        self._publish()
         return True
 
     @property
@@ -227,6 +253,13 @@ class LiveRollingAnalysisSession:
         if thread is not None:
             thread.join(timeout=remaining)
             if thread.is_alive():
+                with self._condition:
+                    self._discard_late_results = True
+                    self._analysis_in_progress = False
+                    self._analysis_state = "drain_timed_out"
+                    self._warning = (
+                        "Rolling analysis drain exceeded its bounded deadline."
+                    )
                 raise LiveAnalysisLifecycleError(
                     "Rolling analysis worker did not stop within "
                     f"{self.join_timeout_seconds:g} seconds; staging must be preserved."
@@ -254,18 +287,35 @@ class LiveRollingAnalysisSession:
         with self._condition:
             return self._public_snapshot_locked()
 
+    def canonical_state(self) -> dict:
+        with self._condition:
+            return deepcopy(self._canonical_state)
+
     def _public_snapshot_locked(self) -> dict:
         return {
             "enabled": True,
             "publication_sequence": self._publication_sequence,
+            "evidence_version": self._analysis_version,
+            "generated_at": self._generated_at,
             "requested_version": self._requested_version,
             "analysis_version": self._analysis_version,
             "analysis_state": self._analysis_state,
             "analysis_in_progress": self._analysis_in_progress,
+            "analysis_runs_started": self._analysis_runs_started,
+            "analysis_versions_conflated": self._analysis_versions_conflated,
+            "analysis_versions_skipped_unchanged": (
+                self._analysis_versions_skipped_unchanged
+            ),
             "analyzed_embedding_count": self._analyzed_embedding_count,
+            "unresolved_embedding_count": self._unresolved_embedding_count,
+            "resolved_cluster_count": self._resolved_cluster_count,
             "last_completed_preprocessing_chunk": self._last_completed_chunk,
             "analysis_warning": self._worker_error or self._warning,
             "live_identities": deepcopy(list(self._live_identities)),
+            "retired_live_identity_ids": sorted(
+                self._retired_live_ids,
+                key=lambda item: (_live_number(item), item),
+            ),
             "live_recognition_events": deepcopy(list(self._events)),
         }
 
@@ -277,24 +327,75 @@ class LiveRollingAnalysisSession:
                 self._wake.wait()
                 while True:
                     with self._condition:
+                        if (
+                            self._shutdown_requested
+                            and self._discard_late_results
+                        ):
+                            return
                         if self._requested_version <= self._completed_version:
                             if self._shutdown_requested:
                                 return
                             self._wake.clear()
                             break
+                        pending_elapsed = (
+                            0.0
+                            if self._pending_since is None
+                            else time.monotonic() - self._pending_since
+                        )
+                        pending_versions = (
+                            self._requested_version - self._completed_version
+                        )
+                        if (
+                            not self._shutdown_requested
+                            and pending_versions < self._minimum_new_versions
+                            and pending_elapsed < self._debounce_seconds
+                        ):
+                            self._condition.wait(
+                                timeout=self._debounce_seconds - pending_elapsed
+                            )
+                            continue
                         target_version = self._requested_version
+                        self._pending_since = None
                         self._analysis_in_progress = True
                         self._analysis_state = "running"
+                        self._analysis_runs_started += 1
 
                     snapshot = self._snapshot_provider()
                     embedding_count = len(snapshot.face_embeddings)
+                    body_count = len(snapshot.quality_body_crops)
                     with self._condition:
                         can_skip = (
                             self._has_valid_result
                             and embedding_count == self._last_successful_embedding_count
+                            and body_count == self._last_successful_body_count
+                        )
+                        reuse_clustering = (
+                            self._has_valid_result
+                            and embedding_count == self._last_successful_embedding_count
+                            and body_count != self._last_successful_body_count
+                            and bool(self._canonical_state)
+                        )
+                        clustered_override = (
+                            {
+                                "identity_clusters": deepcopy(
+                                    self._canonical_state.get(
+                                        "identity_clusters",
+                                        [],
+                                    )
+                                ),
+                                "unresolved_faces": deepcopy(
+                                    self._canonical_state.get(
+                                        "unresolved_faces",
+                                        [],
+                                    )
+                                ),
+                            }
+                            if reuse_clustering else None
                         )
                         self._last_attempted_embedding_count = embedding_count
                     if can_skip:
+                        with self._condition:
+                            self._analysis_versions_skipped_unchanged += 1
                         self._complete_without_analysis(snapshot, target_version)
                         continue
 
@@ -302,7 +403,12 @@ class LiveRollingAnalysisSession:
                         if memory is None:
                             memory = self._open_memory()
                         committed = self._committed_inputs()
-                        result = self._analyze(snapshot, memory, committed)
+                        result = self._analyze(
+                            snapshot,
+                            memory,
+                            committed,
+                            clustered_override=clustered_override,
+                        )
                         self._commit_result(result, target_version)
                     except Exception as exc:
                         self._record_pass_failure(snapshot, target_version, exc)
@@ -405,6 +511,7 @@ class LiveRollingAnalysisSession:
         with self._condition:
             return _CommittedInputs(
                 active_memberships=tuple(self._active_memberships.items()),
+                membership_history=tuple(self._membership_history.items()),
                 retired_live_ids=self._retired_live_ids,
                 next_live_number=self._next_live_number,
                 memory_matches=tuple(
@@ -421,18 +528,68 @@ class LiveRollingAnalysisSession:
         snapshot: FrozenAnalysisSnapshot,
         memory: Any | None,
         committed: _CommittedInputs,
+        clustered_override: Mapping[str, Any] | None = None,
     ) -> _AnalysisResult:
         state = snapshot.mutable_node_state()
-        clustered = self._cluster_stage()(state)
+        clustered = (
+            deepcopy(dict(clustered_override))
+            if clustered_override is not None
+            else self._cluster_stage()(state)
+        )
         if not isinstance(clustered, dict):
             raise TypeError("cluster_identities returned a non-dictionary result")
         state.update(clustered)
         association = self._association_stage()(state)
+        state.update({
+            "associations": list(getattr(association, "associations", []) or []),
+            "cluster_assignments": dict(
+                getattr(association, "cluster_assignments", {}) or {}
+            ),
+            "unattached_bodies": list(
+                getattr(association, "unattached_bodies", []) or []
+            ),
+            "frame_groups": list(getattr(association, "frame_groups", []) or []),
+            "rejected_pairs": list(
+                getattr(association, "rejected_pairs", []) or []
+            ),
+        })
+        from forensics.person_creation.nodes.build_profile import build_profile
+        from forensics.person_creation.nodes.compute_reid import compute_reid
+        from forensics.person_creation.nodes.select_best import select_best
+
+        state.update(select_best(state))
+        state.update(compute_reid(state))
+        state.update(build_profile(state))
+        canonical_node_state = state
 
         clusters = list(state.get("identity_clusters") or [])
+        unresolved_records = list(state.get("unresolved_faces") or [])
+        analysis_groups = list(clusters)
+        for index, record in enumerate(unresolved_records):
+            path = _safe_path(record.get("crop_path"))
+            vector = np.asarray(record.get("embedding"), dtype=np.float64)
+            if (
+                not path
+                or vector.ndim != 1
+                or vector.size == 0
+                or not np.isfinite(vector).all()
+            ):
+                continue
+            norm = float(np.linalg.norm(vector))
+            if norm <= 0:
+                continue
+            analysis_groups.append({
+                "cluster_id": -(index + 1),
+                "face_records": [record],
+                "representative_embedding": (vector / norm).astype(float).tolist(),
+                "face_count": 1,
+                "confidence": 0.0,
+                "low_confidence": True,
+                "clustering_state": "unresolved",
+            })
         current_memberships = []
         cluster_by_signature: dict[tuple[str, ...], dict] = {}
-        for cluster in clusters:
+        for cluster in analysis_groups:
             paths = frozenset(
                 _safe_path(record.get("crop_path"))
                 for record in cluster.get("face_records", [])
@@ -447,7 +604,8 @@ class LiveRollingAnalysisSession:
             current_memberships.append(current)
             cluster_by_signature[current.signature] = cluster
 
-        previous_memberships = dict(committed.active_memberships)
+        previous_active_memberships = dict(committed.active_memberships)
+        previous_memberships = dict(committed.membership_history)
         assigned = assign_live_identities(
             current_memberships=current_memberships,
             previous_memberships=previous_memberships,
@@ -463,9 +621,11 @@ class LiveRollingAnalysisSession:
             key=lambda item: (_live_number(item.session_person_id), item.session_person_id),
         ):
             cluster = cluster_by_signature[tuple(sorted(identity.crop_paths))]
+            # Representative-strategy comparison is deliberately absent here.
+            # It costs one Global Memory query per enrolled person per identity
+            # per pass and publishes the enrolled roster, so it lives only in
+            # forensics/person_creation/tools/compare_cluster_representatives.py.
             representative_path = self._representative_path(cluster)
-            match = self._memory_match(memory, cluster.get("representative_embedding"))
-            next_matches[identity.session_person_id] = match
             chunks = sorted(
                 chunk_by_path[path]
                 for path in identity.crop_paths
@@ -496,6 +656,29 @@ class LiveRollingAnalysisSession:
                         snapshot.version,
                         exc,
                     )
+            if record is not None and record.get("candidate_person_id"):
+                match = {
+                    "person_id": str(record["candidate_person_id"]),
+                    "name": str(record["candidate_person_id"]),
+                    "similarity": record.get("candidate_similarity"),
+                }
+            elif self._identity_decisions_enabled:
+                match = None
+            else:
+                match = self._memory_match(
+                    memory,
+                    cluster.get("representative_embedding"),
+                )
+            next_matches[identity.session_person_id] = match
+            if (
+                str(cluster.get("clustering_state") or "resolved")
+                == "unresolved"
+                and not bool((record or {}).get("publishable"))
+            ):
+                # Noise remains in the canonical evidence/membership ledger so
+                # a later DBSCAN cluster keeps the same live ID. It is not a
+                # frontend identity, review item, VLM input, or durable write.
+                continue
             state, state_version = self._identity_state_and_version(
                 identity.session_person_id,
                 record,
@@ -505,6 +688,9 @@ class LiveRollingAnalysisSession:
                 "live_identity_id": identity.session_person_id,
                 "cluster_label": identity.cluster_label,
                 "status": "provisional",
+                "clustering_state": str(
+                    cluster.get("clustering_state") or "resolved"
+                ),
                 "state": state,
                 "version": state_version,
                 "face_count": face_count,
@@ -539,6 +725,15 @@ class LiveRollingAnalysisSession:
                 "observation_count": (
                     (record or {}).get("observation_count", face_count)
                 ),
+                "comparison_timestamp": (
+                    (record or {}).get("comparison_timestamp")
+                ),
+                "latency_metrics": deepcopy(
+                    (record or {}).get("latency_metrics") or {}
+                ),
+                "quality_classification": (
+                    (record or {}).get("quality_classification")
+                ),
             })
 
         raw_events = self._build_events(
@@ -554,22 +749,53 @@ class LiveRollingAnalysisSession:
             next_event_number=committed.next_event_number,
         )
         active_ids = {live_id for live_id, _paths in assigned.active_memberships}
+        membership_history = dict(previous_memberships)
+        for live_id, paths in assigned.active_memberships:
+            membership_history[live_id] = frozenset(
+                set(membership_history.get(live_id, frozenset())) | set(paths)
+            )
         retired = frozenset(
-            set(committed.retired_live_ids)
-            | (set(previous_memberships) - active_ids)
+            (
+                set(committed.retired_live_ids)
+                | (set(previous_active_memberships) - active_ids)
+            )
+            - active_ids
         )
         return _AnalysisResult(
             version=snapshot.version,
             embedding_count=len(snapshot.face_embeddings),
+            body_count=len(snapshot.quality_body_crops),
+            unresolved_embedding_count=len(unresolved_records),
+            resolved_cluster_count=len(clusters),
             last_completed_chunk=snapshot.last_completed_preprocessing_chunk,
             live_identities=tuple(identities),
             active_memberships=assigned.active_memberships,
+            membership_history=tuple(membership_history.items()),
             retired_live_ids=retired,
             next_live_number=assigned.next_live_number,
             memory_matches=tuple(sorted(next_matches.items())),
             events=events,
             event_keys=event_keys,
             next_event_number=next_event_number,
+            canonical_state={
+                key: deepcopy(canonical_node_state.get(key))
+                for key in (
+                    "identity_clusters",
+                    "unresolved_faces",
+                    "associations",
+                    "cluster_assignments",
+                    "unattached_bodies",
+                    "frame_groups",
+                    "rejected_pairs",
+                    "per_cluster_best_body_crops",
+                    "best_body_crops",
+                    "reid_embeddings",
+                    "reid_crop_counts",
+                    "reid_reasons",
+                    "per_cluster_profiles",
+                    "profile",
+                )
+            },
         )
 
     @staticmethod
@@ -735,6 +961,47 @@ class LiveRollingAnalysisSession:
         )
 
     @staticmethod
+    def _latency_metrics(
+        cluster: Mapping[str, Any],
+        comparison_completed: float,
+    ) -> dict:
+        timed_records = []
+        for record in cluster.get("face_records") or []:
+            timing = dict(record.get("_latency_timing") or {})
+            try:
+                capture = float(timing["capture_monotonic"])
+                face = float(timing["face_detected_monotonic"])
+                embedding = float(timing["embedding_completed_monotonic"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            timed_records.append((capture, face, embedding, timing))
+        if not timed_records:
+            return {}
+        capture, face, embedding, timing = min(
+            timed_records,
+            key=lambda item: item[0],
+        )
+        return {
+            "source_frame_timestamp": timing.get("source_frame_timestamp"),
+            "capture_monotonic": capture,
+            "face_detected_monotonic": face,
+            "quality_accepted_monotonic": timing.get(
+                "quality_accepted_monotonic"
+            ),
+            "embedding_completed_monotonic": embedding,
+            "comparison_completed_monotonic": float(comparison_completed),
+            "capture_to_face_ms": round(max(0.0, face - capture) * 1000.0, 3),
+            "capture_to_embedding_ms": round(
+                max(0.0, embedding - capture) * 1000.0,
+                3,
+            ),
+            "embedding_to_comparison_ms": round(
+                max(0.0, comparison_completed - embedding) * 1000.0,
+                3,
+            ),
+        }
+
+    @staticmethod
     def _best_body_path(assignments: list[dict]) -> str:
         if not assignments:
             return ""
@@ -787,9 +1054,15 @@ class LiveRollingAnalysisSession:
         assignments: list[dict],
         face_count: int,
     ) -> dict | None:
-        """Evaluate provisionally, persist once stable, then append new evidence."""
+        """Evaluate once per distinct face signature and persist only clusters."""
         if not self._identity_decisions_enabled:
             return None
+        with self._condition:
+            if self._discard_late_results:
+                return deepcopy(
+                    self._identity_decision_records.get(live_id)
+                    or self._identity_provisional.get(live_id)
+                )
 
         faces, bodies = self._identity_evidence(cluster, assignments)
         face_count = len(faces)
@@ -842,14 +1115,49 @@ class LiveRollingAnalysisSession:
         if memory is None:
             return None
 
+        unresolved = (
+            str(cluster.get("clustering_state") or "resolved") == "unresolved"
+        )
         decision = self._provisional_decision(memory, cluster, face_count, policy)
-        outcome = decision.decision.value
+        comparison_completed = time.monotonic()
+        comparison_timestamp = datetime.now(timezone.utc).isoformat()
+        latency_metrics = self._latency_metrics(cluster, comparison_completed)
+        margin_sufficient = (
+            decision.margin is None
+            or decision.margin >= policy.minimum_margin
+        )
+        quality_results = [
+            record.get("face_quality") or {}
+            for record in cluster.get("face_records") or []
+        ]
+        confirmation_eligible = bool(quality_results) and all(
+            result.get("immediate_confirmation_eligible") is True
+            for result in quality_results
+        )
+        # Backward-compatible test fixtures without quality metadata are
+        # standard evidence, never a production bypass.
+        strong_single_known = bool(
+            unresolved
+            and face_count == 1
+            and confirmation_eligible
+            and decision.top_candidate_person_id
+            and decision.top_similarity is not None
+            and decision.top_similarity >= policy.maximum_similarity
+            and margin_sufficient
+        )
+        outcome = (
+            "attach_existing" if strong_single_known else decision.decision.value
+        )
+        reason = (
+            "strong_clear_match" if strong_single_known else decision.reason.value
+        )
         consecutive = streak[1] + 1 if streak and streak[0] == outcome else 1
         published = {
             "live_identity_id": live_id,
             "job_id": self._job_id,
             "decision": outcome,
-            "reason": decision.reason.value,
+            "reason": reason,
+            "publishable": (not unresolved) or strong_single_known,
             "provisional": True,
             "persisted": False,
             "canonical_person_id": None,
@@ -864,7 +1172,55 @@ class LiveRollingAnalysisSession:
             "evidence_signature": face_signature,
             "observation_count": face_count,
             "last_evidence_signature": all_signature,
+            "comparison_timestamp": comparison_timestamp,
+            "latency_metrics": latency_metrics,
+            "quality_classification": (
+                quality_results[0].get("quality_class")
+                if quality_results else None
+            ),
         }
+        previous_candidate = (provisional or {}).get("candidate_person_id")
+        next_candidate = published.get("candidate_person_id")
+        candidate_changed = bool(
+            previous_candidate and previous_candidate != next_candidate
+        )
+        if candidate_changed:
+            previous_similarity = float(
+                (provisional or {}).get("candidate_similarity") or 0.0
+            )
+            next_similarity = float(published.get("candidate_similarity") or 0.0)
+            previous_margin = float((provisional or {}).get("margin") or 0.0)
+            next_margin = float(published.get("margin") or 0.0)
+            materially_stronger = (
+                next_similarity >= previous_similarity + policy.minimum_margin
+                and next_margin >= previous_margin
+                and confirmation_eligible
+            )
+            if not materially_stronger:
+                for field in (
+                    "decision",
+                    "candidate_person_id",
+                    "candidate_similarity",
+                    "second_candidate_person_id",
+                    "second_candidate_similarity",
+                    "margin",
+                    "publishable",
+                ):
+                    published[field] = (provisional or {}).get(field)
+                published["reason"] = "candidate_evidence_conflict"
+                published["conflict_count"] = int(
+                    (provisional or {}).get("conflict_count") or 0
+                ) + 1
+                with self._condition:
+                    self._identity_outcome_streak.pop(live_id, None)
+                    self._identity_provisional[live_id] = deepcopy(published)
+                return published
+        if unresolved:
+            # A one-face bypass is visual only. It never advances the durable
+            # streak and can never invoke register_with_identity_policy.
+            with self._condition:
+                self._identity_provisional[live_id] = deepcopy(published)
+            return published
         with self._condition:
             self._identity_outcome_streak[live_id] = (outcome, consecutive)
             self._identity_provisional[live_id] = deepcopy(published)
@@ -886,6 +1242,8 @@ class LiveRollingAnalysisSession:
             signature=all_signature,
             policy=policy,
             memory=memory,
+            comparison_timestamp=comparison_timestamp,
+            latency_metrics=latency_metrics,
         )
 
     def _persist_identity(
@@ -901,6 +1259,8 @@ class LiveRollingAnalysisSession:
         signature: str,
         policy: Any,
         memory: Any,
+        comparison_timestamp: str,
+        latency_metrics: Mapping[str, Any],
     ) -> dict | None:
         key = f"{self._job_id}|{live_id}|{version}"
         with self._condition:
@@ -978,6 +1338,8 @@ class LiveRollingAnalysisSession:
             "canonical_body_paths": persisted_bodies,
             "persisted_face_count": len(persisted_faces),
             "persisted_body_count": len(persisted_bodies),
+            "comparison_timestamp": comparison_timestamp,
+            "latency_metrics": deepcopy(dict(latency_metrics)),
         }
         with self._condition:
             self._identity_decision_keys.add(key)
@@ -1200,20 +1562,42 @@ class LiveRollingAnalysisSession:
 
     def _commit_result(self, result: _AnalysisResult, target_version: int) -> None:
         active_memberships = dict(result.active_memberships)
+        membership_history = dict(result.membership_history)
         memory_matches = {
             live_id: deepcopy(match) for live_id, match in result.memory_matches
         }
-        live_identities = tuple(deepcopy(identity) for identity in result.live_identities)
+        status_published = time.monotonic()
+        live_identity_records = []
+        for raw_identity in result.live_identities:
+            identity = deepcopy(raw_identity)
+            metrics = dict(identity.get("latency_metrics") or {})
+            try:
+                capture = float(metrics["capture_monotonic"])
+                comparison = float(metrics["comparison_completed_monotonic"])
+            except (KeyError, TypeError, ValueError):
+                pass
+            else:
+                metrics["status_published_monotonic"] = status_published
+                metrics["comparison_to_status_ms"] = round(
+                    max(0.0, status_published - comparison) * 1000.0,
+                    3,
+                )
+                metrics["capture_to_status_ms"] = round(
+                    max(0.0, status_published - capture) * 1000.0,
+                    3,
+                )
+            identity["latency_metrics"] = metrics
+            live_identity_records.append(identity)
+        live_identities = tuple(live_identity_records)
         events = tuple(deepcopy(event) for event in result.events)
         event_keys = tuple(result.event_keys)
         with self._condition:
-            if self._requested_version > result.version:
-                self._completed_version = max(self._completed_version, result.version)
+            if self._discard_late_results:
                 self._analysis_in_progress = False
-                self._analysis_state = "scheduled"
                 self._condition.notify_all()
                 return
             self._active_memberships = active_memberships
+            self._membership_history = membership_history
             self._retired_live_ids = result.retired_live_ids
             self._next_live_number = result.next_live_number
             self._memory_matches = memory_matches
@@ -1221,16 +1605,32 @@ class LiveRollingAnalysisSession:
             self._events = events
             self._event_keys = event_keys
             self._next_event_number = result.next_event_number
-            self._completed_version = max(target_version, result.version)
-            self._analysis_version = max(target_version, result.version)
+            self._canonical_state = deepcopy(result.canonical_state)
+            self._completed_version = max(
+                self._completed_version,
+                target_version,
+                result.version,
+            )
+            self._analysis_version = max(
+                self._analysis_version,
+                target_version,
+                result.version,
+            )
             self._last_attempted_embedding_count = result.embedding_count
             self._last_successful_embedding_count = result.embedding_count
+            self._last_successful_body_count = result.body_count
             self._has_valid_result = True
             self._analyzed_embedding_count = result.embedding_count
+            self._unresolved_embedding_count = result.unresolved_embedding_count
+            self._resolved_cluster_count = result.resolved_cluster_count
             self._last_completed_chunk = result.last_completed_chunk
             self._warning = None
             self._analysis_in_progress = False
-            self._analysis_state = "ready"
+            self._analysis_state = (
+                "scheduled"
+                if self._requested_version > self._completed_version
+                else "ready"
+            )
             self._condition.notify_all()
         self._publish()
 
@@ -1275,6 +1675,7 @@ class LiveRollingAnalysisSession:
             return
         with self._condition:
             self._publication_sequence += 1
+            self._generated_at = datetime.now(timezone.utc).isoformat()
             snapshot = self._public_snapshot_locked()
         try:
             self._notify_callback(snapshot)

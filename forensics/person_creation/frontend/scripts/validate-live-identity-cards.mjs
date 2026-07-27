@@ -10,6 +10,7 @@ import { build } from 'esbuild'
 
 import {
   canonicalLiveCropPath,
+  completeCardLatency,
   createStatusRequestGuard,
   mergeJobStatus,
   normalizeRollingAnalysis,
@@ -22,6 +23,7 @@ const identity = (overrides = {}) => ({
   session_person_id: 'live_0001',
   version: 2,
   state: 'provisional',
+  clustering_state: 'resolved',
   decision: 'attach_existing',
   provisional: true,
   canonical_person_id: null,
@@ -44,6 +46,17 @@ const identity = (overrides = {}) => ({
   clothing_description: '',
   vlm_error: null,
   vlm_version: 2,
+  comparison_timestamp: '2026-07-23T10:00:00Z',
+  latency_metrics: {
+    source_frame_timestamp: '2026-07-23T10:00:00Z',
+    capture_to_face_ms: 20,
+    capture_to_embedding_ms: 40,
+    embedding_to_comparison_ms: 10,
+    comparison_to_status_ms: 5,
+    capture_to_status_ms: 55,
+    frontend_received_monotonic: 100,
+    frontend_received_epoch_ms: 1000,
+  },
   ...overrides,
 })
 
@@ -70,6 +83,40 @@ const status = rollingAnalysis => ({
   snapshot: { media_lifecycle_version: 0, rolling_analysis: rollingAnalysis },
 })
 
+const realBackendStatusSchema = {
+  job_id: 'job-live',
+  status: 'processing_live_frames',
+  node: 'process_live_stream',
+  error: null,
+  snapshot: {
+    identity_clusters: [{ cluster_id: 0, face_count: 4 }],
+    per_cluster_profiles: { 0: { person_id: 'live_0001' } },
+    per_cluster_best_body_crops: {
+      0: ['person_004/body_crops/body.jpg'],
+    },
+    per_cluster_clothing: {},
+    profile: { person_id: 'live_0001' },
+    rolling_analysis: rolling([identity({
+      decision: 'new_person',
+      vlm_status: 'queued',
+      vlm_state: 'pending',
+    })], {
+      evidence_version: 8,
+      generated_at: '2026-07-23T10:00:00Z',
+    }),
+  },
+}
+const realSchemaCards = normalizeRollingAnalysis(
+  realBackendStatusSchema.snapshot.rolling_analysis,
+).identities
+assert.equal(realSchemaCards.length, 1, 'real backend status schema exposes a card')
+assert.equal(
+  realSchemaCards[0].liveIdentityId,
+  'live_0001',
+  'frontend consumes $.snapshot.rolling_analysis.live_identities',
+)
+assert.equal(realSchemaCards[0].vlmStatus, 'queued')
+
 const normalized = normalizeRollingAnalysis(rolling([
   identity(),
   identity({ state: 'observing', face_count: 1 }),
@@ -85,7 +132,16 @@ assert.equal(normalized.identities[0].secondCandidateSimilarity, 0.74)
 assert.equal(normalized.identities[0].observationCount, 5)
 assert.equal(normalized.identities[0].evidenceVersion, 2)
 assert.equal(normalized.identities[0].persisted, false)
+assert.equal(normalized.identities[0].clusteringState, 'resolved')
 assert.equal(normalized.identities[0].vlmStatus, 'queued')
+assert.equal(normalized.identities[0].latencyMetrics.captureToEmbeddingMs, 40)
+const completedLatency = completeCardLatency(
+  normalized.identities[0].latencyMetrics,
+  112,
+  Date.parse('2026-07-23T10:00:00Z') + 75,
+)
+assert.equal(completedLatency.statusToCardMs, 12)
+assert.equal(completedLatency.captureToCardMs, 75)
 assert.equal(normalized.vlmQueueCapacity, 2)
 const tenNormalized = normalizeRollingAnalysis(rolling([
   ...Array.from({ length: 10 }, (_, index) => identity({
@@ -111,7 +167,19 @@ for (const vlmValue of [
   const item = normalizeRollingAnalysis(rolling([identity({ vlm_status: vlmValue })])).identities[0]
   assert.equal(item.vlmStatus, vlmValue, `VLM state ${vlmValue} is supported`)
 }
+assert.equal(
+  normalizeRollingAnalysis(rolling([identity({
+    vlm_status: undefined,
+    vlm_state: 'pending',
+  })])).identities[0].vlmStatus,
+  'queued',
+  'backend pending VLM state maps to the existing queued card state',
+)
 assert.equal(canonicalLiveCropPath('person_004/face_crops/face.jpg', 'face'), 'person_004/face_crops/face.jpg')
+assert.equal(
+  canonicalLiveCropPath('session/_staging/face_crops/first.jpg', 'face'),
+  'session/_staging/face_crops/first.jpg',
+)
 for (const unsafe of [
   '/private/face.jpg',
   'C:\\private\\face.jpg',
@@ -128,6 +196,15 @@ assert.equal(sanitizeVlmError('timeout'), 'timeout')
 assert.equal(sanitizeVlmError('rtsp://user:secret@camera/live C:\\private'), 'inference_error')
 
 const provisional = status(rolling([identity()]))
+const unresolved = status(rolling([identity({
+  clustering_state: 'unresolved',
+  observation_count: 1,
+  face_count: 1,
+})]))
+const unresolvedNormalized = normalizeRollingAnalysis(
+  unresolved.snapshot.rolling_analysis,
+)
+assert.equal(unresolvedNormalized.identities.length, 0, 'weak unresolved evidence is hidden')
 const persisted = status(rolling([identity({
   version: 3,
   state: 'attach_existing',
@@ -152,6 +229,131 @@ const noFaceResult = normalizeRollingAnalysis(
 )
 assert.equal(noFaceResult.identities.length, 1, 'no-face update retains known live cards')
 assert.equal(noFaceResult.identities[0].liveIdentityId, 'live_0001')
+
+let decreasingCoreChunkStatus = status(rolling([identity({
+  version: 1,
+  face_count: 1,
+})], {
+  publication_sequence: 1,
+  evidence_version: 1,
+  requested_version: 1,
+  analysis_version: 1,
+  last_completed_preprocessing_chunk: -1,
+}))
+for (const [index, chunk] of [-4, -7, -10].entries()) {
+  const version = index + 2
+  decreasingCoreChunkStatus = mergeJobStatus(
+    decreasingCoreChunkStatus,
+    status(rolling([identity({
+      version,
+      face_count: version,
+    })], {
+      publication_sequence: version,
+      evidence_version: version,
+      requested_version: version,
+      analysis_version: version,
+      last_completed_preprocessing_chunk: chunk,
+    })),
+  )
+  assert.equal(
+    decreasingCoreChunkStatus.snapshot.rolling_analysis.publication_sequence,
+    version,
+    `core chunk ${chunk} publication is accepted`,
+  )
+}
+const decreasingCoreChunkResult = normalizeRollingAnalysis(
+  decreasingCoreChunkStatus.snapshot.rolling_analysis,
+)
+assert.equal(decreasingCoreChunkResult.publicationSequence, 4)
+assert.equal(decreasingCoreChunkResult.lastCompletedChunk, -10)
+assert.equal(decreasingCoreChunkResult.identities[0].faceCount, 4)
+
+const twoUnresolved = status(rolling([
+  identity({ clustering_state: 'unresolved' }),
+  identity({
+    live_identity_id: 'live_0002',
+    session_person_id: 'live_0002',
+    clustering_state: 'unresolved',
+  }),
+]))
+const reconciled = status(rolling([
+  identity({ clustering_state: 'resolved', face_count: 3 }),
+], {
+  publication_sequence: 11,
+  requested_version: 11,
+  analysis_version: 11,
+  retired_live_identity_ids: ['live_0002'],
+}))
+const reconciledResult = normalizeRollingAnalysis(
+  mergeJobStatus(twoUnresolved, reconciled).snapshot.rolling_analysis,
+)
+assert.deepEqual(
+  reconciledResult.identities.map(item => item.liveIdentityId),
+  ['live_0001'],
+  'absorbed unresolved card is retired after reconciliation',
+)
+
+const temporarilyRetired = mergeJobStatus(
+  status(rolling([identity({
+    version: 4,
+    provisional: false,
+    persisted: true,
+    canonical_person_id: 'person_004',
+  })], {
+    publication_sequence: 20,
+    evidence_version: 20,
+    requested_version: 20,
+    analysis_version: 20,
+  })),
+  status(rolling([], {
+    publication_sequence: 21,
+    evidence_version: 21,
+    requested_version: 21,
+    analysis_version: 21,
+    retired_live_identity_ids: ['live_0001'],
+  })),
+)
+assert.equal(
+  normalizeRollingAnalysis(
+    temporarilyRetired.snapshot.rolling_analysis,
+  ).identities.length,
+  0,
+  'temporarily retired identity card disappears',
+)
+const reappeared = mergeJobStatus(
+  temporarilyRetired,
+  status(rolling([
+    identity({
+      version: 4,
+      provisional: false,
+      persisted: true,
+      canonical_person_id: 'person_004',
+    }),
+    identity({
+      version: 4,
+      provisional: false,
+      persisted: true,
+      canonical_person_id: 'person_004',
+    }),
+  ], {
+    publication_sequence: 22,
+    evidence_version: 22,
+    requested_version: 22,
+    analysis_version: 22,
+    retired_live_identity_ids: ['live_0001'],
+  })),
+)
+const reappearedResult = normalizeRollingAnalysis(
+  reappeared.snapshot.rolling_analysis,
+)
+assert.equal(reappearedResult.identities.length, 1, 'active retired identity reappears once')
+assert.equal(reappearedResult.identities[0].liveIdentityId, 'live_0001')
+assert.equal(reappearedResult.identities[0].persisted, true)
+assert.deepEqual(
+  reappeared.snapshot.rolling_analysis.retired_live_identity_ids,
+  [],
+  'currently active identity is removed from the retired set',
+)
 
 const processing = status(rolling([identity({ vlm_status: 'processing' })]))
 const completed = status(rolling([identity({
@@ -193,14 +395,19 @@ let terminalCalls = 0
 const pollingCleanup = startStatusPolling({
   fetchStatus: async () => ({ status: 'done' }),
   onTerminal: () => { terminalCalls += 1 },
-  setIntervalFn: callback => { scheduledPoll = callback; return 23 },
-  clearIntervalFn: id => { assert.equal(id, 23); cleared += 1 },
+  setTimeoutFn: (callback, interval) => {
+    assert.equal(interval, 2000)
+    scheduledPoll = callback
+    return 23
+  },
+  clearTimeoutFn: id => { assert.equal(id, 23); cleared += 1 },
 })
 await new Promise(resolve => setTimeout(resolve, 0))
 assert.equal(typeof scheduledPoll, 'function')
-assert.equal(cleared, 1)
+assert.equal(cleared, 0)
 assert.equal(terminalCalls, 1)
 pollingCleanup()
+assert.equal(cleared, 1)
 
 const frontendRoot = path.resolve(import.meta.dirname, '..')
 const panelPath = path.join(frontendRoot, 'src', 'components', 'LiveIdentityPanel.jsx')
@@ -306,16 +513,36 @@ async function run() {
     observation_count: 1,
     evidence_version: 1,
     evidence_signature: 'first-face',
-    decision: 'review_required',
-    reason: 'insufficient_face_observations',
+    decision: 'attach_existing',
+    reason: 'strong_clear_match',
+    candidate_person_id: 'person_004',
+    clustering_state: 'unresolved',
     provisional: true,
     persisted: false,
   })]))
   await waitFor(() => output.querySelectorAll('[data-live-identity-id]').length === 1, 'one-face provisional card')
   const firstFaceCard = output.querySelector('[data-live-identity-id="live_0001"]')
-  assert(firstFaceCard.textContent.includes('Provisional comparison'), 'one-face result is labelled provisional')
+  assert(firstFaceCard.textContent.includes('Strong known-person match'), 'one-face strong match is explicit')
+  assert(firstFaceCard.dataset.clusteringState === 'unresolved', 'unresolved state is machine-readable')
   assert(firstFaceCard.textContent.includes('PersistedNo'), 'one-face result is not labelled persisted')
   assert(firstFaceCard.textContent.includes('1 face observation'), 'one-face observation count is displayed')
+
+  render(rolling([identity('live_0001', {
+    face_count: 3,
+    observation_count: 3,
+    evidence_version: 2,
+    evidence_signature: 'resolved-face-evidence',
+    decision: 'review_required',
+    clustering_state: 'resolved',
+    provisional: true,
+    persisted: false,
+  })]))
+  await waitFor(
+    () => output.querySelector('[data-clustering-state="resolved"]'),
+    'resolved update',
+  )
+  assert(output.querySelector('[data-live-identity-id="live_0001"]') === firstFaceCard, 'resolution preserves the same DOM card')
+  assert(output.querySelectorAll('[data-live-identity-id="live_0001"]').length === 1, 'resolution creates no duplicate card')
 
   render(rolling([
     identity('live_0001'),
@@ -328,10 +555,9 @@ async function run() {
       vlm_status: 'not_started',
     }),
   ]))
-  await waitFor(() => output.querySelectorAll('[data-live-identity-id]').length === 2, 'two unique cards')
+  await waitFor(() => output.querySelectorAll('[data-live-identity-id]').length === 1, 'empty-image card is suppressed')
   const stableCard = output.querySelector('[data-live-identity-id="live_0001"]')
   assert(stableCard, 'first live identity card exists')
-  assert(output.textContent.includes('No face image'), 'missing face placeholder is stable')
   assert(output.textContent.includes('No body image'), 'missing body placeholder is stable')
   await waitFor(() => imageMounts === 2, 'canonical face and body requests')
   await waitFor(() => stableCard.textContent.includes('No face image'), 'failed canonical face placeholder')
@@ -366,7 +592,7 @@ async function run() {
   const identityWithoutMedia = index => identity(
     'live_' + String(index).padStart(4, '0'),
     {
-      best_face_path: '',
+      best_face_path: 'person_004/face_crops/face.jpg',
       best_body_path: '',
       selected_body_crop: '',
       vlm_status: 'not_started',

@@ -167,9 +167,19 @@ export function canonicalLiveCropPath(path, cropType) {
   const folder = cropType === 'face' ? 'face_crops' : cropType === 'body' ? 'body_crops' : ''
   if (!folder || !mediaImageUrl(safePath)) return ''
   const match = safePath.match(/^person_[0-9]+\/(face_crops|body_crops)\/([^/]+)$/)
-  if (!match || match[1] !== folder) return ''
-  if (!/\.(?:jpe?g|png|webp|bmp)$/i.test(match[2])) return ''
-  return safePath
+  if (match && match[1] === folder && /\.(?:jpe?g|png|webp|bmp)$/i.test(match[2])) {
+    return safePath
+  }
+  const parts = safePath.split('/')
+  const filename = parts.at(-1) ?? ''
+  const staging = (
+    parts.length >= 4
+    && parts.at(-3) === '_staging'
+    && parts.at(-2) === folder
+    && parts.slice(0, -3).every(part => /^[A-Za-z0-9_.-]+$/.test(part))
+    && /\.(?:jpe?g|png|webp|bmp)$/i.test(filename)
+  )
+  return staging ? safePath : ''
 }
 
 export function sanitizeVlmError(value) {
@@ -184,6 +194,51 @@ export function formatSimilarity(value) {
   return `${Math.round(Math.min(1, Math.max(0, similarity)) * 100)}%`
 }
 
+export function markStatusResponseReceived(
+  data,
+  receivedMonotonic = performance.now(),
+  receivedEpochMs = Date.now(),
+) {
+  const identities = data?.snapshot?.rolling_analysis?.live_identities
+  if (!Array.isArray(identities)) return data
+  for (const identity of identities) {
+    if (!identity || typeof identity !== 'object') continue
+    identity.latency_metrics = {
+      ...objectOrEmpty(identity.latency_metrics),
+      frontend_received_monotonic: receivedMonotonic,
+      frontend_received_epoch_ms: receivedEpochMs,
+    }
+  }
+  return data
+}
+
+export function completeCardLatency(
+  value,
+  renderedMonotonic = performance.now(),
+  renderedEpochMs = Date.now(),
+) {
+  const latency = objectOrEmpty(value)
+  const received = finiteNumber(latency.frontendReceivedMonotonic)
+  const sourceTimestamp = stringValue(latency.sourceFrameTimestamp)
+  const sourceEpochMs = Date.parse(sourceTimestamp)
+  const statusToCard = received === null
+    ? null
+    : Math.max(0, renderedMonotonic - received)
+  const captureToCard = Number.isFinite(sourceEpochMs)
+    ? Math.max(0, renderedEpochMs - sourceEpochMs)
+    : (
+      finiteNumber(latency.captureToStatusMs) !== null && statusToCard !== null
+        ? finiteNumber(latency.captureToStatusMs) + statusToCard
+        : null
+    )
+  return {
+    ...latency,
+    cardRenderedMonotonic: renderedMonotonic,
+    statusToCardMs: statusToCard,
+    captureToCardMs: captureToCard,
+  }
+}
+
 export function normalizeRollingAnalysis(value) {
   const rolling = objectOrEmpty(value)
   const enabled = rolling.enabled === true
@@ -194,6 +249,17 @@ export function normalizeRollingAnalysis(value) {
     const raw = objectOrEmpty(rawValue)
     const liveIdentityId = stringValue(raw.live_identity_id ?? raw.session_person_id)
     if (!liveIdentityId || identityIds.has(liveIdentityId)) continue
+    const bestFacePath = canonicalLiveCropPath(
+      raw.best_face_path ?? raw.representative_face_path,
+      'face',
+    )
+    const clusteringState = stringValue(
+      raw.clustering_state,
+      'resolved',
+    ).toLowerCase() === 'unresolved' ? 'unresolved' : 'resolved'
+    const reasonValue = stringValue(raw.reason)
+    if (!bestFacePath) continue
+    if (clusteringState === 'unresolved' && reasonValue !== 'strong_clear_match') continue
     identityIds.add(liveIdentityId)
     const sessionPersonId = stringValue(raw.session_person_id, liveIdentityId)
     const decisionValue = stringValue(raw.decision).toLowerCase()
@@ -202,17 +268,27 @@ export function normalizeRollingAnalysis(value) {
     const state = LIVE_IDENTITY_STATES.has(stateValue)
       ? stateValue
       : decision || (raw.provisional === true ? 'provisional' : 'observing')
-    const vlmValue = stringValue(raw.vlm_status, 'not_started').toLowerCase()
+    const rawVlmValue = stringValue(
+      raw.vlm_status ?? raw.vlm_state,
+      'not_started',
+    ).toLowerCase()
+    const vlmValue = rawVlmValue === 'pending'
+      ? 'queued'
+      : rawVlmValue === 'running'
+        ? 'processing'
+        : rawVlmValue
     const vlmStatus = VLM_STATES.has(vlmValue) ? vlmValue : 'failed'
+    const rawLatency = objectOrEmpty(raw.latency_metrics)
     identities.push({
       liveIdentityId,
       sessionPersonId,
       version: nonNegativeInteger(raw.version),
       clusterLabel: finiteNumber(raw.cluster_label),
       status: stringValue(raw.status, 'provisional'),
+      clusteringState,
       state,
       decision,
-      reason: stringValue(raw.reason),
+      reason: reasonValue,
       provisional: raw.provisional === true,
       persisted: raw.persisted === true || (
         raw.provisional === false && Boolean(raw.canonical_person_id)
@@ -233,14 +309,8 @@ export function normalizeRollingAnalysis(value) {
       ),
       firstSeenChunk: finiteNumber(raw.first_seen_chunk),
       lastSeenChunk: finiteNumber(raw.last_seen_chunk),
-      bestFacePath: canonicalLiveCropPath(
-        raw.best_face_path ?? raw.representative_face_path,
-        'face',
-      ),
-      representativeFacePath: canonicalLiveCropPath(
-        raw.best_face_path ?? raw.representative_face_path,
-        'face',
-      ),
+      bestFacePath,
+      representativeFacePath: bestFacePath,
       bestBodyPath: canonicalLiveCropPath(raw.best_body_path, 'body'),
       vlmStatus,
       selectedBodyCrop: canonicalLiveCropPath(raw.selected_body_crop, 'body'),
@@ -248,6 +318,25 @@ export function normalizeRollingAnalysis(value) {
       vlmError: sanitizeVlmError(raw.vlm_error),
       vlmVersion: finiteNumber(raw.vlm_version),
       memoryMatch: normalizeMemoryMatch(raw.memory_match),
+      comparisonTimestamp: stringValue(raw.comparison_timestamp),
+      latencyMetrics: {
+        sourceFrameTimestamp: stringValue(rawLatency.source_frame_timestamp),
+        captureToFaceMs: finiteNumber(rawLatency.capture_to_face_ms),
+        captureToEmbeddingMs: finiteNumber(rawLatency.capture_to_embedding_ms),
+        embeddingToComparisonMs: finiteNumber(
+          rawLatency.embedding_to_comparison_ms,
+        ),
+        comparisonToStatusMs: finiteNumber(
+          rawLatency.comparison_to_status_ms,
+        ),
+        captureToStatusMs: finiteNumber(rawLatency.capture_to_status_ms),
+        frontendReceivedMonotonic: finiteNumber(
+          rawLatency.frontend_received_monotonic,
+        ),
+        frontendReceivedEpochMs: finiteNumber(
+          rawLatency.frontend_received_epoch_ms,
+        ),
+      },
     })
   }
 
@@ -286,6 +375,10 @@ export function normalizeRollingAnalysis(value) {
     stateLabel: ROLLING_STATE_LABELS[state],
     analysisInProgress: rolling.analysis_in_progress === true,
     analyzedEmbeddingCount: nonNegativeInteger(rolling.analyzed_embedding_count),
+    unresolvedEmbeddingCount: nonNegativeInteger(
+      rolling.unresolved_embedding_count,
+    ),
+    resolvedClusterCount: nonNegativeInteger(rolling.resolved_cluster_count),
     lastCompletedChunk: finiteNumber(rolling.last_completed_preprocessing_chunk),
     warning: stringValue(rolling.analysis_warning),
     vlmQueueDepth: nonNegativeInteger(rolling.vlm_queue_depth),
@@ -393,12 +486,31 @@ function mergeRollingPayload(previousRolling, incomingRolling) {
       .map(identity => [rawLiveIdentityId(identity), identity])
       .filter(([identityId]) => identityId),
   )
+  const currentlyActiveIdentityIds = new Set(
+    (Array.isArray(incomingRolling.live_identities)
+      ? incomingRolling.live_identities
+      : [])
+      .map(rawLiveIdentityId)
+      .filter(Boolean),
+  )
+  const retiredIdentityIds = new Set([
+    ...(Array.isArray(previousRolling.retired_live_identity_ids)
+      ? previousRolling.retired_live_identity_ids.map(stringValue).filter(Boolean)
+      : []),
+    ...(Array.isArray(incomingRolling.retired_live_identity_ids)
+      ? incomingRolling.retired_live_identity_ids.map(stringValue).filter(Boolean)
+      : []),
+  ])
+  for (const identityId of currentlyActiveIdentityIds) {
+    retiredIdentityIds.delete(identityId)
+  }
+  merged.retired_live_identity_ids = [...retiredIdentityIds]
   if (Array.isArray(incomingRolling.live_identities)) {
     const seen = new Set()
     merged.live_identities = []
     for (const identity of incomingRolling.live_identities) {
       const identityId = rawLiveIdentityId(identity)
-      if (!identityId || seen.has(identityId)) continue
+      if (!identityId || seen.has(identityId) || retiredIdentityIds.has(identityId)) continue
       seen.add(identityId)
       const previous = previousIdentities.get(identityId)
       merged.live_identities.push(
@@ -406,7 +518,7 @@ function mergeRollingPayload(previousRolling, incomingRolling) {
       )
     }
     for (const [identityId, identity] of previousIdentities) {
-      if (seen.has(identityId)) continue
+      if (seen.has(identityId) || retiredIdentityIds.has(identityId)) continue
       seen.add(identityId)
       merged.live_identities.push(identity)
     }
@@ -437,8 +549,8 @@ export function mergeJobStatus(previous, incoming) {
   if (previousRolling.enabled !== true) return incoming
 
   const monotonicRollingFields = [
-    'publication_sequence', 'requested_version', 'analysis_version',
-    'last_completed_preprocessing_chunk',
+    'publication_sequence', 'evidence_version', 'analysis_version',
+    'requested_version',
   ]
   if (incomingRolling.enabled === true && monotonicRollingFields.some(field => (
     finiteNumber(incomingRolling[field]) !== null
@@ -557,6 +669,12 @@ export function liveProgress(snapshot = {}) {
   const stats = objectOrEmpty(snapshot.stream_stats)
   const lastChunk = objectOrEmpty(snapshot.last_chunk ?? stats.last_chunk)
   const totals = objectOrEmpty(snapshot.session_totals ?? stats.session_totals)
+  const preprocessing = objectOrEmpty(
+    snapshot.live_preprocessing ?? stats.live_preprocessing,
+  )
+  const rolling = objectOrEmpty(
+    snapshot.rolling_analysis ?? stats.rolling_analysis,
+  )
   const streamState = stringValue(stats.stream_state).toLowerCase()
   const normalizedStreamState = ['connected', 'reconnecting', 'stopped', 'error'].includes(streamState)
     ? streamState
@@ -578,6 +696,17 @@ export function liveProgress(snapshot = {}) {
     totalFramesProcessed: finiteNumber(totals.frames_processed ?? stats.frames_processed),
     totalBodyDetections: finiteNumber(totals.body_detections ?? stats.body_detections),
     totalFaceDetections: finiteNumber(totals.face_detections ?? stats.face_detections),
+    samplingIntervalFrames: finiteNumber(
+      snapshot.sampling_interval_frames
+      ?? stats.sampling_interval_frames
+      ?? lastChunk.sampling_interval_frames,
+    ),
+    acceptedFaces: finiteNumber(preprocessing.quality_face_crops),
+    embeddedFaces: finiteNumber(preprocessing.embedded_faces),
+    unresolvedEmbeddings: finiteNumber(rolling.unresolved_embedding_count),
+    resolvedClusters: finiteNumber(rolling.resolved_cluster_count),
+    maximumQueueDepth: finiteNumber(preprocessing.maximum_queue_depth),
+    totalDroppedFrames: finiteNumber(totals.frames_dropped ?? stats.frames_dropped),
     streamState: normalizedStreamState,
     streamReconnectCount: finiteNumber(stats.stream_reconnect_count),
     streamWarning: stringValue(stats.stream_warning),
@@ -628,35 +757,52 @@ export function runSingleFlight(ref, action) {
 export function startStatusPolling({
   fetchStatus,
   onTerminal,
-  intervalMs = 2000,
-  setIntervalFn = setInterval,
-  clearIntervalFn = clearInterval,
+  intervalMs = 500,
+  terminalIntervalMs = 2000,
+  setTimeoutFn = setTimeout,
+  clearTimeoutFn = clearTimeout,
 }) {
   let disposed = false
   let inFlight = false
   let timerId = null
+  let terminalNotified = false
 
   const stop = () => {
     if (disposed) return
     disposed = true
-    if (timerId !== null) clearIntervalFn(timerId)
+    if (timerId !== null) clearTimeoutFn(timerId)
+    timerId = null
+  }
+  const schedule = delay => {
+    if (disposed) return
+    timerId = setTimeoutFn(() => {
+      timerId = null
+      void poll()
+    }, delay)
   }
   const poll = async () => {
     if (disposed || inFlight) return
     inFlight = true
+    let terminal = false
     try {
       const data = await fetchStatus()
       if (disposed) return
-      if (data && isTerminalStatus(data.status)) {
+      terminal = Boolean(data && isTerminalStatus(data.status))
+      if (terminal && !terminalNotified) {
+        terminalNotified = true
         onTerminal?.(data)
-        stop()
       }
     } finally {
       inFlight = false
+      schedule(terminal ? terminalIntervalMs : intervalMs)
     }
   }
 
-  timerId = setIntervalFn(poll, intervalMs)
   void poll()
+  stop.diagnostics = Object.freeze({
+    activeIntervalMs: intervalMs,
+    terminalIntervalMs,
+    singleFlight: true,
+  })
   return stop
 }

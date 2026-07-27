@@ -65,3 +65,5 @@ venv/
 *.webm
 yarn-debug.log*
 yarn-error.log*
+runtime_logs/
+wsl

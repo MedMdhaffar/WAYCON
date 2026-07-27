@@ -109,6 +109,9 @@ def test_backpressure_loses_no_chunks_and_preserves_order():
     assert entered.wait(1.0)
     session.submit_chunk(_chunk(1))
     session.submit_chunk(_chunk(2))
+    bounded = session.public_snapshot()
+    assert bounded["queue_depth"] <= bounded["queue_capacity"]
+    assert bounded["maximum_queue_depth"] == bounded["queue_capacity"]
 
     producer_errors: list[Exception] = []
 

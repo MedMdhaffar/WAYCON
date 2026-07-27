@@ -2,6 +2,7 @@ import json
 import re
 import sqlite3
 import threading
+import time
 import traceback
 import uuid
 from copy import deepcopy
@@ -60,10 +61,15 @@ class StartRequestError(ValueError):
 
 
 def _as_int(value, field_name: str) -> int:
+    if isinstance(value, bool) or isinstance(value, float):
+        raise StartRequestError(f"{field_name} must be an integer")
     try:
-        return int(value)
+        parsed = int(value)
     except (TypeError, ValueError) as exc:
         raise StartRequestError(f"{field_name} must be an integer") from exc
+    if str(value).strip() != str(parsed):
+        raise StartRequestError(f"{field_name} must be an integer")
+    return parsed
 
 
 def build_initial_state(body: dict, *, validate_video_paths: bool = True) -> dict:
@@ -90,7 +96,17 @@ def build_initial_state(body: dict, *, validate_video_paths: bool = True) -> dic
         output_dir = str(get_media_root() / output_relative)
     except MediaPathError as exc:
         raise StartRequestError("output_dir must be inside the configured media root") from exc
-    every_n = max(1, _as_int(body.get("every_n", 15), "every_n"))
+    if input_type == "camera_uri":
+        from forensics.person_creation.nodes.process_live_stream import (
+            live_process_every_n_frames,
+        )
+
+        try:
+            every_n = live_process_every_n_frames(body.get("every_n"))
+        except ValueError as exc:
+            raise StartRequestError(str(exc)) from exc
+    else:
+        every_n = max(1, _as_int(body.get("every_n", 15), "every_n"))
     initial_state = {
         "person_name": name,
         "input_type": input_type,
@@ -261,6 +277,48 @@ def _sanitize_media_references(value: Any, parent_key: str = "") -> Any:
     return value
 
 
+# Representative-strategy comparison is an offline concern
+# (forensics/person_creation/tools/compare_cluster_representatives.py). It
+# carries the enrolled-person roster and one similarity row per enrolled
+# identity, so the public payload drops it even if a producer reattaches it.
+_OFFLINE_DIAGNOSTIC_KEYS = {
+    "representative_similarity_diagnostic",
+    "medoid_similarity",
+    "normalized_mean_similarity",
+    "medoid_best_person_id",
+    "medoid_best_similarity",
+    "normalized_mean_best_person_id",
+    "normalized_mean_best_similarity",
+    "similarity_drift",
+    "maximum_absolute_similarity_drift",
+}
+
+
+def _embedding_free_public_projection(value: Any) -> Any:
+    """Recursively remove raw vectors and offline diagnostics from status."""
+    if isinstance(value, dict):
+        projected = {}
+        for key, item in value.items():
+            normalized = str(key).lower()
+            if (
+                normalized in {"embedding", "embeddings"}
+                or normalized.endswith("_embedding")
+                or (
+                    normalized.endswith("_embeddings")
+                    and isinstance(item, (dict, list, tuple))
+                )
+                or normalized in _OFFLINE_DIAGNOSTIC_KEYS
+            ):
+                continue
+            projected[key] = _embedding_free_public_projection(item)
+        return projected
+    if isinstance(value, list):
+        return [_embedding_free_public_projection(item) for item in value]
+    if isinstance(value, tuple):
+        return [_embedding_free_public_projection(item) for item in value]
+    return value
+
+
 def _live_vlm_status(rolling: Any) -> Any:
     """Reject non-canonical media references in versioned live identities."""
     if not isinstance(rolling, dict):
@@ -283,11 +341,20 @@ def _live_vlm_status(rolling: Any) -> Any:
                 continue
             reference = _public_media_reference(identity.get(key))
             parts = reference.split("/") if reference else []
-            identity[key] = reference if (
+            canonical = (
                 len(parts) == 3
                 and re.fullmatch(r"person_[0-9]+", parts[0])
                 and parts[0] == person_id
                 and parts[1] == f"{crop_type}_crops"
+            )
+            provisional_staging = (
+                not person_id
+                and len(parts) >= 4
+                and parts[-3] == "_staging"
+                and parts[-2] == f"{crop_type}_crops"
+            )
+            identity[key] = reference if (
+                canonical or provisional_staging
             ) else None
     return result
 
@@ -309,6 +376,7 @@ class JobState:
 @dataclass
 class JobRuntime:
     stop_event: threading.Event = field(default_factory=threading.Event)
+    stop_requested_monotonic: float | None = None
 
 
 _jobs: dict[str, JobState] = {}
@@ -325,8 +393,27 @@ def _rolling_counter(value: Any) -> int:
         return -1
 
 
+_LIVE_CANONICAL_SNAPSHOT_KEYS = {
+    "identity_clusters",
+    "unresolved_faces",
+    "associations",
+    "cluster_assignments",
+    "unattached_bodies",
+    "frame_groups",
+    "rejected_pairs",
+    "per_cluster_best_body_crops",
+    "best_body_crops",
+    "reid_embeddings",
+    "reid_crop_counts",
+    "reid_reasons",
+    "per_cluster_profiles",
+    "per_cluster_clothing",
+    "profile",
+}
+
+
 def _merge_job_snapshot(job: JobState, snapshot_update: dict) -> None:
-    """Merge a status callback while rejecting stale rolling publications."""
+    """Atomically project capture or canonical live state into the job registry."""
     from forensics.person_creation.media_lifecycle import (
         rewrite_media_references,
         scrub_obsolete_session_media,
@@ -344,27 +431,49 @@ def _merge_job_snapshot(job: JobState, snapshot_update: dict) -> None:
             output_dir=finalized_root,
         )
     incoming = update.pop("rolling_analysis", None)
-    job.snapshot.update(update)
     if not isinstance(incoming, dict):
+        # Capture-only publications can advance counters and chunk metadata, but
+        # cannot erase identity state owned by rolling analysis.
+        if (
+            job.input_type == "camera_uri"
+            and isinstance(job.snapshot.get("rolling_analysis"), dict)
+        ):
+            for key in _LIVE_CANONICAL_SNAPSHOT_KEYS:
+                update.pop(key, None)
+        job.snapshot.update(update)
         return
     current = job.snapshot.get("rolling_analysis")
-    if not isinstance(current, dict):
-        job.snapshot["rolling_analysis"] = deepcopy(incoming)
-        return
-    incoming_sequence = _rolling_counter(incoming.get("publication_sequence"))
-    current_sequence = _rolling_counter(current.get("publication_sequence"))
-    if incoming_sequence < current_sequence:
-        return
-    monotonic_fields = (
-        "requested_version",
-        "analysis_version",
-        "last_completed_preprocessing_chunk",
-    )
-    if any(
-        _rolling_counter(incoming.get(field)) < _rolling_counter(current.get(field))
-        for field in monotonic_fields
-    ):
-        return
+    if isinstance(current, dict):
+        monotonic_fields = (
+            "publication_sequence",
+            "evidence_version",
+            "analysis_version",
+            "requested_version",
+        )
+        if any(
+            _rolling_counter(incoming.get(field))
+            < _rolling_counter(current.get(field))
+            for field in monotonic_fields
+        ):
+            return
+
+    canonical_update = {
+        key: update.pop(key)
+        for key in tuple(update)
+        if key in _LIVE_CANONICAL_SNAPSHOT_KEYS
+    }
+    job.snapshot.update(update)
+    for key, value in canonical_update.items():
+        if key == "per_cluster_clothing":
+            existing = job.snapshot.get(key)
+            if isinstance(existing, dict) and isinstance(value, dict):
+                merged = deepcopy(existing)
+                merged.update(deepcopy(value))
+                job.snapshot[key] = merged
+                continue
+        if key == "profile" and not value and job.snapshot.get(key):
+            continue
+        job.snapshot[key] = deepcopy(value)
     job.snapshot["rolling_analysis"] = deepcopy(incoming)
 
 
@@ -428,6 +537,23 @@ def _run_pipeline(job_id: str, initial_state: dict) -> None:
                         _merge_job_snapshot(job, update)
 
         with _jobs_lock:
+            terminal_started = time.monotonic()
+            if runtime is not None and runtime.stop_requested_monotonic is not None:
+                stream_stats = deepcopy(job.snapshot.get("stream_stats") or {})
+                stop_timings = deepcopy(stream_stats.get("stop_timings") or {})
+                stop_timings["total_stop_ms"] = round(
+                    (
+                        time.monotonic()
+                        - runtime.stop_requested_monotonic
+                    ) * 1000.0,
+                    3,
+                )
+                stop_timings["terminal_state_publication_ms"] = round(
+                    (time.monotonic() - terminal_started) * 1000.0,
+                    3,
+                )
+                stream_stats["stop_timings"] = stop_timings
+                job.snapshot["stream_stats"] = stream_stats
             job.status = "done"
 
     except Exception:
@@ -481,6 +607,7 @@ def start():
         "source_type": initial_state.get("source_type", "video_file"),
         "camera_id": initial_state.get("camera_id"),
         "duration_seconds": initial_state.get("duration_seconds"),
+        "sampling_interval_frames": initial_state.get("process_every_n"),
         "source_uri_masked": initial_state.get("source_uri_masked", ""),
     }
     job = JobState(
@@ -513,6 +640,8 @@ def stop(job_id: str):
         if runtime is None:
             return jsonify({"job_id": job_id, "status": "stop_unavailable"}), 409
         first_request = not runtime.stop_event.is_set()
+        if first_request:
+            runtime.stop_requested_monotonic = time.monotonic()
         runtime.stop_event.set()
         job.status = "stop_requested"
 
@@ -542,7 +671,6 @@ def status(job_id: str):
         "per_cluster_profiles": snap.get("per_cluster_profiles", {}),
         "best_body_crops":     snap.get("best_body_crops", []),
         "per_cluster_best_body_crops": snap.get("per_cluster_best_body_crops", {}),
-        "reid_embeddings":    snap.get("reid_embeddings", {}),
         "reid_crop_counts":   snap.get("reid_crop_counts", {}),
         "reid_reasons":       snap.get("reid_reasons", {}),
         "reid_unavailable_reason": snap.get("reid_unavailable_reason", ""),
@@ -567,6 +695,11 @@ def status(job_id: str):
         "duration_seconds_per_chunk": snap.get("duration_seconds_per_chunk"),
         "live_preprocessing": snap.get("live_preprocessing", {}),
         "rolling_analysis": _live_vlm_status(snap.get("rolling_analysis", {})),
+        "effective_configuration": snap.get("effective_configuration", {}),
+        "live_finalization_timings": snap.get(
+            "live_finalization_timings",
+            {},
+        ),
         "media_lifecycle_version": snap.get("media_lifecycle_version", 0),
         "media_cleanup_warning": snap.get("media_cleanup_warning", ""),
     }
@@ -575,7 +708,9 @@ def status(job_id: str):
         "status":   job_status,
         "node":     job_node,
         "error":    job_error,
-        "snapshot": _sanitize_media_references(safe_snap),
+        "snapshot": _sanitize_media_references(
+            _embedding_free_public_projection(safe_snap)
+        ),
     })
 
 

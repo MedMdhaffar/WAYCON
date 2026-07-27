@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import math
 import os
 from typing import Any, Mapping
 
@@ -29,6 +30,11 @@ class QualityFilterConfig:
 
 DEFAULT_QUALITY_FILTER_CONFIG = QualityFilterConfig()
 _CONFIG_FIELDS = tuple(QualityFilterConfig.__dataclass_fields__)
+_FIXED_FACE_FIELDS = {
+    "face_min_width",
+    "face_min_height",
+    "face_min_sharpness",
+}
 
 
 def _coerce(name: str, value: Any) -> int | float:
@@ -42,7 +48,13 @@ def _coerce(name: str, value: Any) -> int | float:
 def load_quality_filter_config(
     overrides: Mapping[str, Any] | None = None,
 ) -> QualityFilterConfig:
-    """Resolve explicit overrides, then environment, then production default."""
+    """Resolve one authoritative configuration.
+
+    The recognition face boundary is a product invariant, not a deployment
+    tuning knob.  Keeping those three values fixed prevents a long-lived
+    service or worker environment from silently restoring the retired 60px
+    boundary.  Body settings retain their existing environment overrides.
+    """
     supplied = dict(overrides or {})
     unknown = sorted(set(supplied) - set(_CONFIG_FIELDS))
     if unknown:
@@ -53,9 +65,12 @@ def load_quality_filter_config(
     values: dict[str, int | float] = {}
     for name in _CONFIG_FIELDS:
         env_key = f"PERSON_CREATION_{name.upper()}"
-        raw = supplied.get(
-            name,
-            os.getenv(env_key, getattr(DEFAULT_QUALITY_FILTER_CONFIG, name)),
-        )
+        if name in _FIXED_FACE_FIELDS:
+            raw = supplied.get(name, getattr(DEFAULT_QUALITY_FILTER_CONFIG, name))
+        else:
+            raw = supplied.get(
+                name,
+                os.getenv(env_key, getattr(DEFAULT_QUALITY_FILTER_CONFIG, name)),
+            )
         values[name] = _coerce(name, raw)
     return QualityFilterConfig(**values).validate()

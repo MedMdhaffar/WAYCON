@@ -62,6 +62,10 @@ class PersonCreationState(TypedDict):
     profile: dict
     per_cluster_profiles: dict[int, dict]
     live_identity_decisions: NotRequired[list[dict]]
+    _canonical_live_state: NotRequired[bool]
+    _canonical_live_identities: NotRequired[list[dict]]
+    canonical_live_report_path: NotRequired[str]
+    live_finalization_timings: NotRequired[dict]
     media_lifecycle_version: NotRequired[int]
     media_cleanup_warning: NotRequired[str]
     _media_path_remap: NotRequired[dict[str, str]]

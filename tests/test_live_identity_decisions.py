@@ -53,7 +53,13 @@ def _face_paths(media_root: Path, count: int, *, prefix: str = "live") -> tuple[
     return tuple(paths)
 
 
-def _snapshot(version: int, paths: tuple[str, ...], *, chunk: int = 0):
+def _snapshot(
+    version: int,
+    paths: tuple[str, ...],
+    *,
+    chunk: int = 0,
+    latency_timing: dict | None = None,
+):
     embeddings = tuple(
         _record({
             "crop_path": path,
@@ -62,6 +68,14 @@ def _snapshot(version: int, paths: tuple[str, ...], *, chunk: int = 0):
             "video": "camera-source",
             "bbox": [0, 0, 80, 80],
             "sharpness": 100.0 + index,
+            "face_quality": {
+                "quality_class": "high",
+                "accepted_for_embedding": True,
+                "immediate_confirmation_eligible": True,
+            },
+            **({
+                "_latency_timing": dict(latency_timing),
+            } if latency_timing is not None else {}),
         })
         for index, path in enumerate(paths)
     )
@@ -114,7 +128,7 @@ def _session(database: Path, provider, **kwargs) -> LiveRollingAnalysisSession:
         snapshot_provider=provider,
         join_timeout_seconds=5.0,
         database_path=database,
-        cluster=_cluster_all,
+        cluster=kwargs.pop("cluster", _cluster_all),
         associate=_association,
         job_id=kwargs.pop("job_id", "job-live-1"),
         identity_decisions=True,
@@ -268,7 +282,19 @@ def test_first_valid_embedded_face_publishes_provisional_comparison(
         _face_paths(media_root, 3, prefix="first-face-seed"),
     )
     paths = _face_paths(media_root, 1, prefix="first-face")
-    state = {"snapshot": _snapshot(1, paths)}
+    state = {
+        "snapshot": _snapshot(
+            1,
+            paths,
+            latency_timing={
+                "source_frame_timestamp": "2026-07-23T10:00:00+00:00",
+                "capture_monotonic": time.monotonic() - 0.05,
+                "face_detected_monotonic": time.monotonic() - 0.04,
+                "quality_accepted_monotonic": time.monotonic() - 0.03,
+                "embedding_completed_monotonic": time.monotonic() - 0.02,
+            },
+        ),
+    }
     session = LiveRollingAnalysisSession(
         snapshot_provider=lambda: state["snapshot"],
         join_timeout_seconds=5.0,
@@ -278,11 +304,12 @@ def test_first_valid_embedded_face_publishes_provisional_comparison(
         identity_decisions=True,
     )
 
-    snapshot = _run(session, state, [(1, _snapshot(1, paths))])
+    snapshot = _run(session, state, [(1, state["snapshot"])])
     identity = _identity(snapshot)
 
-    assert identity["decision"] == "review_required"
-    assert identity["reason"] == "low_confidence_cluster"
+    assert identity["decision"] == "attach_existing"
+    assert identity["reason"] == "strong_clear_match"
+    assert identity["clustering_state"] == "unresolved"
     assert identity["state"] == "provisional"
     assert identity["provisional"] is True
     assert identity["persisted"] is False
@@ -293,8 +320,368 @@ def test_first_valid_embedded_face_publishes_provisional_comparison(
     assert identity["evidence_version"] == 1
     assert identity["evidence_signature"]
     assert identity["canonical_person_id"] is None
+    assert identity["comparison_timestamp"]
+    assert identity["latency_metrics"]["capture_to_face_ms"] >= 0
+    assert identity["latency_metrics"]["capture_to_embedding_ms"] >= 0
+    assert identity["latency_metrics"]["embedding_to_comparison_ms"] >= 0
+    assert identity["latency_metrics"]["comparison_to_status_ms"] >= 0
+    assert identity["latency_metrics"]["capture_to_status_ms"] >= 0
     assert _person_count(database) == 1
     assert len(session.identity_decisions()) == 0
+
+
+def test_dbscan_noise_face_publishes_once_and_reconciles_to_same_card(
+    media_root,
+    database,
+):
+    first_paths = _face_paths(media_root, 1, prefix="noise-first")
+    resolved_paths = first_paths + _face_paths(
+        media_root,
+        2,
+        prefix="noise-resolved",
+    )
+
+    def unresolved_then_resolved(state):
+        records = list(state["all_face_embeddings"])
+        if len(records) == 1:
+            return {
+                "identity_clusters": [],
+                "unresolved_faces": records,
+            }
+        return _cluster_all(state)
+
+    class ChangingRankingMemory(_RankingMemory):
+        def rank_identity_candidates(self, _embedding):
+            self.rank_calls += 1
+            if self.rank_calls == 1:
+                return [IdentityCandidate("person_900", 0.9)]
+            return []
+
+    ranked = ChangingRankingMemory([])
+    state = {"snapshot": _snapshot(1, first_paths)}
+    session = _session(
+        database,
+        lambda: state["snapshot"],
+        cluster=unresolved_then_resolved,
+        decision_memory_factory=lambda _path: ranked,
+    )
+    session.start()
+    try:
+        session.request_version(1)
+        first_snapshot = _wait_for(session, 1)
+        first = _identity(first_snapshot)
+        first_id = first["live_identity_id"]
+
+        assert len(first_snapshot["live_identities"]) == 1
+        assert first["clustering_state"] == "unresolved"
+        assert first["observation_count"] == 1
+        assert first["provisional"] is True
+        assert first["persisted"] is False
+        assert first["best_face_path"] == first_paths[0]
+        assert first["comparison_timestamp"]
+        assert first["evidence_version"] == 1
+        assert ranked.rank_calls == 1
+        assert _person_count(database) == 0
+
+        state["snapshot"] = _snapshot(2, first_paths)
+        session.request_version(2)
+        duplicate_snapshot = _wait_for(session, 2)
+        assert len(duplicate_snapshot["live_identities"]) == 1
+        assert duplicate_snapshot["live_identities"][0]["live_identity_id"] == first_id
+        assert ranked.rank_calls == 1
+
+        state["snapshot"] = _snapshot(3, resolved_paths)
+        session.request_version(3)
+        resolved_snapshot = _wait_for(session, 3)
+        resolved = _identity(resolved_snapshot)
+
+        assert len(resolved_snapshot["live_identities"]) == 1
+        assert resolved["live_identity_id"] == first_id
+        assert resolved["clustering_state"] == "resolved"
+        assert resolved["observation_count"] == 3
+        assert resolved["evidence_version"] == 2
+        assert resolved["provisional"] is True
+        assert resolved["persisted"] is False
+        assert ranked.rank_calls == 2
+        assert _person_count(database) == 0
+    finally:
+        session.finish(3)
+
+    assert not session.worker_alive
+
+
+def test_two_independent_weak_noise_embeddings_create_no_cards(
+    media_root,
+    database,
+):
+    paths = _face_paths(media_root, 2, prefix="separate-noise")
+    embeddings = tuple(
+        _record({
+            "crop_path": path,
+            "embedding": vector,
+            "frame_idx": index,
+            "video": "camera-source",
+            "bbox": [0, 0, 80, 80],
+            "sharpness": 100.0,
+        })
+        for index, (path, vector) in enumerate(zip(
+            paths,
+            ([1.0, 0.0], [0.0, 1.0]),
+        ))
+    )
+    faces = tuple(
+        _record({
+            "path": path,
+            "frame_idx": index,
+            "video": "camera-source",
+            "bbox": [0, 0, 80, 80],
+            "sharpness": 100.0,
+        })
+        for index, path in enumerate(paths)
+    )
+    actual_noise_snapshot = FrozenAnalysisSnapshot(
+        version=1,
+        last_completed_preprocessing_chunk=0,
+        person_name="Live Subject",
+        video_paths=("camera-source",),
+        identity_clustering_config=_record({"eps": 0.4, "min_samples": 3}),
+        quality_body_crops=(),
+        quality_face_crops=faces,
+        face_embeddings=embeddings,
+        face_chunk_membership=tuple((path, 0) for path in paths),
+    )
+    ranked = _RankingMemory([])
+    state = {"snapshot": actual_noise_snapshot}
+    session = LiveRollingAnalysisSession(
+        snapshot_provider=lambda: state["snapshot"],
+        join_timeout_seconds=5.0,
+        database_path=database,
+        associate=_association,
+        job_id="job-actual-dbscan-noise",
+        identity_decisions=True,
+        decision_memory_factory=lambda _path: ranked,
+    )
+
+    snapshot = _run(session, state, [(1, state["snapshot"])])
+
+    assert snapshot["live_identities"] == []
+    assert snapshot["unresolved_embedding_count"] == 2
+    assert snapshot["resolved_cluster_count"] == 0
+    assert ranked.rank_calls == 2
+    assert _person_count(database) == 0
+
+
+def test_noise_memberships_merge_without_duplicate_live_card(media_root, database):
+    initial_paths = _face_paths(media_root, 2, prefix="merge-noise")
+    resolved_paths = initial_paths + _face_paths(
+        media_root,
+        1,
+        prefix="merge-resolved",
+    )
+
+    def noise_then_cluster(state):
+        records = list(state["all_face_embeddings"])
+        if len(records) == 2:
+            return {
+                "identity_clusters": [],
+                "unresolved_faces": records,
+            }
+        return _cluster_all(state)
+
+    state = {"snapshot": _snapshot(1, initial_paths)}
+    session = LiveRollingAnalysisSession(
+        snapshot_provider=lambda: state["snapshot"],
+        join_timeout_seconds=5.0,
+        database_path=database,
+        cluster=noise_then_cluster,
+        associate=_association,
+        job_id="job-noise-merge",
+        identity_decisions=False,
+    )
+    session.start()
+    try:
+        session.request_version(1)
+        unresolved = _wait_for(session, 1)
+        assert unresolved["live_identities"] == []
+
+        state["snapshot"] = _snapshot(2, resolved_paths)
+        session.request_version(2)
+        resolved = _wait_for(session, 2)
+
+        assert len(resolved["live_identities"]) == 1
+        assert resolved["live_identities"][0]["live_identity_id"] == "live_0001"
+        assert resolved["live_identities"][0]["clustering_state"] == "resolved"
+        assert resolved["retired_live_identity_ids"] == ["live_0002"]
+        assert any(
+            event["type"] == "identity_merged"
+            and event["retained_live_id"] == "live_0001"
+            and event["absorbed_live_ids"] == ["live_0002"]
+            for event in resolved["live_recognition_events"]
+        )
+    finally:
+        session.finish(2)
+
+
+def test_retired_identity_reappears_without_duplicate_card_or_persistence(
+    media_root,
+    database,
+):
+    stable_paths = _face_paths(media_root, 6, prefix="reappearing")
+    extra_paths = _face_paths(media_root, 2, prefix="temporary")
+    state = {"snapshot": _snapshot(1, stable_paths)}
+
+    def temporarily_missing_cluster(node_state):
+        records = list(node_state["all_face_embeddings"])
+        if len(records) == 7:
+            return {"identity_clusters": [], "unresolved_faces": []}
+        stable_records = records[:6]
+        return {
+            "identity_clusters": [{
+                "cluster_id": 0,
+                "face_records": stable_records,
+                "representative_embedding": [1.0, 0.0],
+                "face_count": len(stable_records),
+                "confidence": 1.0,
+                "low_confidence": False,
+            }],
+            "unresolved_faces": [],
+        }
+
+    session = _session(
+        database,
+        lambda: state["snapshot"],
+        cluster=temporarily_missing_cluster,
+        job_id="job-retired-recovery",
+    )
+    session.start()
+    try:
+        session.request_version(1)
+        initial = _wait_for(session, 1)
+        assert [
+            item["live_identity_id"] for item in initial["live_identities"]
+        ] == ["live_0001"]
+        persisted_before = {
+            table: _count(database, table)
+            for table in (
+                "persons",
+                "person_gallery",
+                "appearances",
+                "recognition_log",
+                "identity_evidence",
+            )
+        }
+
+        state["snapshot"] = _snapshot(
+            2,
+            stable_paths + extra_paths[:1],
+        )
+        session.request_version(2)
+        missing = _wait_for(session, 2)
+        assert missing["live_identities"] == []
+        assert missing["retired_live_identity_ids"] == ["live_0001"]
+
+        state["snapshot"] = _snapshot(
+            3,
+            stable_paths + extra_paths,
+        )
+        session.request_version(3)
+        reappeared = _wait_for(session, 3)
+
+        assert [
+            item["live_identity_id"] for item in reappeared["live_identities"]
+        ] == ["live_0001"]
+        assert reappeared["retired_live_identity_ids"] == []
+        assert len(session.identity_decisions()) == 1
+        assert {
+            table: _count(database, table)
+            for table in persisted_before
+        } == persisted_before
+    finally:
+        session.finish(3)
+
+
+class _CountingMemory:
+    """Record every Global Memory call the rolling analysis worker makes."""
+
+    def __init__(self, delegate):
+        self._delegate = delegate
+        self.calls: list[str] = []
+
+    def __getattr__(self, name):
+        attribute = getattr(self._delegate, name)
+        if not callable(attribute):
+            return attribute
+
+        def recorded(*args, **kwargs):
+            self.calls.append(name)
+            return attribute(*args, **kwargs)
+
+        return recorded
+
+
+def test_analysis_pass_issues_no_representative_diagnostic_memory_queries(
+    media_root,
+    database,
+):
+    """The medoid/mean comparison must not run inside the live analysis pass.
+
+    It previously cost one ``get_person`` per enrolled person per identity on
+    every rolling pass, so the read-only handle must now stay untouched.
+    """
+    for index in range(3):
+        _seed_person(
+            database,
+            [1.0, float(index) / 10.0],
+            _face_paths(media_root, 4, prefix=f"enrolled-{index}"),
+        )
+
+    paths = _face_paths(media_root, 4, prefix="diagnostic-free")
+    state = {"snapshot": _snapshot(1, paths)}
+    counters: list[_CountingMemory] = []
+
+    def memory_factory(path):
+        counter = _CountingMemory(GlobalMemory(str(path), read_only=True))
+        counters.append(counter)
+        return counter
+
+    session = _session(
+        database,
+        lambda: state["snapshot"],
+        memory_factory=memory_factory,
+    )
+    session.start()
+    try:
+        session.request_version(1)
+        snapshot = _wait_for(session, 1)
+    finally:
+        session.finish(1)
+
+    assert snapshot["live_identities"], "the pass must still produce an identity"
+    assert counters, "the read-only Global Memory handle should still be opened"
+    # ``close`` is worker shutdown, not a query.
+    queries = [name for name in counters[0].calls if name != "close"]
+    assert queries == [], (
+        f"live analysis issued unexpected Global Memory queries: {queries}"
+    )
+    assert "list_all" not in counters[0].calls
+    assert "get_person" not in counters[0].calls
+
+    for identity in snapshot["live_identities"]:
+        assert "representative_similarity_diagnostic" not in identity
+        assert "comparisons" not in identity
+        assert "medoid_similarity" not in identity
+        assert "normalized_mean_similarity" not in identity
+
+
+def test_representative_comparison_is_absent_from_live_analysis_module():
+    """The comparison must live only in the offline tool."""
+    from forensics.person_creation import live_analysis
+
+    assert not hasattr(live_analysis, "representative_similarity_diagnostic")
+    source = Path(live_analysis.__file__).read_text(encoding="utf-8")
+    assert "compare_cluster_representatives" not in source.replace(
+        "tools/compare_cluster_representatives.py", ""
+    )
 
 
 def test_one_face_publishes_second_candidate_and_margin(media_root, database):

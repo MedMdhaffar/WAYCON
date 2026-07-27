@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import threading
+import time
 from collections import deque
 from copy import deepcopy
 from dataclasses import dataclass
@@ -25,7 +26,9 @@ _CAMERA_URL = re.compile(r"rtsps?://\S+", re.IGNORECASE)
 _ABSOLUTE_PATH = re.compile(r"(?:[A-Za-z]:[\\/]|/(?:[^\s/]+/)+)[^\s]*")
 _VLM_FIELDS = {
     "vlm_status": "not_started",
+    "vlm_state": "not_started",
     "clothing_description": "",
+    "clothing": {},
     "clothing_diagnostics": [],
     "vlm_error": None,
     "vlm_version": None,
@@ -112,6 +115,10 @@ class LiveIdentityVLMCoordinator:
         describe: Callable[[LiveVLMJob], dict] | None = None,
         persist: Callable[[LiveVLMJob, Mapping[str, Any]], None] | None = None,
         notify: Callable[[dict], None] | None = None,
+        core_work_pending: Callable[[], bool] | None = None,
+        core_queue_depth: Callable[[], int] | None = None,
+        maximum_core_deferral_seconds: float = 7.5,
+        safe_core_queue_depth: int = 1,
     ) -> None:
         self.job_id = str(job_id or "live-job")
         self.queue_capacity = max(1, int(queue_capacity))
@@ -119,6 +126,13 @@ class LiveIdentityVLMCoordinator:
         self._describe = describe or _default_describe
         self._persist = persist or _default_persist
         self._notify = notify
+        self._core_work_pending = core_work_pending
+        self._core_queue_depth = core_queue_depth
+        self._maximum_core_deferral_seconds = max(
+            0.1,
+            float(maximum_core_deferral_seconds),
+        )
+        self._safe_core_queue_depth = max(0, int(safe_core_queue_depth))
 
         self._condition = threading.Condition(threading.Lock())
         self._queue: deque[LiveVLMJob] = deque()
@@ -132,6 +146,18 @@ class LiveIdentityVLMCoordinator:
         self._failed = 0
         self._dropped = 0
         self._timed_out = 0
+        self._queue_peak = 0
+        self._deferred_for_core_work = 0
+        self._deferral_started: dict[tuple[str, int, str], float] = {}
+        self._maximum_deferral_ms = 0.0
+        self._observations_received = 0
+        self._jobs_eligible = 0
+        self._jobs_submitted = 0
+        self._jobs_replaced = 0
+        self._jobs_started = 0
+        self._results_merged = 0
+        self._results_published = 0
+        self._last_error: str | None = None
         self._persisted_versions: set[tuple[str, str, int]] = set()
         self._thread = threading.Thread(
             target=self._worker_loop,
@@ -149,6 +175,7 @@ class LiveIdentityVLMCoordinator:
         }
         submissions: list[LiveVLMJob] = []
         with self._condition:
+            self._observations_received += 1
             self._latest_snapshot = deepcopy(dict(snapshot))
             identities = list(self._latest_snapshot.get("live_identities") or [])
             next_current: dict[str, tuple[int, str | None, str | None]] = {}
@@ -184,10 +211,15 @@ class LiveIdentityVLMCoordinator:
                 raw_identity["best_face_path"] = face_path
                 raw_identity["best_body_path"] = body_path
                 raw_identity.update(deepcopy(state))
-                if (
+                eligible = (
                     self._accepting
                     and canonical_person_id is not None
                     and body_path is not None
+                )
+                if eligible:
+                    self._jobs_eligible += 1
+                if (
+                    eligible
                     and self._should_submit_locked(live_id, version, body_path)
                 ):
                     submissions.append(LiveVLMJob(
@@ -242,6 +274,7 @@ class LiveIdentityVLMCoordinator:
                             error="timeout",
                         )
                         self._timed_out += 1
+                        self._last_error = "timeout"
                         publish = True
                 self._condition.notify_all()
             decorated = self._decorated_locked()
@@ -361,18 +394,32 @@ class LiveIdentityVLMCoordinator:
             None,
         )
         if replacement_index is not None:
+            replaced = self._queue[replacement_index]
+            self._deferral_started.pop((
+                replaced.live_identity_id,
+                replaced.live_identity_version,
+                replaced.body_crop_path,
+            ), None)
             self._queue[replacement_index] = job
             self._dropped += 1
+            self._jobs_replaced += 1
         else:
             if len(self._queue) >= self.queue_capacity:
                 dropped = self._queue.popleft()
                 self._mark_dropped_locked(dropped)
             self._queue.append(job)
+        self._jobs_submitted += 1
+        self._queue_peak = max(self._queue_peak, len(self._queue))
         self._set_state_locked(job, status="queued")
         self._condition.notify()
 
     def _mark_dropped_locked(self, job: LiveVLMJob) -> None:
         self._dropped += 1
+        self._deferral_started.pop((
+            job.live_identity_id,
+            job.live_identity_version,
+            job.body_crop_path,
+        ), None)
         if self._job_is_current_locked(job):
             self._set_state_locked(job, status="not_started")
 
@@ -383,6 +430,11 @@ class LiveIdentityVLMCoordinator:
                 retained.append(job)
             else:
                 self._dropped += 1
+                self._deferral_started.pop((
+                    job.live_identity_id,
+                    job.live_identity_version,
+                    job.body_crop_path,
+                ), None)
         self._queue = retained
 
     def _worker_loop(self) -> None:
@@ -392,8 +444,40 @@ class LiveIdentityVLMCoordinator:
                     self._condition.wait()
                 if self._stopped or (not self._accepting and not self._queue):
                     return
+                pending = self._queue[0]
+                pending_key = (
+                    pending.live_identity_id,
+                    pending.live_identity_version,
+                    pending.body_crop_path,
+                )
+                if (
+                    self._accepting
+                    and self._core_work_pending is not None
+                    and self._core_is_busy()
+                ):
+                    now = time.monotonic()
+                    started = self._deferral_started.setdefault(pending_key, now)
+                    elapsed = max(0.0, now - started)
+                    self._maximum_deferral_ms = max(
+                        self._maximum_deferral_ms,
+                        elapsed * 1000.0,
+                    )
+                    if (
+                        elapsed < self._maximum_core_deferral_seconds
+                        or (
+                            self._current_core_queue_depth()
+                            > self._safe_core_queue_depth
+                            and elapsed
+                            < self._maximum_core_deferral_seconds * 1.25
+                        )
+                    ):
+                        self._deferred_for_core_work += 1
+                        self._condition.wait(timeout=0.05)
+                        continue
                 job = self._queue.popleft()
+                self._deferral_started.pop(pending_key, None)
                 self._active = job
+                self._jobs_started += 1
                 if self._job_is_current_locked(job):
                     self._set_state_locked(job, status="processing")
                     should_publish = True
@@ -413,6 +497,8 @@ class LiveIdentityVLMCoordinator:
                 clothing, diagnostics, failure = self._parse_result(job, result)
             except Exception:
                 clothing, diagnostics, failure = None, [], "inference_error"
+                with self._condition:
+                    self._last_error = "inference_error"
 
             with self._condition:
                 stale = self._stopped or not self._job_is_current_locked(job)
@@ -444,9 +530,12 @@ class LiveIdentityVLMCoordinator:
                             job,
                             status="completed",
                             description=clothing.get("full"),
+                            clothing=clothing,
                             diagnostics=diagnostics,
                         )
                         self._completed += 1
+                        self._results_merged += 1
+                        self._last_error = None
                     else:
                         status = "timed_out" if failure == "timeout" else "failed"
                         self._set_state_locked(
@@ -459,10 +548,32 @@ class LiveIdentityVLMCoordinator:
                             self._timed_out += 1
                         else:
                             self._failed += 1
+                        self._last_error = failure or "inference_error"
                     publish = True
                 self._condition.notify_all()
             if publish:
-                self._publish()
+                published = self._publish()
+                if published and clothing is not None:
+                    with self._condition:
+                        self._results_published += 1
+
+    def _core_is_busy(self) -> bool:
+        try:
+            return bool(
+                self._core_work_pending is not None
+                and self._core_work_pending()
+            )
+        except Exception:
+            return False
+
+    def _current_core_queue_depth(self) -> int:
+        try:
+            return max(
+                0,
+                int(self._core_queue_depth() if self._core_queue_depth else 0),
+            )
+        except Exception:
+            return 0
 
     def _parse_result(
         self,
@@ -508,12 +619,19 @@ class LiveIdentityVLMCoordinator:
         *,
         status: str,
         description: Any = "",
+        clothing: Mapping[str, Any] | None = None,
         diagnostics: list[dict] | None = None,
         error: Any = None,
     ) -> None:
+        public_state = {
+            "queued": "pending",
+            "processing": "running",
+        }.get(status, status)
         self._states[job.live_identity_id] = {
             "vlm_status": status,
+            "vlm_state": public_state,
             "clothing_description": _safe_text(description),
+            "clothing": deepcopy(dict(clothing or {})),
             "clothing_diagnostics": deepcopy(diagnostics or []),
             "vlm_error": _safe_error(error) if error else None,
             "vlm_version": job.live_identity_version,
@@ -523,6 +641,7 @@ class LiveIdentityVLMCoordinator:
     def _decorated_locked(self) -> dict:
         snapshot = deepcopy(self._latest_snapshot)
         identities = list(snapshot.get("live_identities") or [])
+        per_cluster_clothing: dict[Any, dict] = {}
         for identity in identities:
             if not isinstance(identity, dict):
                 continue
@@ -530,9 +649,26 @@ class LiveIdentityVLMCoordinator:
             state = self._states.get(live_id)
             if state is not None:
                 identity.update(deepcopy(state))
+                clothing = state.get("clothing")
+                if (
+                    state.get("vlm_status") == "completed"
+                    and isinstance(clothing, dict)
+                    and clothing
+                ):
+                    cluster_label = identity.get("cluster_label")
+                    per_cluster_clothing[cluster_label] = {
+                        **deepcopy(clothing),
+                        "status": "ok",
+                        "selected_body_crop": state.get("selected_body_crop"),
+                        "live_identity_id": live_id,
+                    }
         snapshot.update({
+            "per_cluster_clothing": per_cluster_clothing,
             "vlm_queue_depth": len(self._queue),
             "vlm_queue_capacity": self.queue_capacity,
+            "vlm_queue_peak": self._queue_peak,
+            "vlm_jobs_deferred_for_core_work": self._deferred_for_core_work,
+            "vlm_active_jobs": 1 if self._active is not None else 0,
             "vlm_active_identity": (
                 self._active.live_identity_id if self._active is not None else None
             ),
@@ -540,14 +676,29 @@ class LiveIdentityVLMCoordinator:
             "vlm_failed": self._failed,
             "vlm_dropped": self._dropped,
             "vlm_timed_out": self._timed_out,
+            "vlm_observations_received": self._observations_received,
+            "vlm_jobs_eligible": self._jobs_eligible,
+            "vlm_jobs_submitted": self._jobs_submitted,
+            "vlm_jobs_replaced": self._jobs_replaced,
+            "vlm_max_deferral_ms": round(self._maximum_deferral_ms, 3),
+            "vlm_jobs_started": self._jobs_started,
+            "vlm_jobs_completed": self._completed,
+            "vlm_jobs_failed": self._failed,
+            "vlm_jobs_timed_out": self._timed_out,
+            "vlm_results_merged": self._results_merged,
+            "vlm_results_published": self._results_published,
+            "vlm_last_error": self._last_error,
         })
         return snapshot
 
-    def _publish(self) -> None:
+    def _publish(self) -> bool:
         if self._notify is None:
-            return
+            return False
         snapshot = self.public_snapshot()
         try:
             self._notify(snapshot)
         except Exception:
-            pass
+            with self._condition:
+                self._last_error = "inference_error"
+            return False
+        return True

@@ -218,3 +218,41 @@ def test_status_sanitizes_selected_body_crop_diagnostics(client, isolated_servic
     # No Windows/POSIX absolute path root (drive letter or leading marker).
     assert re.search(r"[A-Za-z]:[\\/]", serialized) is None
     assert str(isolated_service) not in serialized
+
+
+def test_status_allows_safe_provisional_staging_face(client, isolated_service):
+    face = (
+        isolated_service
+        / "session"
+        / "_staging"
+        / "face_crops"
+        / "first-face.jpg"
+    )
+    face.parent.mkdir(parents=True)
+    face.write_bytes(b"face")
+    with service._jobs_lock:
+        service._jobs["job-provisional-face"] = service.JobState(
+            "job-provisional-face",
+            input_type="camera_uri",
+            output_dir=str(isolated_service / "session"),
+            snapshot={
+                "rolling_analysis": {
+                    "enabled": True,
+                    "live_identities": [{
+                        "live_identity_id": "live_0001",
+                        "canonical_person_id": None,
+                        "provisional": True,
+                        "clustering_state": "unresolved",
+                        "best_face_path": str(face),
+                    }],
+                },
+            },
+        )
+
+    payload = client.get("/api/person/status/job-provisional-face").get_json()
+    identity = payload["snapshot"]["rolling_analysis"]["live_identities"][0]
+
+    assert identity["best_face_path"] == (
+        "session/_staging/face_crops/first-face.jpg"
+    )
+    assert str(isolated_service) not in json.dumps(payload)

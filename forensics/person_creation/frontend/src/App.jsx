@@ -17,6 +17,7 @@ import {
   isStopPending,
   createStatusRequestGuard,
   mergeJobStatus,
+  markStatusResponseReceived,
   normalizeSnapshot,
   postStopRequest,
   runSingleFlight,
@@ -56,6 +57,7 @@ export default function App() {
         throw new Error(data.error || `Status request failed (HTTP ${res.status})`)
       }
       if (!guard.isCurrent(request)) return null
+      markStatusResponseReceived(data)
       setJobStatus(current => mergeJobStatus(current, data))
       setPollingError('')
       return data

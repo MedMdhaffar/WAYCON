@@ -109,6 +109,18 @@ def test_missing_and_unreadable_files_have_explicit_reasons(tmp_path):
     assert unreadable_reason == "unreadable"
 
 
+def test_invalid_bbox_is_not_mislabeled_too_small(tmp_path):
+    path = tmp_path / "face.jpg"
+    assert cv2.imwrite(str(path), np.full((81, 51, 3), 127, dtype=np.uint8))
+
+    reason, diagnostic = quality._face_diagnostic(
+        _face(path, bbox=[20, 20, 10, 30])
+    )
+
+    assert reason == "invalid_bbox"
+    assert (diagnostic["width"], diagnostic["height"]) == (51, 81)
+
+
 def test_rejection_counts_sum_and_only_five_samples_are_logged(tmp_path, capsys):
     records = [_face(tmp_path / f"missing-{index}.jpg") for index in range(6)]
 
