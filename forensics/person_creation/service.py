@@ -28,6 +28,7 @@ from forensics.media_paths import (
 from forensics.person_identifier.config import Config as _PIConfig
 from forensics.person_creation.path_utils import to_wsl_path as _to_wsl_path
 from forensics.person_creation.live_stream import mask_camera_uri
+from forensics.person_creation.profile_management import bp as profile_management_bp
 from forensics.person_creation.tools.cleanup_orphan_crops import (
     cleanup as _cleanup_orphan_crops,
     CleanupError as _CleanupError,
@@ -175,6 +176,8 @@ _ALLOWED_PROFILE_IMAGE_EXTENSIONS = {"jpg", "jpeg", "png"}
 
 app = Flask(__name__)
 CORS(app)
+
+app.register_blueprint(profile_management_bp)
 
 
 def initialize_global_memory() -> None:

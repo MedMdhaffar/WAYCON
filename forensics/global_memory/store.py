@@ -338,6 +338,8 @@ class GlobalMemory:
                 "cameras": self._json_list(row["cameras"]),
                 "profile_image": self._public_media_path(row["profile_image"]),
                 "profile_image_source": row["profile_image_source"],
+                "notes": row["notes"],
+                "identity_source": row["identity_source"],
                 "is_active": bool(row["is_active"]),
                 "merged_into_person_id": row["merged_into_person_id"],
                 "image_candidates": self._image_candidates(row["person_id"]),
@@ -351,7 +353,7 @@ class GlobalMemory:
                 f"""
                 SELECT person_id, name, enrolled_at, updated_at, cameras,
                        profile_image, profile_image_source,
-                       is_active, merged_into_person_id
+                       notes, identity_source, is_active, merged_into_person_id
                   FROM persons
                  {where}
                  ORDER BY person_id
@@ -366,6 +368,8 @@ class GlobalMemory:
                     "cameras": self._json_list(row["cameras"]),
                     "profile_image": self._public_media_path(row["profile_image"]),
                     "profile_image_source": row["profile_image_source"],
+                    "notes": row["notes"],
+                    "identity_source": row["identity_source"],
                     "is_active": bool(row["is_active"]),
                     "merged_into_person_id": row["merged_into_person_id"],
                     "image_candidates": self._image_candidates(row["person_id"]),
@@ -1235,6 +1239,54 @@ class GlobalMemory:
 
         return result
 
+    def merge_persons_atomic(
+        self,
+        source_person_id: str,
+        target_person_id: str,
+        *,
+        reason: str,
+        decision_source: str | None = None,
+        participant: Callable[[sqlite3.Connection, PersonMergeResult], None] | None = None,
+    ) -> PersonMergeResult:
+        """Merge two identities and let a caller extend the SAME transaction.
+
+        ``participant`` runs after the merge primitive and before COMMIT on the
+        one connection that owns the transaction.  Any exception it raises rolls
+        the whole merge back, so a caller that has to move its own evidence can
+        never leave a half-merged identity behind.
+        """
+        self._require_writable("merge_persons_atomic")
+        source_id = self._validated_merge_text(source_person_id, "source_person_id")
+        target_id = self._validated_merge_text(target_person_id, "target_person_id")
+        merge_reason = self._validated_merge_text(reason, "reason")
+        if source_id == target_id:
+            raise SelfMergeError("source_person_id and target_person_id must differ")
+        audit_source = (
+            "phase_3f_logical_merge"
+            if decision_source is None
+            else self._validated_merge_text(decision_source, "decision_source")
+        )
+
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                result = self._merge_persons_in_transaction(
+                    source_id,
+                    target_id,
+                    reason=merge_reason,
+                    decision_source=audit_source,
+                )
+                if participant is not None:
+                    participant(self._conn, result)
+                self._before_merge_commit()
+                self._conn.execute("COMMIT")
+            except BaseException:
+                if self._conn.in_transaction:
+                    self._conn.execute("ROLLBACK")
+                raise
+
+        return result
+
     def _merge_persons_in_transaction(
         self,
         source_id: str,
@@ -1583,11 +1635,89 @@ class GlobalMemory:
             self._conn.execute(
                 "ALTER TABLE persons ADD COLUMN merged_into_person_id TEXT DEFAULT NULL"
             )
+        if "notes" not in person_columns:
+            self._conn.execute(
+                "ALTER TABLE persons ADD COLUMN notes TEXT NOT NULL DEFAULT ''"
+            )
+        if "identity_source" not in person_columns:
+            self._conn.execute(
+                "ALTER TABLE persons ADD COLUMN identity_source TEXT NOT NULL DEFAULT 'video'"
+            )
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_persons_active ON persons(is_active)"
         )
         self._ensure_identity_evidence_schema()
         self._ensure_identity_merge_audit_schema()
+        self._ensure_profile_import_schema()
+
+    def _ensure_profile_import_schema(self) -> None:
+        """Add phone-import columns when opening a database created earlier."""
+        photo_columns = self._table_columns("face_photo_sources")
+        if photo_columns and "is_supervisor_selected" not in photo_columns:
+            self._conn.execute(
+                "ALTER TABLE face_photo_sources ADD COLUMN is_supervisor_selected "
+                "INTEGER NOT NULL DEFAULT 0 CHECK (is_supervisor_selected IN (0, 1))"
+            )
+        if photo_columns and "content_sha256" not in photo_columns:
+            self._conn.execute(
+                "ALTER TABLE face_photo_sources ADD COLUMN content_sha256 TEXT"
+            )
+        commit_columns = self._table_columns("profile_import_commits")
+        if commit_columns and "result_json" not in commit_columns:
+            self._conn.execute(
+                "ALTER TABLE profile_import_commits ADD COLUMN result_json "
+                "TEXT NOT NULL DEFAULT '{}'"
+            )
+        if commit_columns and "content_set_key" not in commit_columns:
+            self._conn.execute(
+                "ALTER TABLE profile_import_commits ADD COLUMN content_set_key TEXT"
+            )
+
+        review_columns = self._table_columns("profile_import_reviews")
+        review_additions = {
+            "content_set_key": "TEXT",
+            "embedding": "BLOB",
+            "resolution_action": "TEXT",
+            "resolution_target_person_id": "TEXT",
+            "resolution_result_json": "TEXT NOT NULL DEFAULT '{}'",
+        }
+        for column, declaration in review_additions.items():
+            if review_columns and column not in review_columns:
+                self._conn.execute(
+                    f"ALTER TABLE profile_import_reviews ADD COLUMN {column} {declaration}"
+                )
+
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS profile_import_content_sets (
+                content_set_key TEXT PRIMARY KEY,
+                semantic_action TEXT NOT NULL CHECK (
+                    semantic_action IN (
+                        'create_new', 'attach_existing', 'review_required', 'skip'
+                    )
+                ),
+                target_person_id TEXT,
+                approved_name_component TEXT NOT NULL DEFAULT '',
+                durable_result_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS profile_import_review_evidence (
+                review_key TEXT NOT NULL REFERENCES profile_import_reviews(review_key),
+                source_id TEXT NOT NULL,
+                embedding BLOB NOT NULL,
+                PRIMARY KEY (review_key, source_id)
+            )
+            """
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_profile_import_commits_content_set "
+            "ON profile_import_commits(content_set_key)"
+        )
 
     def _ensure_identity_evidence_schema(self) -> None:
         """Create the Phase 4 ledger when opening a pre-Phase 4 database."""

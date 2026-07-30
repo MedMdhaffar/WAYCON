@@ -31,7 +31,7 @@ import {
 const TABS = ['Setup', 'Progress & Crops', 'Results', 'Memory', 'Identity Reviews']
 
 export default function App() {
-  const [mode, setMode] = useState('enroll')   // 'enroll' | 'manage'
+  const [mode, setMode] = useState(() => window.location.pathname === '/manage' ? 'manage' : 'enroll')
   const [tab, setTab] = useState(0)
   const [jobId, setJobId] = useState(null)
   const [jobStatus, setJobStatus] = useState(null)
@@ -83,6 +83,14 @@ export default function App() {
       statusRequestGuardRef.current.cancel()
     }
   }, [jobId, fetchStatus])
+
+  useEffect(() => {
+    const handleNavigation = () => {
+      setMode(window.location.pathname === '/manage' ? 'manage' : 'enroll')
+    }
+    window.addEventListener('popstate', handleNavigation)
+    return () => window.removeEventListener('popstate', handleNavigation)
+  }, [])
 
   const handleStart = (id, sourceType) => {
     statusRequestGuardRef.current.cancel()
@@ -150,14 +158,20 @@ export default function App() {
         <div style={{ marginLeft: 'auto', display: 'flex', gap: 4 }}>
           <button
             className={`btn ${mode === 'enroll' ? 'btn-primary' : 'btn-ghost'}`}
-            onClick={() => setMode('enroll')}
+            onClick={() => {
+              window.history.pushState({}, '', '/')
+              setMode('enroll')
+            }}
             style={{ padding: '6px 14px', fontSize: 13 }}
           >
             Enroll
           </button>
           <button
             className={`btn ${mode === 'manage' ? 'btn-primary' : 'btn-ghost'}`}
-            onClick={() => setMode('manage')}
+            onClick={() => {
+              window.history.pushState({}, '', '/manage')
+              setMode('manage')
+            }}
             style={{ padding: '6px 14px', fontSize: 13 }}
           >
             Manage

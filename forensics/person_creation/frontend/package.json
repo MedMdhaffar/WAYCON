@@ -7,10 +7,12 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
+    "test": "npm run test:live && npm run test:live-identities && npm run test:identity-review && npm run test:media-lifecycle && npm run test:profiles",
     "test:live": "node scripts/validate-live-controls.mjs",
     "test:live-identities": "node scripts/validate-live-identity-cards.mjs",
     "test:identity-review": "node scripts/validate-identity-review-component.mjs",
-    "test:media-lifecycle": "node scripts/validate-media-lifecycle-component.mjs"
+    "test:media-lifecycle": "node scripts/validate-media-lifecycle-component.mjs",
+    "test:profiles": "node scripts/validate-profile-management.mjs"
   },
   "dependencies": {
     "react": "^18.3.1",

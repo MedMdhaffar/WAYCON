@@ -67,3 +67,10 @@ yarn-debug.log*
 yarn-error.log*
 runtime_logs/
 wsl
+forensics/person_db/
+**/__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+forensics/person_creation/frontend/node_modules/.vite/
+forensics/global_memory.db-x-*
