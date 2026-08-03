@@ -13,7 +13,7 @@ import threading
 
 import numpy as np
 
-from forensics.person_creation.models.device import resolve_device
+from forensics.person_creation.models.device import model_parameter_device, resolve_device
 
 _INPUT_HW = (256, 128)
 _IMAGENET_MEAN = (0.485, 0.456, 0.406)
@@ -31,6 +31,12 @@ class BodyReId:
 
     def is_available(self) -> bool:
         return self._model is not None
+
+    @property
+    def device(self) -> str:
+        if not self.is_available():
+            return "unavailable" if self._load_attempted else "not_loaded"
+        return model_parameter_device(self._model, fallback=self._device)
 
     def load(self, device: str = "auto") -> None:
         """Best-effort load. Safe to call even when torchreid isn't installed —
@@ -55,7 +61,7 @@ class BodyReId:
                     transforms.ToTensor(),
                     transforms.Normalize(mean=_IMAGENET_MEAN, std=_IMAGENET_STD),
                 ])
-                print(f"[BodyReId] OSNet-x0.25 loaded on {self._device}")
+                print(f"[BodyReId] OSNet-x0.25 loaded on {self.device}")
             except Exception as exc:  # pragma: no cover - optional dependency
                 self._model = None
                 self.unavailable_reason = str(exc)

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
-import json
+from copy import deepcopy
+from dataclasses import dataclass
 from datetime import datetime
+import json
 from pathlib import Path
+from typing import Any, Mapping
 
 from forensics.person_creation.nodes.auto_pair import (
     _MIN_MATCH_SCORE,
@@ -11,6 +14,16 @@ from forensics.person_creation.nodes.auto_pair import (
     _conf_sharp_score,
     _geometry_score,
 )
+
+
+@dataclass(frozen=True)
+class BodyAssignmentResult:
+    associations: list[dict]
+    cluster_assignments: dict[int, list[dict]]
+    unattached_bodies: list[dict]
+    frame_groups: list[dict]
+    rejected_pairs: list[dict]
+    feedback_data: dict
 
 
 def _build_cluster_lookup(identity_clusters: list[dict]) -> dict[str, int]:
@@ -127,19 +140,17 @@ def _dedupe_cluster_frame(assignments: list[dict]) -> tuple[list[dict], list[dic
     return list(winners.values()), rejected
 
 
-def assign_bodies_to_clusters(state: dict) -> dict:
-    """Pair each clustered face to a body crop in the same frame (Hungarian match).
+def compute_body_cluster_assignments(
+    state: Mapping[str, Any],
+) -> BodyAssignmentResult:
+    """Compute body-to-identity assignments without filesystem side effects.
 
     Input state:  `identity_clusters`, `quality_face_crops`, `quality_body_crops`.
-    Output state: `cluster_assignments` (per-cluster face/body pairs), flat
-                  `associations` (compatibility), `unattached_bodies`,
-                  `frame_groups`, `human_feedback_path`.
+    The selected inputs are copied so result objects never alias caller state.
     """
-    clusters = state.get("identity_clusters", [])
-    quality_face = state.get("quality_face_crops", [])
-    quality_body = state.get("quality_body_crops", [])
-    output_dir = Path(state["output_dir"])
-    feedback_path = output_dir / "pairing_feedback.json"
+    clusters = deepcopy(list(state.get("identity_clusters", [])))
+    quality_face = deepcopy(list(state.get("quality_face_crops", [])))
+    quality_body = deepcopy(list(state.get("quality_body_crops", [])))
 
     cluster_lookup = _build_cluster_lookup(clusters)
     frame_groups = _build_frame_groups(quality_face, quality_body, cluster_lookup)
@@ -168,31 +179,83 @@ def assign_bodies_to_clusters(state: dict) -> dict:
     attached_body_paths = {a["body_path"] for a in accepted_all}
     unattached_bodies = [b for b in quality_body if b.get("path") not in attached_body_paths]
 
-    output_dir.mkdir(parents=True, exist_ok=True)
     feedback_data = {
         "timestamp": datetime.now().isoformat(),
         "pairing_mode": "face_cluster_assignment_v1",
         "person_name": state.get("person_name", ""),
-        "video_sources": state.get("video_paths", []),
+        "video_sources": deepcopy(list(state.get("video_paths", []))),
         "identity_clusters_found": len(clusters),
         "total_frame_groups_shown": len(frame_groups),
         "candidate_pairs_count": len(accepted_all) + len(rejected_pairs),
         "confirmed_pairs_count": len(accepted_all),
         "rejected_pairs_count": len(rejected_pairs),
         "unattached_bodies_count": len(unattached_bodies),
-        "confirmed_pairs": accepted_all,
-        "rejected_pairs": rejected_pairs,
+        "confirmed_pairs": deepcopy(accepted_all),
+        "rejected_pairs": deepcopy(rejected_pairs),
     }
-    feedback_path.write_text(json.dumps(feedback_data, indent=2), encoding="utf-8")
+    return BodyAssignmentResult(
+        associations=accepted_all,
+        cluster_assignments=cluster_assignments,
+        unattached_bodies=unattached_bodies,
+        frame_groups=frame_groups,
+        rejected_pairs=rejected_pairs,
+        feedback_data=feedback_data,
+    )
+
+
+def _credential_safe_json(value: Any, camera_values: set[str]) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _credential_safe_json(item, camera_values)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_credential_safe_json(item, camera_values) for item in value]
+    if isinstance(value, tuple):
+        return [_credential_safe_json(item, camera_values) for item in value]
+    if isinstance(value, str) and (
+        value in camera_values
+        or value.lower().startswith(("rtsp://", "rtsps://"))
+    ):
+        return "<camera-source>"
+    return value
+
+
+def write_pairing_feedback(
+    result: BodyAssignmentResult,
+    output_path: Path,
+) -> Path:
+    """Write the existing pairing feedback schema without recomputing it."""
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    camera_values: set[str] = set()
+    for source in result.feedback_data.get("video_sources", []):
+        if isinstance(source, str) and source.lower().startswith(("rtsp://", "rtsps://")):
+            camera_values.update((source, Path(source).name))
+    payload = _credential_safe_json(deepcopy(result.feedback_data), camera_values)
+    output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return output_path.resolve()
+
+
+def assign_bodies_to_clusters(state: dict) -> dict:
+    """LangGraph wrapper preserving association state and feedback output."""
+    result = compute_body_cluster_assignments(state)
+    feedback_path = write_pairing_feedback(
+        result,
+        Path(state["output_dir"]) / "pairing_feedback.json",
+    )
 
     print(
-        f"[assign_bodies_to_clusters] clusters={len(clusters)} frame_groups={len(frame_groups)} "
-        f"assignments={len(accepted_all)} unattached_bodies={len(unattached_bodies)}"
+        f"[assign_bodies_to_clusters] "
+        f"clusters={result.feedback_data['identity_clusters_found']} "
+        f"frame_groups={len(result.frame_groups)} "
+        f"assignments={len(result.associations)} "
+        f"unattached_bodies={len(result.unattached_bodies)}"
     )
     return {
-        "associations": accepted_all,
-        "cluster_assignments": cluster_assignments,
-        "unattached_bodies": unattached_bodies,
-        "frame_groups": frame_groups,
-        "human_feedback_path": str(feedback_path.resolve()),
+        "associations": result.associations,
+        "cluster_assignments": result.cluster_assignments,
+        "unattached_bodies": result.unattached_bodies,
+        "frame_groups": result.frame_groups,
+        "human_feedback_path": str(feedback_path),
     }

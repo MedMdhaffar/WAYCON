@@ -47,7 +47,17 @@ def _profile_for_cluster(state: dict, cluster: dict) -> dict:
     per_cluster_clothing = state.get("per_cluster_clothing") or {}
     best_body_crops = per_cluster_best.get(cid, per_cluster_best.get(str(cid), []))
     clothing = per_cluster_clothing.get(cid, per_cluster_clothing.get(str(cid), {}))
-    clothing_structured = clothing.get("structured") or {"top": "unknown", "bottom": "unknown", "shoes": "unknown", "full": "unknown"}
+    clothing_structured = clothing.get("structured") or clothing
+    clothing_status = clothing_structured.get("status", "not_attempted")
+    appearance = {
+        "date": date.today().isoformat(),
+        "clothing_status": clothing_status,
+    }
+    if clothing_status == "ok":
+        appearance.update({
+            key: clothing_structured.get(key)
+            for key in ("top", "bottom", "shoes", "full")
+        })
     color_signals = color_signals_from_crops(best_body_crops)
 
     cluster_state = {
@@ -93,10 +103,7 @@ def _profile_for_cluster(state: dict, cluster: dict) -> dict:
         "face_crop_count": cluster.get("face_count", 0),
         "face_crops": [r["crop_path"] for r in cluster.get("face_records", []) if r.get("crop_path")],
         "face_crop_sharpness": face_crop_sharpness,
-        "appearance": {
-            "date": date.today().isoformat(),
-            **clothing_structured,
-        },
+        "appearance": appearance,
         "body_crops": [a["body_path"] for a in associations],
         "best_body_crops": best_body_crops,
         "body_crop_sharpness": body_crop_sharpness,

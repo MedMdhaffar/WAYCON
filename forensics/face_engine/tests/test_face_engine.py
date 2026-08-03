@@ -135,6 +135,50 @@ def test_recognize_wrong_dim(client):
     assert "expected 512" in res.get_json()["error"]
 
 
+def test_recognize_rejects_non_finite_embedding(client):
+    vector = [0.0] * 512
+    vector[0] = float("nan")
+
+    res = client.post("/recognize", json={"embedding": vector})
+
+    assert res.status_code == 422
+    assert "non-finite" in res.get_json()["error"]
+
+
+def test_embed_rejects_non_finite_model_output():
+    class NonFiniteEmbedder(FakeEmbedder):
+        def embed(self, image):
+            vector = np.zeros(512, dtype=np.float32)
+            vector[0] = np.nan
+            return vector
+
+    app = create_app(load_models=False)
+    app.config["FACE_DETECTOR"] = FakeDetector()
+    app.config["FACE_EMBEDDER"] = NonFiniteEmbedder()
+    app.config["TESTING"] = True
+
+    res = app.test_client().post(
+        "/embed",
+        data={"image": (io.BytesIO(_jpg_bytes()), "crop.jpg")},
+        content_type="multipart/form-data",
+    )
+
+    assert res.status_code == 500
+    assert "non-finite" in res.get_json()["error"]
+
+
+def test_client_rejects_non_finite_embedding(monkeypatch):
+    client = FaceEngineClient()
+    monkeypatch.setattr(
+        client,
+        "_request",
+        lambda *_args, **_kwargs: {"embedding": [float("nan")] * 512},
+    )
+
+    with pytest.raises(ValueError, match="non-finite"):
+        client.embed(np.zeros((32, 32, 3), dtype=np.uint8))
+
+
 def test_recognize_unknown(client, tmp_path, monkeypatch):
     from forensics.global_memory import config as gm_config
 

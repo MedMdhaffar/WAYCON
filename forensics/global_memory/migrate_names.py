@@ -42,71 +42,130 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_log_event ON recognition_log(event_type)")
 
 
+def _is_phase3d_schema(conn: sqlite3.Connection) -> bool:
+    tables = {
+        row[0]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    }
+    person_columns = (
+        {row[1] for row in conn.execute("PRAGMA table_info(persons)").fetchall()}
+        if "persons" in tables
+        else set()
+    )
+    return bool(
+        "is_active" in person_columns
+        or "identity_match_suggestions" in tables
+        or "identity_merge_audit" in tables
+    )
+
+
 def run() -> None:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    _ensure_schema(conn)
+    try:
+        if _is_phase3d_schema(conn):
+            raise RuntimeError(
+                "migrate_names refuses Phase 3D databases; no changes were made"
+            )
 
-    existing = conn.execute(
-        "SELECT person_id, name FROM persons ORDER BY rowid"
-    ).fetchall()
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("PRAGMA busy_timeout=5000")
+        journal_mode = conn.execute("PRAGMA journal_mode=WAL").fetchone()
+        if journal_mode is None or str(journal_mode[0]).lower() != "wal":
+            raise RuntimeError("legacy name migration requires WAL journal mode")
+
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("PRAGMA defer_foreign_keys=ON")
+        _ensure_schema(conn)
+        gallery_columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(person_gallery)").fetchall()
+        }
+        has_person_gallery = "person_id" in gallery_columns
+
+        existing = conn.execute(
+            "SELECT person_id, name FROM persons ORDER BY rowid"
+        ).fetchall()
+        migrated: list[tuple[str, str, str]] = []
+
+        if not existing:
+            conn.execute("UPDATE counters SET value=0 WHERE key='person_count'")
+        else:
+            # Temporary IDs avoid primary-key collisions during the rewrite.
+            temp_pairs = []
+            for i, row in enumerate(existing, start=1):
+                old_id = row["person_id"]
+                temp_id = f"__migration_tmp_{i:03d}"
+                temp_pairs.append((old_id, temp_id))
+                if old_id != temp_id:
+                    conn.execute(
+                        "UPDATE persons SET person_id=? WHERE person_id=?",
+                        (temp_id, old_id),
+                    )
+                    conn.execute(
+                        "UPDATE appearances SET person_id=? WHERE person_id=?",
+                        (temp_id, old_id),
+                    )
+                    conn.execute(
+                        "UPDATE recognition_log SET person_id=? WHERE person_id=?",
+                        (temp_id, old_id),
+                    )
+                    if has_person_gallery:
+                        conn.execute(
+                            "UPDATE person_gallery SET person_id=? WHERE person_id=?",
+                            (temp_id, old_id),
+                        )
+
+            for i, (old_id, temp_id) in enumerate(temp_pairs, start=1):
+                new_id = f"person_{i:03d}"
+                new_name = f"Person {i:03d}"
+                conn.execute(
+                    "UPDATE persons SET person_id=?, name=? WHERE person_id=?",
+                    (new_id, new_name, temp_id),
+                )
+                conn.execute(
+                    "UPDATE appearances SET person_id=? WHERE person_id=?",
+                    (new_id, temp_id),
+                )
+                conn.execute(
+                    "UPDATE recognition_log SET person_id=? WHERE person_id=?",
+                    (new_id, temp_id),
+                )
+                if has_person_gallery:
+                    conn.execute(
+                        "UPDATE person_gallery SET person_id=? WHERE person_id=?",
+                        (new_id, temp_id),
+                    )
+                migrated.append((old_id, new_id, new_name))
+
+            conn.execute(
+                "UPDATE counters SET value=? WHERE key='person_count'",
+                (len(existing),),
+            )
+
+        violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+        if violations:
+            raise sqlite3.IntegrityError(
+                "legacy name migration failed foreign-key validation"
+            )
+        conn.execute("COMMIT")
+    except BaseException:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
 
     if not existing:
-        conn.execute("UPDATE counters SET value=0 WHERE key='person_count'")
-        conn.commit()
-        conn.close()
         print("No persons found. Nothing to migrate.")
         print("recognition_log table created.")
         return
 
     print(f"Migrating {len(existing)} persons...")
-
-    # Use temporary IDs first so reruns or mixed old/new rows cannot collide
-    # with UNIQUE(person_id) while we rewrite primary keys.
-    temp_pairs = []
-    for i, row in enumerate(existing, start=1):
-        old_id = row["person_id"]
-        temp_id = f"__migration_tmp_{i:03d}"
-        temp_pairs.append((old_id, temp_id))
-        if old_id != temp_id:
-            conn.execute(
-                "UPDATE persons SET person_id=? WHERE person_id=?",
-                (temp_id, old_id),
-            )
-            conn.execute(
-                "UPDATE appearances SET person_id=? WHERE person_id=?",
-                (temp_id, old_id),
-            )
-            conn.execute(
-                "UPDATE recognition_log SET person_id=? WHERE person_id=?",
-                (temp_id, old_id),
-            )
-
-    for i, (old_id, temp_id) in enumerate(temp_pairs, start=1):
-        new_id = f"person_{i:03d}"
-        new_name = f"Person {i:03d}"
-        conn.execute(
-            "UPDATE persons SET person_id=?, name=? WHERE person_id=?",
-            (new_id, new_name, temp_id),
-        )
-        conn.execute(
-            "UPDATE appearances SET person_id=? WHERE person_id=?",
-            (new_id, temp_id),
-        )
-        conn.execute(
-            "UPDATE recognition_log SET person_id=? WHERE person_id=?",
-            (new_id, temp_id),
-        )
+    for old_id, new_id, new_name in migrated:
         print(f"  {old_id} -> {new_id} ({new_name})")
-
-    conn.execute(
-        "UPDATE counters SET value=? WHERE key='person_count'",
-        (len(existing),),
-    )
-
-    conn.commit()
-    conn.close()
     print("recognition_log table created.")
     print("Migration complete.")
     print(f"Counter seeded at {len(existing)}.")

@@ -1,7 +1,20 @@
+import json
+import re
+
 import cv2
 import numpy as np
 from pathlib import Path
 from typing import Any
+
+
+_REQUIRED_QUALITY_FIELDS = (
+    "path",
+    "frame_idx",
+    "bbox",
+    "confidence",
+    "sharpness",
+)
+_CAMERA_URI_RE = re.compile(r"rtsps?://\S+", re.IGNORECASE)
 
 
 def _sharpness(img_bgr: np.ndarray) -> float:
@@ -29,6 +42,43 @@ def prepare_staging_dirs(output_dir: str | Path) -> tuple[Path, Path]:
     return body_dir, face_dir
 
 
+def _write_crop(recorded_path: str, crop: np.ndarray) -> str:
+    """Persist one crop and verify that its record names the written file."""
+    imwrite_path = str(Path(recorded_path))
+    write_ok = bool(cv2.imwrite(imwrite_path, crop))
+    exists = Path(imwrite_path).exists()
+    if not write_ok:
+        raise OSError(f"cv2.imwrite failed for crop {Path(imwrite_path).name}")
+    if recorded_path != imwrite_path:
+        raise RuntimeError("Recorded crop path differs from the cv2.imwrite path.")
+    if not exists:
+        raise OSError(
+            f"Crop write reported success but file is missing: {Path(imwrite_path).name}"
+        )
+    return recorded_path
+
+
+def log_crop_record_example(label: str, record: dict | None) -> None:
+    """Log one credential-safe crop schema example for source comparison."""
+    if not record:
+        return
+    example = {
+        key: (Path(str(record[key])).name if key == "path" else record.get(key))
+        for key in _REQUIRED_QUALITY_FIELDS
+        if key in record
+    }
+    example["source_type"] = record.get("source_type")
+    for key in ("video", "video_path", "source_uri"):
+        if key in record:
+            example[key] = _CAMERA_URI_RE.sub("<camera-source>", str(record.get(key)))
+    missing = [key for key in _REQUIRED_QUALITY_FIELDS if key not in record]
+    null = [key for key in _REQUIRED_QUALITY_FIELDS if record.get(key) is None]
+    print(
+        f"[crop_schema] {label} crop record: "
+        f"{json.dumps(example, sort_keys=True)} missing={missing} null={null}"
+    )
+
+
 def detect_and_save_frame(
     frame: np.ndarray,
     *,
@@ -52,8 +102,7 @@ def detect_and_save_frame(
             continue
         fname = f"{source_stem}_f{frame_idx:06d}_b{det_idx:02d}.jpg"
         path = str(body_dir / fname)
-        if not cv2.imwrite(path, crop):
-            continue
+        _write_crop(path, crop)
         body_crops.append({
             "path": path,
             "frame_idx": frame_idx,
@@ -69,8 +118,7 @@ def detect_and_save_frame(
             continue
         fname = f"{source_stem}_face_f{frame_idx:06d}_f{det_idx:02d}.jpg"
         path = str(face_dir / fname)
-        if not cv2.imwrite(path, crop):
-            continue
+        _write_crop(path, crop)
         face_crops.append({
             "path": path,
             "frame_idx": frame_idx,
@@ -133,6 +181,7 @@ def process_video(state: dict) -> dict:
         if frame_idx == 0:
             raise OSError(f"cv2 opened but decoded 0 frames from {video_path!r} — codec / file may be corrupt")
 
+    log_crop_record_example("video face", face_crops[0] if face_crops else None)
     return {
         "body_crops": body_crops,
         "face_crops": face_crops,

@@ -51,6 +51,8 @@ class FaceEngineClient:
         vec = np.asarray(data.get("embedding"), dtype=np.float32).reshape(-1)
         if vec.shape[0] != 512:
             raise ValueError(f"face engine returned {vec.shape[0]}-d embedding, expected 512")
+        if not np.isfinite(vec).all():
+            raise ValueError("face engine returned a non-finite embedding")
         return vec
 
     def recognize(self, embedding: list[float] | np.ndarray, top_k: int = 5, threshold: float | None = None) -> dict:

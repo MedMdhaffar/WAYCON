@@ -23,6 +23,8 @@ def embed():
     vec = np.asarray(embedding, dtype=np.float32).reshape(-1)
     if vec.shape[0] != 512:
         return jsonify({"error": f"embedding dimension is {vec.shape[0]}, expected 512"}), 500
+    if not np.isfinite(vec).all():
+        return jsonify({"error": "embedding contains non-finite values"}), 500
     norm = float(np.linalg.norm(vec))
     if abs(norm - 1.0) >= 1e-5:
         return jsonify({"error": f"embedding norm is {norm}, expected 1.0"}), 500

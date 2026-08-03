@@ -3,11 +3,13 @@ from __future__ import annotations
 import sqlite3
 import threading
 from datetime import date, timedelta
+from pathlib import Path
 
 import numpy as np
 import pytest
 
 from forensics.global_memory import GlobalMemory
+from forensics.global_memory.store import ReadOnlyGlobalMemoryError
 
 
 def _unit(values) -> list[float]:
@@ -219,6 +221,100 @@ def test_thread_safety(memory):
     assert len(memory.list_all()) == 3
 
 
+def _database_contents(path: Path) -> dict[str, list[tuple]]:
+    connection = sqlite3.connect(str(path))
+    try:
+        tables = [
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+            )
+        ]
+        return {
+            table: connection.execute(
+                f'SELECT * FROM "{table}" ORDER BY rowid'
+            ).fetchall()
+            for table in tables
+        }
+    finally:
+        connection.close()
+
+
+def test_read_only_query_preserves_complete_database_contents(tmp_path):
+    database = tmp_path / "memory.db"
+    writer = GlobalMemory(str(database))
+    embedding = _unit([1.0, 0.0, 0.0])
+    writer.register(_profile(embedding=embedding))
+    writer.close()
+    before = _database_contents(database)
+    bytes_before = database.read_bytes()
+
+    reader = GlobalMemory(str(database), read_only=True)
+    try:
+        assert reader.query_by_face(embedding)[0]["person_id"] == "person_001"
+    finally:
+        reader.close()
+
+    assert _database_contents(database) == before
+    assert database.read_bytes() == bytes_before
+
+
+def test_read_only_initialization_runs_no_schema_or_migration_writes(tmp_path):
+    database = tmp_path / "memory.db"
+    writer = GlobalMemory(str(database))
+    writer.close()
+    before = _database_contents(database)
+    bytes_before = database.read_bytes()
+
+    reader = GlobalMemory(str(database), read_only=True)
+    reader.close()
+
+    assert _database_contents(database) == before
+    assert database.read_bytes() == bytes_before
+
+
+def test_missing_read_only_database_creates_nothing(tmp_path):
+    database = tmp_path / "absent" / "memory.db"
+
+    with pytest.raises(sqlite3.OperationalError):
+        GlobalMemory(str(database), read_only=True)
+
+    assert not database.parent.exists()
+    assert not database.exists()
+
+
+@pytest.mark.parametrize(
+    ("method_name", "args"),
+    [
+        ("register", (_profile(),)),
+        ("rename_person", ("person_001", "Renamed")),
+        ("update_crop_paths", ("person_001", _profile())),
+        ("set_profile_image", ("person_001", "face.jpg")),
+        ("update_gallery", ("person_001", _profile())),
+    ],
+)
+def test_all_public_mutations_are_rejected_in_read_only_mode(
+    tmp_path,
+    method_name,
+    args,
+):
+    database = tmp_path / "memory.db"
+    writer = GlobalMemory(str(database))
+    writer.register(_profile())
+    writer.close()
+    before = _database_contents(database)
+
+    reader = GlobalMemory(str(database), read_only=True)
+    try:
+        with pytest.raises(ReadOnlyGlobalMemoryError, match="read-only mode"):
+            getattr(reader, method_name)(*args)
+    finally:
+        reader.close()
+
+    assert _database_contents(database) == before
+
+
 def test_register_logs_new_and_recognized_events(memory):
     emb = _unit([1.0, 0.0, 0.0])
     assigned = memory.register(_profile(embedding=emb, face_count=4, day="2026-05-13"))
@@ -242,3 +338,114 @@ def test_auto_ids_ignore_cluster_names(memory):
     assert second == "person_002"
     assert memory.get_person(first)["name"] == "Person 001"
     assert memory.get_person(second)["name"] == "Person 002"
+
+
+def test_failed_clothing_preserves_good_values_and_merges_evidence(tmp_path):
+    root = tmp_path / "person_db"
+    first_body = root / "session" / "body_crops" / "first.jpg"
+    second_body = root / "session" / "body_crops" / "second.jpg"
+    first_body.parent.mkdir(parents=True)
+    first_body.write_bytes(b"first")
+    second_body.write_bytes(b"second")
+    memory = GlobalMemory(tmp_path / "memory.db", media_root=root)
+    try:
+        profile = _profile(day="2026-07-16", top="black jacket")
+        profile["appearance"]["clothing_status"] = "ok"
+        profile["best_body_crops"] = [str(first_body)]
+        profile["video_sources"] = ["first.mp4"]
+        person_id = memory.register(profile)
+
+        failed = _profile(day="2026-07-16", top="unknown")
+        failed["appearance"] = {
+            "date": "2026-07-16",
+            "clothing_status": "failed",
+            "top": None,
+            "bottom": None,
+            "shoes": None,
+            "full": None,
+        }
+        failed["best_body_crops"] = [str(second_body)]
+        failed["video_sources"] = ["second.mp4"]
+        memory.register(failed)
+
+        appearance = memory.get_person(person_id)["latest_appearance"]
+        assert appearance["top"] == "black jacket"
+        assert appearance["clothing_status"] == "failed"
+        assert appearance["best_body_crops"] == [
+            "session/body_crops/first.jpg",
+            "session/body_crops/second.jpg",
+        ]
+        assert appearance["video_sources"] == ["first.mp4", "second.mp4"]
+    finally:
+        memory.close()
+
+
+def test_successful_clothing_update_replaces_only_useful_fields(tmp_path):
+    memory = GlobalMemory(tmp_path / "memory.db", media_root=tmp_path / "person_db")
+    try:
+        person_id = memory.register(_profile(day="2026-07-16", top="white shirt"))
+        update = _profile(day="2026-07-16", top="blue coat")
+        update["appearance"]["bottom"] = None
+        update["appearance"]["clothing_status"] = "ok"
+        memory.register(update)
+
+        appearance = memory.get_person(person_id)["latest_appearance"]
+        assert appearance["top"] == "blue coat"
+        assert appearance["bottom"] == "black pants"
+        assert appearance["clothing_status"] == "ok"
+    finally:
+        memory.close()
+
+
+def test_unknown_fallback_is_never_persisted_as_valid_clothing(tmp_path):
+    memory = GlobalMemory(tmp_path / "memory.db", media_root=tmp_path / "person_db")
+    try:
+        profile = _profile(day="2026-07-16", top="unknown")
+        profile["appearance"] = {
+            "date": "2026-07-16",
+            "clothing_status": "failed",
+            "top": "unknown",
+            "bottom": "unknown",
+            "shoes": "unknown",
+            "full": "Clothing description unavailable.",
+        }
+        person_id = memory.register(profile)
+        appearance = memory.get_person(person_id)["latest_appearance"]
+
+        assert appearance["clothing_status"] == "failed"
+        assert appearance["top"] is None
+        assert appearance["bottom"] is None
+        assert appearance["shoes"] is None
+        assert appearance["full_description"] is None
+    finally:
+        memory.close()
+
+
+def test_crop_path_update_rolls_back_all_database_changes_on_boundary_failure(tmp_path):
+    root = tmp_path / "person_db"
+    old_face = root / "session" / "face_crops" / "old.jpg"
+    new_face = root / "person_001" / "face_crops" / "new.jpg"
+    old_face.parent.mkdir(parents=True)
+    new_face.parent.mkdir(parents=True)
+    old_face.write_bytes(b"old")
+    new_face.write_bytes(b"new")
+    database = tmp_path / "memory.db"
+    memory = GlobalMemory(database, media_root=root)
+    try:
+        profile = _profile(day="2026-07-16")
+        profile["face_crops"] = [str(old_face)]
+        person_id = memory.register(profile)
+        before = _database_contents(database)
+        updated = _profile(day="2026-07-16", top="new coat")
+        updated["face_crops"] = [str(new_face)]
+
+        def fail_gallery(*_args, **_kwargs):
+            raise RuntimeError("injected gallery update failure")
+
+        memory.update_gallery = fail_gallery
+        with pytest.raises(RuntimeError, match="injected gallery update failure"):
+            memory.update_crop_paths(person_id, updated)
+
+        assert _database_contents(database) == before
+    finally:
+        memory.close()

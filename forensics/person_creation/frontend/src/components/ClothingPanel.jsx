@@ -1,112 +1,95 @@
+import SafeImage from './SafeImage.jsx'
+
 const FIELDS = ['top', 'bottom', 'shoes', 'full']
 
 function isInternalLabel(value) {
   return /cluster[_\s-]?\d+/i.test(value || '')
 }
 
+function CropStrip({ crops, prefix, height }) {
+  if (!crops.length) return null
+  return (
+    <div style={{ display: 'flex', gap: 8, marginBottom: 14, overflowX: 'auto', paddingBottom: 4 }}>
+      {crops.map((path, index) => (
+        <SafeImage
+          key={`${path}-${index}`}
+          path={path}
+          alt={`${prefix} crop ${index + 1}`}
+          placeholder="Unavailable"
+          style={{ height, width: 'auto', minWidth: 72, borderRadius: 6, border: '1px solid #1e2330', flexShrink: 0, display: 'grid', placeItems: 'center', color: '#64748b', fontSize: 11 }}
+        />
+      ))}
+    </div>
+  )
+}
+
+function ClothingFields({ result }) {
+  if (result?.status === 'failed') {
+    return (
+      <div className="clothing-status-failed">
+        Clothing description unavailable for this identity.
+      </div>
+    )
+  }
+  const labelStyle = { fontSize: 12, color: '#94a3b8', marginBottom: 5, display: 'block', textTransform: 'uppercase' }
+  const valueStyle = { width: '100%', padding: '7px 11px', background: '#0f1117', border: '1px solid #1e2330', borderRadius: 6, color: '#e2e8f0', fontSize: 14, minHeight: 34 }
+  return (
+    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+      {FIELDS.map(field => (
+        <div key={field} style={field === 'full' ? { gridColumn: '1 / -1' } : {}}>
+          <label style={labelStyle}>{field}</label>
+          <div style={valueStyle}>{result?.[field] || '-'}</div>
+        </div>
+      ))}
+    </div>
+  )
+}
+
 function ClusterClothingCard({ clusterId, crops, clothing, profile }) {
-  const structured = clothing?.structured ?? clothing ?? {}
+  const result = clothing?.structured ?? clothing ?? {}
   const title = !isInternalLabel(profile?.name)
     ? profile?.name
     : (!isInternalLabel(profile?.id) ? profile?.id : 'Pending identity')
-  const labelStyle = { fontSize: '12px', color: '#94a3b8', marginBottom: '5px', display: 'block', textTransform: 'uppercase', letterSpacing: '0.05em' }
-  const valueStyle = {
-    width: '100%', padding: '7px 11px', background: '#0f1117',
-    border: '1px solid #1e2330', borderRadius: '6px',
-    color: '#e2e8f0', fontSize: '14px', minHeight: '34px',
-  }
-
   return (
-    <div style={{ border: '1px solid #1e2330', borderRadius: '6px', padding: '12px', background: '#11151f' }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
+    <div style={{ border: '1px solid #1e2330', borderRadius: 6, padding: 12, background: '#11151f' }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
         <div>
-          <div style={{ fontSize: '14px', fontWeight: 600, color: '#e2e8f0' }}>{title}</div>
-          {profile?.id && !isInternalLabel(profile.id) && (
-            <div style={{ fontSize: '12px', color: '#64748b' }}>{profile.id}</div>
-          )}
+          <div style={{ fontSize: 14, fontWeight: 600, color: '#e2e8f0' }}>{title}</div>
+          {profile?.id && !isInternalLabel(profile.id) && <div style={{ fontSize: 12, color: '#64748b' }}>{profile.id}</div>}
         </div>
-        <div style={{ fontSize: '12px', color: '#64748b' }}>{crops.length} crops</div>
+        <div style={{ fontSize: 12, color: '#64748b' }}>{crops.length} crops</div>
       </div>
-
-      {crops.length > 0 && (
-        <div style={{ display: 'flex', gap: '8px', marginBottom: '14px', overflowX: 'auto', paddingBottom: '4px' }}>
-          {crops.map((p, i) => (
-            <img
-              key={p + i}
-              src={`/api/images?path=${encodeURIComponent(p)}`}
-              alt={`cluster ${clusterId} crop ${i + 1}`}
-              style={{ height: '110px', width: 'auto', borderRadius: '6px', border: '1px solid #1e2330', flexShrink: 0 }}
-            />
-          ))}
-        </div>
-      )}
-
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
-        {FIELDS.map(f => (
-          <div key={f} style={f === 'full' ? { gridColumn: '1 / -1' } : {}}>
-            <label style={labelStyle}>{f}</label>
-            <div style={valueStyle}>{structured[f] || '-'}</div>
-          </div>
-        ))}
-      </div>
+      <CropStrip crops={crops} prefix={`cluster ${clusterId}`} height={110} />
+      <ClothingFields result={result} />
     </div>
   )
 }
 
 export default function ClothingPanel({ bestBodyCrops, clothingStructured, perClusterBestBodyCrops = {}, perClusterClothing = {}, clusterProfiles = {} }) {
   const clusterIds = Object.keys(perClusterBestBodyCrops).sort((a, b) => Number(a) - Number(b))
-
-  const labelStyle = { fontSize: '12px', color: '#94a3b8', marginBottom: '5px', display: 'block', textTransform: 'uppercase', letterSpacing: '0.05em' }
-  const valueStyle = {
-    width: '100%', padding: '7px 11px', background: '#0f1117',
-    border: '1px solid #1e2330', borderRadius: '6px',
-    color: '#e2e8f0', fontSize: '14px', minHeight: '34px',
-  }
-
   if (clusterIds.length > 1 || (clusterIds.length === 1 && Object.keys(perClusterClothing).length)) {
     return (
       <div className="card">
         <div className="card-title">Clothing Description</div>
-        <div style={{ display: 'grid', gap: '12px' }}>
-          {clusterIds.map(cid => (
+        <div style={{ display: 'grid', gap: 12 }}>
+          {clusterIds.map(clusterId => (
             <ClusterClothingCard
-              key={cid}
-              clusterId={cid}
-              crops={perClusterBestBodyCrops[cid] ?? []}
-              clothing={perClusterClothing[cid] ?? {}}
-              profile={clusterProfiles[cid] ?? clusterProfiles[Number(cid)] ?? {}}
+              key={clusterId}
+              clusterId={clusterId}
+              crops={perClusterBestBodyCrops[clusterId] ?? []}
+              clothing={perClusterClothing[clusterId] ?? {}}
+              profile={clusterProfiles[clusterId] ?? clusterProfiles[Number(clusterId)] ?? {}}
             />
           ))}
         </div>
       </div>
     )
   }
-
   return (
     <div className="card">
       <div className="card-title">Clothing Description</div>
-
-      {bestBodyCrops.length > 0 && (
-        <div style={{ display: 'flex', gap: '8px', marginBottom: '20px', overflowX: 'auto', paddingBottom: '4px' }}>
-          {bestBodyCrops.map((p, i) => (
-            <img
-              key={i}
-              src={`/api/images?path=${encodeURIComponent(p)}`}
-              alt={`best ${i + 1}`}
-              style={{ height: '120px', width: 'auto', borderRadius: '6px', border: '1px solid #1e2330', flexShrink: 0 }}
-            />
-          ))}
-        </div>
-      )}
-
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
-        {FIELDS.map(f => (
-          <div key={f} style={f === 'full' ? { gridColumn: '1 / -1' } : {}}>
-            <label style={labelStyle}>{f}</label>
-            <div style={valueStyle}>{clothingStructured[f] || '-'}</div>
-          </div>
-        ))}
-      </div>
+      <CropStrip crops={bestBodyCrops} prefix="best" height={120} />
+      <ClothingFields result={clothingStructured} />
     </div>
   )
 }

@@ -1,6 +1,20 @@
 import json
+import os
+import re
 import shutil
+import uuid
 from pathlib import Path
+
+import numpy as np
+
+from forensics.identity_evidence import identity_evidence_key
+from forensics.media_paths import MediaPathError, get_media_root, normalize_media_path
+from forensics.person_creation.media_lifecycle import (
+    cleanup_relocated_sources,
+    relocate_profile_media,
+    rewrite_media_references,
+    scrub_obsolete_session_media,
+)
 
 
 def _basenames(items) -> set[str]:
@@ -18,7 +32,13 @@ def _prune_orphans(directory: Path, keep: set[str]) -> tuple[int, int]:
     deleted = 0
     freed = 0
     for p in directory.iterdir():
-        if not p.is_file() or p.name in keep:
+        if not p.is_file():
+            continue
+        try:
+            media_path = normalize_media_path(p, require_exists=True)
+        except (MediaPathError, FileNotFoundError, OSError):
+            continue
+        if media_path in keep:
             continue
         try:
             size = p.stat().st_size
@@ -32,57 +52,12 @@ def _prune_orphans(directory: Path, keep: set[str]) -> tuple[int, int]:
 
 def _write_json(path: Path, data: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
-
-
-def _move_or_merge_dir(src: Path, dst: Path) -> None:
-    if not src.exists():
-        dst.mkdir(parents=True, exist_ok=True)
-        return
-    dst.mkdir(parents=True, exist_ok=True)
-    for item in src.iterdir():
-        target = dst / item.name
-        if target.exists():
-            if item.is_file():
-                try:
-                    item.unlink()
-                except OSError:
-                    pass
-            continue
-        shutil.move(str(item), str(target))
+    temporary = path.parent / f".{path.name}.{uuid.uuid4().hex}.tmp"
     try:
-        src.rmdir()
-    except OSError:
-        pass
-
-
-def _remap_crop_paths(paths: list[str], person_dir: Path, crop_dir: str) -> list[str]:
-    return [str(person_dir / crop_dir / Path(p).name) for p in (paths or []) if p]
-
-
-def _remap_sharpness_map(sharpness: dict, person_dir: Path, crop_dir: str) -> dict:
-    remapped: dict[str, float] = {}
-    for raw_path, value in (sharpness or {}).items():
-        if not raw_path:
-            continue
-        new_path = str(person_dir / crop_dir / Path(raw_path).name)
-        try:
-            remapped[new_path] = float(value)
-        except (TypeError, ValueError):
-            remapped[new_path] = 0.0
-    return remapped
-
-
-def _remap_color_sample_paths(color_signal: dict, person_dir: Path) -> dict:
-    color_signal = dict(color_signal or {})
-    samples = []
-    for sample in color_signal.get("samples", []) or []:
-        item = dict(sample)
-        if item.get("path"):
-            item["path"] = str(person_dir / "body_crops" / Path(item["path"]).name)
-        samples.append(item)
-    color_signal["samples"] = samples
-    return color_signal
+        temporary.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _normalize_profile_schema(profile: dict) -> dict:
@@ -114,6 +89,14 @@ def _normalize_profile_schema(profile: dict) -> dict:
     return profile
 
 
+def _accepted_face_observation_count(profile: dict) -> int:
+    """Return the accepted embedded faces represented by this profile."""
+    for key in ("cluster_face_count", "face_count", "face_crop_count"):
+        if profile.get(key) is not None:
+            return profile[key]
+    return len(profile.get("face_crops") or [])
+
+
 def _session_report(state: dict, profiles_written: int) -> dict:
     clusters = state.get("identity_clusters", [])
     low_confidence = [c for c in clusters if c.get("low_confidence")]
@@ -124,12 +107,14 @@ def _session_report(state: dict, profiles_written: int) -> dict:
         "profiles_written": profiles_written,
         "total_face_crops": state.get("total_quality_face_crops", len(state.get("quality_face_crops", []))),
         "total_body_crops": state.get("total_quality_body_crops", len(state.get("quality_body_crops", []))),
+        "face_rejection_counts": state.get("face_rejection_counts", {}),
         "identity_clusters_found": len(clusters),
         "low_confidence_clusters": len(low_confidence),
         "unresolved_faces": len(state.get("unresolved_faces", [])),
         "unattached_bodies": len(state.get("unattached_bodies", [])),
         "identity_clustering_config": state.get("identity_clustering_config", {}),
         "reid_config": state.get("reid_config", {}),
+        "clothing_diagnostics": state.get("clothing_diagnostics", []),
     }
     if state.get("source_type") == "live_camera":
         report.update({
@@ -142,6 +127,256 @@ def _session_report(state: dict, profiles_written: int) -> dict:
     return report
 
 
+def _keep_staging_on_empty_faces(state: dict) -> bool:
+    return (
+        os.environ.get("PERSON_CREATION_KEEP_STAGING_ON_EMPTY_FACES") == "1"
+        and len(state.get("face_crops") or []) > 0
+        and state.get(
+            "total_quality_face_crops",
+            len(state.get("quality_face_crops") or []),
+        ) == 0
+    )
+
+
+def _cleanup_staging(state: dict, staging: Path) -> None:
+    print("[finalize] cleanup entered", flush=True)
+    try:
+        if staging.exists() and _keep_staging_on_empty_faces(state):
+            print(
+                "[finalize] preserving staging tree because detected faces were "
+                "all rejected by quality filtering"
+            )
+        elif staging.exists():
+            shutil.rmtree(staging, ignore_errors=True)
+            print(f"[finalize] removed staging tree: {staging}")
+    finally:
+        print("[finalize] cleanup completed", flush=True)
+
+
+_FINAL_MEDIA_FIELDS = (
+    "body_crops",
+    "face_crops",
+    "quality_body_crops",
+    "quality_face_crops",
+    "all_face_embeddings",
+    "failed_face_embeddings",
+    "frame_groups",
+    "associations",
+    "identity_clusters",
+    "cluster_assignments",
+    "unresolved_faces",
+    "unattached_bodies",
+    "best_body_crops",
+    "per_cluster_best_body_crops",
+    "per_cluster_clothing",
+    "clothing_diagnostics",
+    "rolling_analysis",
+    "stream_stats",
+)
+
+
+def _canonical_replay_person_id(profile: dict) -> str | None:
+    person_id = str(profile.get("id") or "")
+    if not re.fullmatch(r"person_[0-9]+", person_id):
+        return None
+    paths = [
+        *list(profile.get("face_crops") or []),
+        *list(profile.get("body_crops") or []),
+        *list(profile.get("best_body_crops") or []),
+    ]
+    if not paths or any(
+        not str(path).replace("\\", "/").startswith(f"{person_id}/")
+        for path in paths
+    ):
+        return None
+    return person_id
+
+
+def _profile_evidence(profile: dict) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+    def unique(items, crop_type: str) -> list[tuple[str, str]]:
+        result: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for path in items or []:
+            if not path:
+                continue
+            key = identity_evidence_key(path, crop_type)
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append((key, str(path)))
+        return result
+
+    return (
+        unique(profile.get("face_crops"), "face"),
+        unique(profile.get("body_crops"), "body"),
+    )
+
+
+def _live_decision_index(receipts) -> list:
+    """Index live decision receipts by their recorded evidence identifiers."""
+    index: list = []
+    for receipt in receipts or []:
+        if not isinstance(receipt, dict):
+            continue
+        if not receipt.get("canonical_person_id"):
+            continue
+        keys = {
+            str(key).strip()
+            for key in (
+                receipt.get("persisted_evidence_keys")
+                or receipt.get("evidence_keys")
+                or []
+            )
+            if str(key).strip()
+        }
+        if keys:
+            index.append((keys, receipt))
+    return index
+
+
+def _live_decision_for_profile(profile: dict, index: list) -> dict | None:
+    """Return the receipt whose recorded evidence this cluster carries.
+
+    Matching is by the receipt's own evidence identifiers only - never by name,
+    embedding, or profile similarity.
+    """
+    faces, bodies = _profile_evidence(profile)
+    candidates = {key for key, _path in faces + bodies}
+    if not candidates:
+        return None
+    best: dict | None = None
+    best_overlap = 0
+    for keys, receipt in index:
+        overlap = len(candidates & keys)
+        if overlap > best_overlap:
+            best_overlap = overlap
+            best = receipt
+    return best if best_overlap else None
+
+
+def _mean_unseen_face_embedding(
+    state: dict,
+    cid: int,
+    unseen_keys: set[str],
+    profile: dict,
+    all_face_keys: set[str],
+):
+    if not unseen_keys:
+        return None
+    vectors: list[np.ndarray] = []
+    matched: set[str] = set()
+    for cluster in state.get("identity_clusters") or []:
+        if int(cluster.get("cluster_id", -1)) != cid:
+            continue
+        for record in cluster.get("face_records") or []:
+            path = record.get("crop_path")
+            if not path:
+                continue
+            key = identity_evidence_key(path, "face")
+            if key not in unseen_keys or key in matched:
+                continue
+            vector = np.asarray(record.get("embedding"), dtype=np.float64)
+            if vector.ndim != 1 or vector.size == 0 or not np.isfinite(vector).all():
+                raise ValueError("unseen face evidence embedding is invalid")
+            norm = float(np.linalg.norm(vector))
+            if norm <= 0:
+                raise ValueError("unseen face evidence embedding has zero norm")
+            vectors.append(vector / norm)
+            matched.add(key)
+        break
+
+    if matched == unseen_keys:
+        mean = np.mean(np.asarray(vectors), axis=0)
+        norm = float(np.linalg.norm(mean))
+        if norm <= 0:
+            raise ValueError("unseen face evidence mean embedding has zero norm")
+        return (mean / norm).astype(float).tolist()
+
+    # A profile aggregate is exact only when every face in that profile is new.
+    if unseen_keys == all_face_keys:
+        return profile.get("face_embedding")
+    raise ValueError("individual embeddings are required for later unseen faces")
+
+
+def _append_unpersisted_evidence(
+    memory,
+    person_id: str,
+    profile: dict,
+    receipt: dict,
+    *,
+    state: dict,
+    cid: int,
+) -> None:
+    faces, bodies = _profile_evidence(profile)
+    durable_keys = set(memory.identity_evidence_keys(person_id))
+    unseen_face_keys = {key for key, _path in faces if key not in durable_keys}
+    embedding = _mean_unseen_face_embedding(
+        state,
+        cid,
+        unseen_face_keys,
+        profile,
+        {key for key, _path in faces},
+    )
+    appearance = dict(profile.get("appearance") or {})
+    appearance.update({
+        "video_sources": list(profile.get("video_sources") or []),
+        "face_crop_sharpness": dict(profile.get("face_crop_sharpness") or {}),
+        "body_crop_sharpness": dict(profile.get("body_crop_sharpness") or {}),
+    })
+    appended = memory.append_identity_evidence(
+        person_id,
+        embedding=embedding,
+        observation_count=len(unseen_face_keys),
+        face_crops=[path for _key, path in faces],
+        body_crops=[path for _key, path in bodies],
+        appearance=appearance,
+        evidence_keys=[key for key, _path in faces + bodies],
+    )
+
+    all_keys = sorted(key for key, _path in faces + bodies)
+    face_paths = sorted(path for _key, path in faces)
+    body_paths = sorted(path for _key, path in bodies)
+    receipt["evidence_keys"] = all_keys
+    receipt["persisted_evidence_keys"] = all_keys
+    receipt["persisted_face_crops"] = face_paths
+    receipt["persisted_body_crops"] = body_paths
+    receipt["canonical_face_paths"] = face_paths
+    receipt["canonical_body_paths"] = body_paths
+    receipt["persisted_face_count"] = len(face_paths)
+    receipt["persisted_body_count"] = len(body_paths)
+    receipt["persisted_observation_count"] = int(
+        receipt.get("persisted_observation_count") or 0
+    ) + int(appended.embedding_count_after - appended.embedding_count_before)
+    analysis_version = (
+        (state.get("rolling_analysis") or {}).get("analysis_version")
+        or receipt.get("last_appended_analysis_version")
+        or receipt.get("decision_version")
+    )
+    receipt["last_appended_analysis_version"] = analysis_version
+
+
+def _rewrite_feedback_report(
+    path: Path,
+    remap: dict[str, str],
+    *,
+    output_dir: Path,
+    media_root: Path,
+) -> None:
+    if not path.is_file():
+        return
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    payload = rewrite_media_references(payload, remap)
+    payload = scrub_obsolete_session_media(
+        payload,
+        output_dir=output_dir,
+        media_root=media_root,
+    )
+    _write_json(path, payload)
+
+
 def finalize(state: dict) -> dict:
     """Write one profile.json per cluster, plus session and rejects reports.
 
@@ -152,81 +387,157 @@ def finalize(state: dict) -> dict:
     """
     output_dir = Path(state["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
-    base_db_dir = output_dir.parent if output_dir.name else Path("forensics/person_db")
+    base_db_dir = get_media_root()
     profiles = state.get("per_cluster_profiles") or {}
     finalized_profiles: dict[int, dict] = {}
+    complete_remap: dict[str, str] = {}
+    cleanup_pairs: list[tuple[str, str]] = []
+    live_decision_index = _live_decision_index(state.get("live_identity_decisions"))
+    reconciled_live_decisions: list[dict] = []
 
     # Goal 3: register completed profiles into global memory. The DB is the
     # source of truth for identity; profile.json below is only a debug export.
     from forensics.global_memory import GlobalMemory
-    gm = GlobalMemory()
+    gm = GlobalMemory(media_root=base_db_dir)
 
-    for raw_cid, profile in profiles.items():
-        cid = int(raw_cid)
-        profile = _normalize_profile_schema(profile)
-        assigned_id = gm.register(profile)
-        profile["id"] = assigned_id
-        stored_person = gm.get_person(assigned_id) or {}
-        profile["name"] = stored_person.get("name") or assigned_id.replace("_", " ").title()
-        person_dir = base_db_dir / assigned_id
-        person_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        for raw_cid, profile in profiles.items():
+            cid = int(raw_cid)
+            profile = _normalize_profile_schema(profile)
+            replay_id = _canonical_replay_person_id(profile)
+            live_decision = _live_decision_for_profile(profile, live_decision_index)
+            resolved_id = replay_id
+            if resolved_id is None and live_decision is not None:
+                resolved_id = str(live_decision.get("canonical_person_id") or "") or None
+            relocation_holder = {}
+            if live_decision is not None:
+                if resolved_id is None:
+                    raise RuntimeError("live identity receipt has no canonical person")
+                assigned_id = gm.resolve_canonical_person_id(resolved_id)
+                if gm.get_person(assigned_id) is None:
+                    raise RuntimeError(
+                        "live identity receipt references a missing canonical person"
+                    )
+                relocation = relocate_profile_media(
+                    profile,
+                    assigned_id,
+                    media_root=base_db_dir,
+                )
+                profile = relocation.profile
+                _append_unpersisted_evidence(
+                    gm,
+                    assigned_id,
+                    profile,
+                    live_decision,
+                    state=state,
+                    cid=cid,
+                )
+                reconciled_live_decisions.append(live_decision)
+            elif resolved_id is not None and gm.get_person(resolved_id) is not None:
+                # Already persisted (batch replay, or a Phase 3E decision taken
+                # while capture was live): reuse that canonical identity without
+                # registering a second person, re-attaching evidence, or
+                # creating a second review suggestion.
+                assigned_id = resolved_id
+                relocation = relocate_profile_media(
+                    profile,
+                    assigned_id,
+                    media_root=base_db_dir,
+                )
+                profile = relocation.profile
+            else:
+                def prepare_for_person(person_id: str, raw_profile: dict) -> dict:
+                    relocation = relocate_profile_media(
+                        raw_profile,
+                        person_id,
+                        media_root=base_db_dir,
+                    )
+                    relocation_holder["value"] = relocation
+                    return relocation.profile
 
-        cluster_dir = output_dir / f"cluster_{cid}"
-        _move_or_merge_dir(cluster_dir / "body_crops", person_dir / "body_crops")
-        _move_or_merge_dir(cluster_dir / "face_crops", person_dir / "face_crops")
+                registration = gm.register_with_identity_policy(
+                    profile,
+                    observation_count=_accepted_face_observation_count(profile),
+                    low_confidence=bool(profile.get("low_confidence", False)),
+                    prepare_profile_for_person=prepare_for_person,
+                )
+                assigned_id = registration.person_id
+                relocation = relocation_holder["value"]
+                profile = relocation.profile
 
-        profile["body_crops"] = _remap_crop_paths(profile.get("body_crops", []), person_dir, "body_crops")
-        profile["best_body_crops"] = _remap_crop_paths(profile.get("best_body_crops", []), person_dir, "body_crops")
-        profile["face_crops"] = _remap_crop_paths(profile.get("face_crops", []), person_dir, "face_crops")
-        profile["body_crop_sharpness"] = _remap_sharpness_map(
-            profile.get("body_crop_sharpness", {}),
-            person_dir,
-            "body_crops",
-        )
-        profile["face_crop_sharpness"] = _remap_sharpness_map(
-            profile.get("face_crop_sharpness", {}),
-            person_dir,
-            "face_crops",
-        )
-        if (profile.get("appearance_signals") or {}).get("color"):
-            profile["appearance_signals"]["color"] = _remap_color_sample_paths(
-                profile["appearance_signals"]["color"],
-                person_dir,
-            )
-        if profile.get("face_crops"):
-            profile["profile_image"] = profile["face_crops"][0]
-        gm.update_crop_paths(assigned_id, profile)
+            complete_remap.update(relocation.remap)
+            for pair in relocation.cleanup_pairs:
+                if pair not in cleanup_pairs:
+                    cleanup_pairs.append(pair)
+            profile["id"] = assigned_id
+            stored_person = gm.get_person(assigned_id) or {}
+            profile["name"] = stored_person.get("name") or assigned_id.replace("_", " ").title()
+            person_dir = base_db_dir / assigned_id
+            person_dir.mkdir(parents=True, exist_ok=True)
 
-        finalized_profiles[cid] = profile
-        profile_path = person_dir / "profile.json"
+            finalized_profiles[cid] = profile
+            profile_path = person_dir / "profile.json"
         # profile.json is a debug artifact - human-readable export of the DB record.
         # Source of truth for all queries is forensics/global_memory.db.
         # Downstream modules (MTMC, Goal 4 face engine) must use GlobalMemory,
         # not read this file directly.
-        profile_for_disk = {k: v for k, v in profile.items() if k != "face_embedding"}
-        _write_json(profile_path, profile_for_disk)
-        print(f"[finalize] profile saved -> {profile_path}")
+            profile_for_disk = {k: v for k, v in profile.items() if k != "face_embedding"}
+            _write_json(profile_path, profile_for_disk)
+            print(f"[finalize] profile saved -> {profile_path}")
 
-        referenced = (
-            _basenames(profile.get("face_crops"))
-            | _basenames(profile.get("body_crops"))
-            | _basenames(profile.get("best_body_crops"))
+            try:
+                referenced = gm.referenced_media_paths(assigned_id)
+                referenced.update(profile.get("face_crops") or [])
+                referenced.update(profile.get("body_crops") or [])
+                referenced.update(profile.get("best_body_crops") or [])
+            except Exception:
+                referenced = None
+                print("[finalize] persistent media lookup failed; orphan pruning skipped")
+            if referenced is not None:
+                body_del, body_bytes = _prune_orphans(person_dir / "body_crops", referenced)
+                face_del, face_bytes = _prune_orphans(person_dir / "face_crops", referenced)
+                total_mb = (body_bytes + face_bytes) / (1024 * 1024)
+                if body_del or face_del:
+                    print(
+                        f"[finalize] cluster_{cid} cleanup: deleted {body_del} orphan body / "
+                        f"{face_del} orphan face crops ({total_mb:.2f} MB freed)"
+                    )
+    finally:
+        gm.close()
+
+    if reconciled_live_decisions:
+        print(
+            f"[finalize] reused {len(reconciled_live_decisions)} identity "
+            "decision(s) already persisted during live capture"
         )
-        body_del, body_bytes = _prune_orphans(person_dir / "body_crops", referenced)
-        face_del, face_bytes = _prune_orphans(person_dir / "face_crops", referenced)
-        total_mb = (body_bytes + face_bytes) / (1024 * 1024)
-        if body_del or face_del:
-            print(
-                f"[finalize] cluster_{cid} cleanup: deleted {body_del} orphan body / "
-                f"{face_del} orphan face crops ({total_mb:.2f} MB freed)"
-            )
 
-    rejected = {
+    promotion_remap = state.get("_media_path_remap") or {}
+    if isinstance(promotion_remap, dict):
+        for staging_path, promoted_path in promotion_remap.items():
+            canonical_path = complete_remap.get(promoted_path)
+            if canonical_path is not None:
+                complete_remap[staging_path] = canonical_path
+
+    rejected = rewrite_media_references({
         "unresolved_faces": state.get("unresolved_faces", []),
         "unattached_bodies": state.get("unattached_bodies", []),
-    }
+    }, complete_remap)
+    rejected = scrub_obsolete_session_media(
+        rejected,
+        output_dir=output_dir,
+        media_root=base_db_dir,
+    )
     _write_json(output_dir / "rejected_detections.json", rejected)
-    session_report = _session_report(state, len(profiles))
+    session_report = rewrite_media_references(
+        _session_report(state, len(profiles)),
+        complete_remap,
+    )
+    session_report["stream_report_path"] = ""
+    session_report = scrub_obsolete_session_media(
+        session_report,
+        output_dir=output_dir,
+        media_root=base_db_dir,
+    )
     for profile in finalized_profiles.values():
         person_dir = base_db_dir / profile["id"]
         _write_json(person_dir / "session_report.json", session_report)
@@ -234,15 +545,72 @@ def finalize(state: dict) -> dict:
         _write_json(output_dir / "session_report.json", session_report)
     print(f"[finalize] session report saved")
 
-    staging = output_dir / "_staging"
-    if staging.exists():
-        shutil.rmtree(staging, ignore_errors=True)
-        print(f"[finalize] removed staging tree: {staging}")
-
-    gm.close()
+    _rewrite_feedback_report(
+        output_dir / "pairing_feedback.json",
+        complete_remap,
+        output_dir=output_dir,
+        media_root=base_db_dir,
+    )
 
     first_id = sorted(finalized_profiles)[0] if finalized_profiles else None
-    return {
+    update = {
         "per_cluster_profiles": finalized_profiles,
         "profile": finalized_profiles.get(first_id, {}) if first_id is not None else {},
+        "human_feedback_path": "",
+        "stream_report_path": "",
+        "_media_path_remap": complete_remap,
+        "_media_cleanup_pairs": cleanup_pairs,
+        "_media_finalized_root": str(output_dir),
+        "media_lifecycle_version": int(state.get("media_lifecycle_version", 0)) + 1,
+    }
+    for field in _FINAL_MEDIA_FIELDS:
+        if field in state:
+            rewritten = rewrite_media_references(state.get(field), complete_remap)
+            update[field] = scrub_obsolete_session_media(
+                rewritten,
+                output_dir=output_dir,
+                media_root=base_db_dir,
+            )
+    return update
+
+
+def cleanup_finalized_media(state: dict) -> dict:
+    """Run disposable-session cleanup after canonical state publication."""
+    warnings: list[str] = []
+    relocated_sources_verified = True
+    try:
+        cleanup_relocated_sources(
+            list(state.get("_media_cleanup_pairs") or []),
+            media_root=get_media_root(),
+        )
+    except Exception as exc:
+        relocated_sources_verified = False
+        warnings.append(f"relocated source cleanup failed: {type(exc).__name__}")
+    output_dir = Path(state["output_dir"])
+    if relocated_sources_verified:
+        try:
+            _cleanup_staging(state, output_dir / "_staging")
+            for cluster_dir in output_dir.glob("cluster_*"):
+                for crop_dir in (cluster_dir / "body_crops", cluster_dir / "face_crops"):
+                    try:
+                        crop_dir.rmdir()
+                    except OSError:
+                        pass
+                for generated_report in (
+                    cluster_dir / "profile.json",
+                    cluster_dir / "session_report.json",
+                ):
+                    try:
+                        generated_report.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                try:
+                    cluster_dir.rmdir()
+                except OSError:
+                    pass
+        except Exception as exc:
+            warnings.append(f"session cleanup failed: {type(exc).__name__}")
+    return {
+        "_media_cleanup_pairs": [],
+        "media_cleanup_warning": "; ".join(warnings),
     }

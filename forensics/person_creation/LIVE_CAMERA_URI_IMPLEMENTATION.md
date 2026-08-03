@@ -68,29 +68,33 @@ Live crop metadata contains the camera ID, original frame index, UTC timestamp, 
 
 Successful capture writes `<output_dir>/stream_report.json`. Its statistics are also copied into `session_report.json` by finalization.
 
-## Asynchronous VLM behavior
+## Clothing VLM behavior
 
-Clothing description can run in a single-worker `ThreadPoolExecutor`:
+Clothing description uses one process-wide, bounded, single-worker inference lane:
 
 ```bash
 export PERSON_CREATION_ASYNC_VLM=1
 export PERSON_CREATION_VLM_TIMEOUT_SECONDS=60
+export PERSON_CREATION_VLM_MAX_RETRIES=1
 ```
 
-The node waits at most the configured timeout. A timeout or VLM exception lets the graph continue with:
+The timeout applies per identity cluster. Empty, malformed, or failed output is retried once with a smaller or next-best crop selection. Each cluster returns an explicit `ok` or `failed` status, and one cluster failure does not abort the remaining clusters.
 
-```json
-{
-  "top": "unknown",
-  "bottom": "unknown",
-  "shoes": "unknown",
-  "full": "Clothing description unavailable."
-}
+Failed inference returns null clothing fields and a compact failure category. It never writes `unknown` as successful clothing data, and a failed same-day update preserves previously valid clothing and body/video evidence.
+
+Successful InternVL structured output is used directly by the node without clothing/color consistency rewriting. Setting `PERSON_CREATION_ASYNC_VLM=0` runs calls synchronously.
+
+Python cannot forcibly stop model inference running inside a thread. If a timeout occurs after inference has started, the pipeline stops waiting but does not launch a concurrent retry against the same model. The bounded worker prevents timed-out calls from creating unbounded threads.
+
+## Media root
+
+Persistent image references are POSIX paths relative to one configured root:
+
+```bash
+export PERSON_CREATION_MEDIA_ROOT=forensics/person_db
 ```
 
-Successful InternVL structured output is used directly by the node without clothing/color consistency rewriting. Setting `PERSON_CREATION_ASYNC_VLM=0` restores synchronous execution; exceptions still use the fallback.
-
-Python cannot forcibly stop model inference running inside a thread. On timeout the graph stops waiting and finalizes, but the overdue worker may remain alive until the underlying model call returns.
+The image API accepts only relative image IDs inside this root. Legacy absolute SQLite references can be inspected safely with `python -m forensics.global_memory.repair_media_paths --database <copy.db>`; the command is dry-run unless `--apply` is supplied.
 
 ## Credential security
 
@@ -99,8 +103,8 @@ The raw camera URI exists only in in-memory graph state while OpenCV connects. U
 For example:
 
 ```text
-rtsp://admin:secret@192.168.1.64:554/Streaming/Channels/101
-→ rtsp://admin:****@192.168.1.64:554/Streaming/Channels/101
+rtsp://example-user:example-password@camera.example.invalid:554/live
+→ rtsp://****@camera.example.invalid:554/live
 ```
 
 ## Run the project

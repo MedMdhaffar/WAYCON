@@ -17,6 +17,8 @@ def _embedding_from_payload() -> tuple[list[float] | None, tuple[dict, int] | No
             vec = np.asarray(payload.get("embedding"), dtype=np.float32).reshape(-1)
             if vec.shape[0] != 512:
                 return None, ({"error": f"embedding dimension is {vec.shape[0]}, expected 512"}, 422)
+            if not np.isfinite(vec).all():
+                return None, ({"error": "embedding contains non-finite values"}, 422)
             norm = float(np.linalg.norm(vec))
             if norm <= 0:
                 return None, ({"error": "embedding must be non-zero"}, 422)

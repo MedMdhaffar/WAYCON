@@ -1,18 +1,16 @@
 import { useCallback, useEffect, useState } from 'react'
+import SafeImage from './SafeImage.jsx'
 
-function ImageThumb({ path, alt, fallback, size = 44, rounded = '50%' }) {
+function ImageThumb({ path, paths, alt, fallback, size = 44, rounded = '50%' }) {
   return (
     <div style={{ width: size, height: size, borderRadius: rounded, overflow: 'hidden', background: '#1e2330', flexShrink: 0, display: 'grid', placeItems: 'center' }}>
-      {path ? (
-        <img
-          src={`/api/images?path=${encodeURIComponent(path)}`}
-          alt={alt}
-          style={{ width: '100%', height: '100%', objectFit: 'cover' }}
-          onError={event => { event.currentTarget.style.display = 'none' }}
-        />
-      ) : (
-        <span style={{ color: '#64748b', fontWeight: 700, fontSize: 12 }}>{fallback}</span>
-      )}
+      <SafeImage
+        path={path}
+        paths={paths}
+        alt={alt}
+        placeholder={fallback}
+        style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'grid', placeItems: 'center', color: '#94a3b8', fontWeight: 700, fontSize: 12 }}
+      />
     </div>
   )
 }
@@ -39,7 +37,7 @@ function PersonCard({ person, selected, onSelect }) {
         alignItems: 'center',
       }}
     >
-      <ImageThumb path={person.profile_image} alt={person.name} fallback={person.name?.charAt(0) || '?'} />
+      <ImageThumb path={person.profile_image} paths={person.image_candidates} alt={person.name} fallback={person.name?.charAt(0) || '?'} />
       <div style={{ minWidth: 0, flex: 1 }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', gap: 10, alignItems: 'flex-start' }}>
           <div style={{ minWidth: 0 }}>
@@ -201,7 +199,7 @@ function RenameField({ personId, initialName, onRenamed }) {
   )
 }
 
-function ProfileImageEditor({ personId, currentImage, source, onUpdated }) {
+function ProfileImageEditor({ personId, currentImage, imageCandidates, source, onUpdated }) {
   const [mode, setMode] = useState(null)
   const [pathInput, setPathInput] = useState('')
   const [saving, setSaving] = useState(false)
@@ -275,16 +273,13 @@ function ProfileImageEditor({ personId, currentImage, source, onUpdated }) {
   return (
     <div style={{ display: 'grid', gap: 8, width: 120, flexShrink: 0 }}>
       <div style={{ position: 'relative', width: 96, height: 96, borderRadius: 8, overflow: 'hidden', background: '#1e2330', border: '1px solid #1e2330' }}>
-        {currentImage ? (
-          <img
-            src={`/api/images?path=${encodeURIComponent(currentImage)}`}
-            alt="Profile"
-            style={{ width: '100%', height: '100%', objectFit: 'cover' }}
-            onError={event => { event.currentTarget.style.display = 'none' }}
-          />
-        ) : (
-          <div style={{ width: '100%', height: '100%', display: 'grid', placeItems: 'center', color: '#64748b', fontWeight: 700 }}>?</div>
-        )}
+        <SafeImage
+          path={currentImage}
+          paths={imageCandidates}
+          alt="Profile"
+          placeholder="?"
+          style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'grid', placeItems: 'center', color: '#64748b', fontWeight: 700 }}
+        />
         {source === 'manual' && (
           <span style={{ position: 'absolute', top: 4, right: 4, background: '#7c3aed', color: 'white', fontSize: 10, padding: '2px 5px', borderRadius: 999 }}>
             manual
@@ -317,7 +312,7 @@ function ProfileImageEditor({ personId, currentImage, source, onUpdated }) {
             type="text"
             value={pathInput}
             onChange={event => setPathInput(event.target.value)}
-            placeholder="/mnt/c/path/image.jpg"
+            placeholder="person_001/face_crops/example.jpg"
             disabled={saving}
             style={{ padding: '7px 9px', borderRadius: 6, border: '1px solid #1e2330', background: '#0f1117', color: '#e2e8f0', fontSize: 12 }}
           />
@@ -367,11 +362,11 @@ function GallerySection({ personId }) {
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(72px, 1fr))', gap: 8 }}>
           {items.map(entry => (
             <div key={entry.id} title={entry.session_date} style={{ position: 'relative', borderRadius: 6, overflow: 'hidden', background: '#0f1117', border: '1px solid #1e2330' }}>
-              <img
-                src={`/api/images?path=${encodeURIComponent(entry.path)}`}
+              <SafeImage
+                path={entry.path}
                 alt={entry.crop_type}
+                placeholder="Unavailable"
                 style={{ width: '100%', aspectRatio: entry.crop_type === 'face' ? '1 / 1' : '1 / 2', objectFit: 'cover', display: 'block' }}
-                onError={event => { event.currentTarget.style.display = 'none' }}
               />
               <div style={{ position: 'absolute', left: 0, right: 0, bottom: 0, background: 'rgba(0,0,0,0.72)', color: '#cbd5e1', fontSize: 10, textAlign: 'center', padding: '2px 3px' }}>
                 {Number(entry.sharpness || 0).toFixed(0)}
@@ -425,6 +420,7 @@ function PersonDetail({ personId, onRosterRefresh }) {
         <ProfileImageEditor
           personId={detail.person_id}
           currentImage={detail.profile_image}
+          imageCandidates={detail.image_candidates}
           source={detail.profile_image_source}
           onUpdated={(newPath, source) => {
             setDetail(current => ({
@@ -457,6 +453,11 @@ function PersonDetail({ personId, onRosterRefresh }) {
             Latest Appearance · {app.date}
             {app.is_stale && <span style={{ color: '#eab308', marginLeft: 8 }}>(previous day)</span>}
           </div>
+          {app.clothing_status === 'failed' && (
+            <div className="clothing-status-failed" style={{ marginBottom: 12 }}>
+              Latest clothing inference failed. Previously verified clothing remains shown below.
+            </div>
+          )}
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, minmax(0, 1fr))', gap: 12 }}>
             <div>
               <div style={{ color: '#64748b', fontSize: 12 }}>Top</div>
